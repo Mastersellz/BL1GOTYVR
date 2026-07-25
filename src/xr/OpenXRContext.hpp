@@ -40,6 +40,8 @@ public:
     bool HasLocatedViews() const { return m_viewsValid; }
     bool ShouldRender() const { return m_frameState.shouldRender == XR_TRUE; }
     bool HasValidPose() const { return m_poseValid; }
+    bool GetPoseSnapshot(float headPosition[3], float headRotation[4],
+                         XrView views[2]) const;
 
     // Eye data
     EyeData& GetLeftEye() { return m_leftEye; }
@@ -56,6 +58,7 @@ public:
     bool GetProjectionCrop(int eye, float sourceAspect, float& scaleX, float& scaleY,
                            float& offsetX, float& offsetY, float& horizontalFovDegrees) const;
     void MarkEyeRendered(int eye);
+    void SetRenderedViewSnapshot(const XrView views[2]);
     void SetUseRenderedViewPoses(bool enabled) { m_useRenderedViewPoses = enabled; }
 
     // Device
@@ -108,6 +111,7 @@ private:
     float m_eyePositions[2][3] = {};
     float m_eyeRotations[2][4] = {};
     bool m_poseValid = false;
+    mutable SRWLOCK m_poseLock = SRWLOCK_INIT;
     float m_ipd = 0.064f;
     float m_nearPlane = 0.1f;
     float m_farPlane = 10000.0f;

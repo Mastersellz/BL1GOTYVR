@@ -6,6 +6,7 @@
 #include "../xr/FrameLoop.hpp"
 #include "../xr/OpenXRContext.hpp"
 #include "../config/Config.hpp"
+#include "../input/InputHook.hpp"
 #include <Windows.h>
 #include <Psapi.h>
 #include <atomic>
@@ -18,6 +19,8 @@
 namespace bl1gotyvr { namespace camera {
 
 static std::atomic<bool> s_cameraFound{false};
+static std::atomic<bool> s_nativeMultiviewActive{false};
+static std::atomic<uint64_t> s_nativeMultiviewGeneration{0};
 static float s_location[3] = {};
 static int32_t s_rotation[3] = {};
 static UE3Globals s_globals = {};
@@ -28,9 +31,160 @@ static uintptr_t s_viewportDrawTarget = 0;
 using RenderSceneFn = void(__fastcall*)(void*);
 static RenderSceneFn s_originalRenderScene = nullptr;
 static uintptr_t s_renderSceneTarget = 0;
+using RenderCommandConstructorFn = void*(__fastcall*)(void*, void*, void*, void*);
+using ExecuteRenderCommandFn = void(__fastcall*)(void*);
+static RenderCommandConstructorFn s_originalRenderCommandConstructor = nullptr;
+static ExecuteRenderCommandFn s_originalExecuteRenderCommand = nullptr;
 static bool s_poseReferenceValid = false;
+static bool s_poseReferenceSimulated = false;
 static float s_poseReferencePosition[3] = {};
 static float s_poseReferenceRotation[4] = {};
+
+struct PendingViewPose {
+    bool active = false;
+    bool xrViewsValid = false;
+    int eye = 0;
+    float originalLocation[3] = {};
+    float headLocation[3] = {};
+    float sourceLocation[3] = {};
+    float location[3] = {};
+    int32_t rotation[3] = {};
+    XrView xrViews[2] = {};
+};
+static PendingViewPose s_pendingViewPoses[2];
+static SRWLOCK s_pendingViewPoseLock = SRWLOCK_INIT;
+static std::atomic<int> s_latestPendingEye{0};
+
+struct CommandPoseEntry {
+    void* command = nullptr;
+    uint64_t serial = 0;
+    PendingViewPose pose = {};
+};
+static CommandPoseEntry s_commandPoses[64];
+static SRWLOCK s_commandPoseLock = SRWLOCK_INIT;
+static std::atomic<uint64_t> s_commandPoseSerial{0};
+
+static void StoreCommandPose(void* command) {
+    if (!command) return;
+    const int eye = s_latestPendingEye.load(std::memory_order_acquire);
+    PendingViewPose pose = {};
+    AcquireSRWLockShared(&s_pendingViewPoseLock);
+    pose = s_pendingViewPoses[eye];
+    ReleaseSRWLockShared(&s_pendingViewPoseLock);
+    if (!pose.active) return;
+
+    AcquireSRWLockExclusive(&s_commandPoseLock);
+    CommandPoseEntry* selected = &s_commandPoses[0];
+    for (auto& entry : s_commandPoses) {
+        if (entry.command == command || !entry.command) {
+            selected = &entry;
+            break;
+        }
+        if (entry.serial < selected->serial) selected = &entry;
+    }
+    selected->command = command;
+    selected->serial = s_commandPoseSerial.fetch_add(1) + 1;
+    selected->pose = pose;
+    ReleaseSRWLockExclusive(&s_commandPoseLock);
+}
+
+static bool GetCommandPose(void* command, PendingViewPose& pose) {
+    bool found = false;
+    AcquireSRWLockShared(&s_commandPoseLock);
+    for (const auto& entry : s_commandPoses) {
+        if (entry.command != command) continue;
+        pose = entry.pose;
+        found = true;
+        break;
+    }
+    ReleaseSRWLockShared(&s_commandPoseLock);
+    return found;
+}
+
+static void RemoveCommandPose(void* command) {
+    AcquireSRWLockExclusive(&s_commandPoseLock);
+    for (auto& entry : s_commandPoses) {
+        if (entry.command != command) continue;
+        entry.command = nullptr;
+        entry.serial = 0;
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_commandPoseLock);
+}
+
+static void MultiplyMatrix(const float left[16], const float right[16], float result[16]) {
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            result[row * 4 + column] =
+                left[row * 4] * right[column] +
+                left[row * 4 + 1] * right[4 + column] +
+                left[row * 4 + 2] * right[8 + column] +
+                left[row * 4 + 3] * right[12 + column];
+        }
+    }
+}
+
+static bool InvertMatrix(const float matrix[16], float inverse[16]) {
+    float augmented[4][8] = {};
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column)
+            augmented[row][column] = matrix[row * 4 + column];
+        augmented[row][4 + row] = 1.0f;
+    }
+    for (int column = 0; column < 4; ++column) {
+        int pivot = column;
+        for (int row = column + 1; row < 4; ++row) {
+            if (fabsf(augmented[row][column]) > fabsf(augmented[pivot][column])) pivot = row;
+        }
+        if (fabsf(augmented[pivot][column]) < 1.0e-6f) return false;
+        if (pivot != column) {
+            for (int index = 0; index < 8; ++index)
+                std::swap(augmented[pivot][index], augmented[column][index]);
+        }
+        const float divisor = augmented[column][column];
+        for (int index = 0; index < 8; ++index) augmented[column][index] /= divisor;
+        for (int row = 0; row < 4; ++row) {
+            if (row == column) continue;
+            const float factor = augmented[row][column];
+            for (int index = 0; index < 8; ++index)
+                augmented[row][index] -= factor * augmented[column][index];
+        }
+    }
+    for (int row = 0; row < 4; ++row)
+        for (int column = 0; column < 4; ++column)
+            inverse[row * 4 + column] = augmented[row][4 + column];
+    return true;
+}
+
+static void BuildViewRotation(const int32_t rotation[3], float matrix[16]) {
+    constexpr float kUnisToRadians = 6.2831853071795864769f / 65536.0f;
+    const float pitch = rotation[0] * kUnisToRadians;
+    const float yaw = rotation[1] * kUnisToRadians;
+    const float roll = rotation[2] * kUnisToRadians;
+    const float cp = cosf(pitch), sp = sinf(pitch);
+    const float cy = cosf(yaw), sy = sinf(yaw);
+    const float cr = cosf(roll), sr = sinf(roll);
+    const float right[3] = { -sy, cy, 0.0f };
+    const float up[3] = { -sp * cy, -sp * sy, cp };
+    const float forward[3] = { cp * cy, cp * sy, sp };
+    const float rolledRight[3] = {
+        right[0] * cr + up[0] * sr,
+        right[1] * cr + up[1] * sr,
+        right[2] * cr + up[2] * sr
+    };
+    const float rolledUp[3] = {
+        up[0] * cr - right[0] * sr,
+        up[1] * cr - right[1] * sr,
+        up[2] * cr - right[2] * sr
+    };
+    memset(matrix, 0, sizeof(float) * 16);
+    for (int axis = 0; axis < 3; ++axis) {
+        matrix[axis * 4] = rolledRight[axis];
+        matrix[axis * 4 + 1] = rolledUp[axis];
+        matrix[axis * 4 + 2] = forward[axis];
+    }
+    matrix[15] = 1.0f;
+}
 
 static void RotateByYaw(float yaw, const float local[3], float world[3]) {
     const float sine = sinf(yaw);
@@ -50,6 +204,8 @@ static void RelativeQuaternion(const float reference[4], const float current[4],
 }
 
 bool IsCameraFound() { return s_cameraFound; }
+bool IsNativeMultiviewActive() { return s_nativeMultiviewActive.load(); }
+uint64_t GetNativeMultiviewGeneration() { return s_nativeMultiviewGeneration.load(); }
 float* GetCameraLocation() {
     return s_camera.found ? reinterpret_cast<float*>(s_camera.cameraCacheLocation) : s_location;
 }
@@ -74,7 +230,8 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
 
     auto& frameLoop = xr::FrameLoop::Instance();
     auto& openXR = xr::OpenXRContext::Instance();
-    if (!s_camera.found || !openXR.IsInitialized()) {
+    const bool simulatedPose = frameLoop.IsDesktopTestMode();
+    if (!s_camera.found || (!simulatedPose && !openXR.IsInitialized())) {
         s_originalViewportDraw(viewportClient, viewport, canvas);
         return;
     }
@@ -86,6 +243,11 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
         const int eye = sequential ? pass : frameLoop.GetRenderEye();
         float originalLocation[3] = {};
         int32_t originalRotation[3] = {};
+        float appliedHeadLocation[3] = {};
+        float appliedLocation[3] = {};
+        int32_t appliedRotation[3] = {};
+        XrView poseViews[2] = {};
+        bool realPoseValid = false;
         float originalFov = 0.0f;
         bool cameraOffsetApplied = false;
         if (s_camera.found && s_camera.cameraCacheLocation && s_camera.cameraCacheRotation) {
@@ -100,12 +262,23 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                 constexpr float kRadiansToUnis = 65536.0f / 6.2831853071795864769f;
                 const float yaw = rotation[1] * kUnisToRadians;
 
-                if (openXR.HasValidPose()) {
-                    const float* headPosition = openXR.GetHeadPosition();
-                    const float* headRotation = openXR.GetHeadRotation();
+                float simulatedPosition[3] = {};
+                float simulatedRotation[4] = {};
+                if (simulatedPose)
+                    frameLoop.GetDesktopHeadPose(simulatedPosition, simulatedRotation);
+                float realPosition[3] = {};
+                float realRotation[4] = {};
+                realPoseValid = !simulatedPose &&
+                    openXR.GetPoseSnapshot(realPosition, realRotation, poseViews);
+                if (simulatedPose || realPoseValid) {
+                    const float* headPosition = simulatedPose ? simulatedPosition : realPosition;
+                    const float* headRotation = simulatedPose ? simulatedRotation : realRotation;
+                    if (s_poseReferenceValid && s_poseReferenceSimulated != simulatedPose)
+                        s_poseReferenceValid = false;
                     if (!s_poseReferenceValid) {
                         memcpy(s_poseReferencePosition, headPosition, sizeof(s_poseReferencePosition));
                         memcpy(s_poseReferenceRotation, headRotation, sizeof(s_poseReferenceRotation));
+                        s_poseReferenceSimulated = simulatedPose;
                         s_poseReferenceValid = true;
                     }
                     const float xrDelta[3] = {
@@ -134,25 +307,45 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                         atan2f(ueForwardZ, sqrtf(ueForwardX * ueForwardX + ueForwardY * ueForwardY)) *
                         rotationScale * kRadiansToUnis);
                     if (config::Get().roll_enabled) {
-                        const float roll = atan2f(2.0f * (relative[3] * relative[2] +
-                            relative[0] * relative[1]), 1.0f - 2.0f *
-                            (relative[1] * relative[1] + relative[2] * relative[2]));
-                        rotation[2] += static_cast<int32_t>(roll * rotationScale * kRadiansToUnis);
+                        const float xrUpX = 2.0f * (relative[0] * relative[1] -
+                            relative[3] * relative[2]);
+                        const float xrUpY = 1.0f - 2.0f *
+                            (relative[0] * relative[0] + relative[2] * relative[2]);
+                        const float xrUpZ = 2.0f * (relative[1] * relative[2] +
+                            relative[3] * relative[0]);
+                        const float ueUp[3] = { -xrUpZ, xrUpX, xrUpY };
+                        const float headYaw = atan2f(ueForwardY, ueForwardX);
+                        const float headPitch = atan2f(ueForwardZ,
+                            sqrtf(ueForwardX * ueForwardX + ueForwardY * ueForwardY));
+                        const float right[3] = { -sinf(headYaw), cosf(headYaw), 0.0f };
+                        const float levelUp[3] = {
+                            -sinf(headPitch) * cosf(headYaw),
+                            -sinf(headPitch) * sinf(headYaw),
+                            cosf(headPitch)
+                        };
+                        const float roll = atan2f(
+                            -(ueUp[0] * right[0] + ueUp[1] * right[1] + ueUp[2] * right[2]),
+                            ueUp[0] * levelUp[0] + ueUp[1] * levelUp[1] +
+                                ueUp[2] * levelUp[2]);
+                        rotation[2] -= static_cast<int32_t>(roll * rotationScale * kRadiansToUnis);
                     }
                 }
 
+                memcpy(appliedHeadLocation, location, sizeof(appliedHeadLocation));
                 const float halfIpdUnits = config::Get().ipd_mm * 0.05f;
                 const float side = eye == 0 ? -halfIpdUnits : halfIpdUnits;
                 location[0] += -sinf(yaw) * side;
                 location[1] += cosf(yaw) * side;
                 float correctedFov = config::Get().fov_degrees;
                 float scaleX = 0.0f, scaleY = 0.0f, offsetX = 0.0f, offsetY = 0.0f;
-                if (frameLoop.IsProjectionCorrectionEnabled()) {
+                if (openXR.IsInitialized() && frameLoop.IsProjectionCorrectionEnabled()) {
                     openXR.GetProjectionCrop(eye,
                         static_cast<float>(config::Get().render_width) / config::Get().render_height,
                         scaleX, scaleY, offsetX, offsetY, correctedFov);
                 }
                 *fov = correctedFov;
+                memcpy(appliedLocation, location, sizeof(appliedLocation));
+                memcpy(appliedRotation, rotation, sizeof(appliedRotation));
                 cameraOffsetApplied = true;
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 cameraOffsetApplied = false;
@@ -160,8 +353,33 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
         }
 
         if (sequential) frameLoop.SetSequentialRenderEye(eye);
-        openXR.MarkEyeRendered(eye);
+        if (cameraOffsetApplied) {
+            AcquireSRWLockExclusive(&s_pendingViewPoseLock);
+            PendingViewPose& pendingPose = s_pendingViewPoses[eye];
+            pendingPose.active = true;
+            pendingPose.xrViewsValid = !simulatedPose && realPoseValid;
+            pendingPose.eye = eye;
+            memcpy(pendingPose.originalLocation, originalLocation,
+                   sizeof(pendingPose.originalLocation));
+            memcpy(pendingPose.headLocation, appliedHeadLocation,
+                   sizeof(pendingPose.headLocation));
+            memcpy(pendingPose.sourceLocation, appliedLocation,
+                   sizeof(pendingPose.sourceLocation));
+            memcpy(pendingPose.location, appliedLocation, sizeof(pendingPose.location));
+            memcpy(pendingPose.rotation, appliedRotation, sizeof(pendingPose.rotation));
+            if (pendingPose.xrViewsValid) {
+                pendingPose.xrViews[0] = poseViews[0];
+                pendingPose.xrViews[1] = poseViews[1];
+            }
+            ReleaseSRWLockExclusive(&s_pendingViewPoseLock);
+            s_latestPendingEye.store(eye, std::memory_order_release);
+        }
+        if (openXR.IsInitialized() && !s_nativeMultiviewActive.load())
+            openXR.MarkEyeRendered(eye);
+        input::InputHook::Instance().ApplyRightHand(eye);
+        input::InputHook::Instance().ApplyLeftHand(eye);
         s_originalViewportDraw(viewportClient, viewport, canvas);
+        input::InputHook::Instance().Restore();
         if (sequential) frameLoop.CaptureSequentialEye(eye);
 
         if (cameraOffsetApplied) {
@@ -172,8 +390,11 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                         s_camera.cameraCacheLocation);
                     const auto* renderedRotation = reinterpret_cast<const int32_t*>(
                         s_camera.cameraCacheRotation);
-                    Log("[Camera] Geometric AFR applied: eye=%d postDrawLoc=(%.1f,%.1f,%.1f) "
-                        "postDrawRot=(%d,%d,%d)", eye, renderedLocation[0], renderedLocation[1],
+                    Log("[Camera] Geometric AFR write: eye=%d appliedLoc=(%.1f,%.1f,%.1f) "
+                        "appliedRot=(%d,%d,%d) postDrawLoc=(%.1f,%.1f,%.1f) "
+                        "postDrawRot=(%d,%d,%d)", eye, appliedLocation[0], appliedLocation[1],
+                        appliedLocation[2], appliedRotation[0], appliedRotation[1],
+                        appliedRotation[2], renderedLocation[0], renderedLocation[1],
                         renderedLocation[2], renderedRotation[0], renderedRotation[1],
                         renderedRotation[2]);
                     loggedAfrWrite = true;
@@ -239,7 +460,9 @@ static void ProbeRendererCamera(void* renderer) {
                     if (++rotationMatches >= 8) break;
                 }
             }
-            const size_t dumpStart = matchedOffset >= 0x80 ? matchedOffset - 0x80 : 0;
+            // UE3 keeps projection and inverse-projection matrices before the
+            // camera origin. Include both in the one-shot diagnostic dump.
+            const size_t dumpStart = matchedOffset >= 0x200 ? matchedOffset - 0x200 : 0;
             const size_t dumpEnd = (std::min)(matchedOffset + 0x100, viewScanSize);
             for (size_t offset = dumpStart; offset < dumpEnd; offset += 16) {
                 const auto* value = reinterpret_cast<const float*>(matchedView + offset);
@@ -252,15 +475,411 @@ static void ProbeRendererCamera(void* renderer) {
     }
 }
 
+struct FinalViewBackup {
+    float translatedView[16] = {};
+    float translatedViewProjection[16] = {};
+    float inverseTranslatedViewProjection[16] = {};
+    float negativeOrigin[4] = {};
+    float viewProjection[16] = {};
+    float inverseViewProjection[16] = {};
+    float origin[4] = {};
+};
+
+static bool ApplyPoseToView(uintptr_t viewAddress, const PendingViewPose& pose) {
+    FinalViewBackup backup = {};
+    __try {
+        if (viewAddress < 0x10000) return false;
+        auto* projection = reinterpret_cast<float*>(viewAddress + 0xC0);
+        auto* translatedView = reinterpret_cast<float*>(viewAddress + 0x130);
+        auto* translatedViewProjection = reinterpret_cast<float*>(viewAddress + 0x170);
+        auto* inverseTranslatedViewProjection = reinterpret_cast<float*>(viewAddress + 0x1B0);
+        auto* negativeOrigin = reinterpret_cast<float*>(viewAddress + 0x1F0);
+        auto* viewProjection = reinterpret_cast<float*>(viewAddress + 0x200);
+        auto* inverseViewProjection = reinterpret_cast<float*>(viewAddress + 0x280);
+        auto* origin = reinterpret_cast<float*>(viewAddress + 0x2C0);
+        const float originError =
+            fabsf(origin[0] - pose.originalLocation[0]) +
+            fabsf(origin[1] - pose.originalLocation[1]) +
+            fabsf(origin[2] - pose.originalLocation[2]);
+        const float sourceOriginError =
+            fabsf(origin[0] - pose.sourceLocation[0]) +
+            fabsf(origin[1] - pose.sourceLocation[1]) +
+            fabsf(origin[2] - pose.sourceLocation[2]);
+        const bool validProjection = projection[0] > 0.1f && projection[5] > 0.1f &&
+                                     fabsf(projection[11] - 1.0f) < 0.01f &&
+                                     fabsf(projection[15]) < 0.01f;
+        if ((std::min)(originError, sourceOriginError) > 10.0f || !validProjection)
+            return false;
+
+        if (pose.eye >= 0 && pose.eye < 2) {
+            if (pose.xrViewsValid) {
+                const XrFovf& fov = pose.xrViews[pose.eye].fov;
+                const float tanLeft = tanf(fov.angleLeft);
+                const float tanRight = tanf(fov.angleRight);
+                const float tanDown = tanf(fov.angleDown);
+                const float tanUp = tanf(fov.angleUp);
+                const float width = tanRight - tanLeft;
+                const float height = tanUp - tanDown;
+                if (width > 0.01f && height > 0.01f) {
+                    projection[0] = 2.0f / width;
+                    projection[5] = 2.0f / height;
+                    projection[8] = -(tanRight + tanLeft) / width;
+                    projection[9] = -(tanUp + tanDown) / height;
+                }
+            } else {
+                const float* viewport = reinterpret_cast<const float*>(viewAddress + 0x50);
+                if (viewport[2] > 0.0f && viewport[3] > 0.0f)
+                    projection[5] = projection[0] * viewport[2] / viewport[3];
+            }
+            if (s_nativeMultiviewActive.load()) {
+                const float magnitude = config::Get().convergence_m * 0.01f;
+                if (magnitude > 0.0f) {
+                    const float convergence = (std::min)(0.20f, magnitude);
+                    projection[8] += pose.eye == 0 ? convergence : -convergence;
+                }
+            }
+            float inverseProjection[16] = {};
+            if (!InvertMatrix(projection, inverseProjection)) return false;
+            memcpy(reinterpret_cast<void*>(viewAddress + 0x240), inverseProjection,
+                   sizeof(inverseProjection));
+            if (*reinterpret_cast<const int*>(viewAddress + 0x448) != 0)
+                memcpy(reinterpret_cast<void*>(viewAddress + 0x450), projection,
+                       sizeof(float) * 16);
+        }
+
+        memcpy(backup.translatedView, translatedView, sizeof(backup.translatedView));
+        memcpy(backup.translatedViewProjection, translatedViewProjection,
+               sizeof(backup.translatedViewProjection));
+        memcpy(backup.inverseTranslatedViewProjection, inverseTranslatedViewProjection,
+               sizeof(backup.inverseTranslatedViewProjection));
+        memcpy(backup.negativeOrigin, negativeOrigin, sizeof(backup.negativeOrigin));
+        memcpy(backup.viewProjection, viewProjection, sizeof(backup.viewProjection));
+        memcpy(backup.inverseViewProjection, inverseViewProjection,
+               sizeof(backup.inverseViewProjection));
+        memcpy(backup.origin, origin, sizeof(backup.origin));
+
+        float rotation[16] = {};
+        BuildViewRotation(pose.rotation, rotation);
+        float newTranslatedView[16] = {};
+        memcpy(newTranslatedView, backup.translatedView, sizeof(newTranslatedView));
+        for (int row = 0; row < 3; ++row)
+            memcpy(newTranslatedView + row * 4, rotation + row * 4, sizeof(float) * 3);
+        float newTranslatedViewProjection[16] = {};
+        float newInverseTranslatedViewProjection[16] = {};
+        MultiplyMatrix(newTranslatedView, projection, newTranslatedViewProjection);
+        if (!InvertMatrix(newTranslatedViewProjection,
+                          newInverseTranslatedViewProjection)) return false;
+
+        float fullView[16] = {};
+        memcpy(fullView, rotation, sizeof(fullView));
+        const float* location = pose.location;
+        fullView[12] = -(location[0] * fullView[0] + location[1] * fullView[4] +
+                         location[2] * fullView[8]);
+        fullView[13] = -(location[0] * fullView[1] + location[1] * fullView[5] +
+                         location[2] * fullView[9]);
+        fullView[14] = -(location[0] * fullView[2] + location[1] * fullView[6] +
+                         location[2] * fullView[10]);
+        float newViewProjection[16] = {};
+        float newInverseViewProjection[16] = {};
+        MultiplyMatrix(fullView, projection, newViewProjection);
+        if (!InvertMatrix(newViewProjection, newInverseViewProjection)) return false;
+
+        memcpy(translatedView, newTranslatedView, sizeof(newTranslatedView));
+        memcpy(translatedViewProjection, newTranslatedViewProjection,
+               sizeof(newTranslatedViewProjection));
+        memcpy(inverseTranslatedViewProjection, newInverseTranslatedViewProjection,
+               sizeof(newInverseTranslatedViewProjection));
+        memcpy(viewProjection, newViewProjection, sizeof(newViewProjection));
+        memcpy(inverseViewProjection, newInverseViewProjection,
+               sizeof(newInverseViewProjection));
+        // RenderScene phase 2 replaces the active matrices from this alternate
+        // cache when +0x448 is set. Keep that phase on the same tracked pose.
+        if (*reinterpret_cast<const int*>(viewAddress + 0x448) != 0) {
+            memcpy(reinterpret_cast<void*>(viewAddress + 0x490), newViewProjection,
+                   sizeof(newViewProjection));
+            memcpy(reinterpret_cast<void*>(viewAddress + 0x4D0), newTranslatedViewProjection,
+                   sizeof(newTranslatedViewProjection));
+            memcpy(reinterpret_cast<void*>(viewAddress + 0x510), newInverseViewProjection,
+                   sizeof(newInverseViewProjection));
+            memcpy(reinterpret_cast<void*>(viewAddress + 0x550),
+                   newInverseTranslatedViewProjection,
+                   sizeof(newInverseTranslatedViewProjection));
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            negativeOrigin[axis] = -location[axis];
+            origin[axis] = location[axis];
+        }
+        origin[3] = 1.0f;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static int ApplyFinalViewPose(void* renderer, uintptr_t& firstViewAddress,
+                              PendingViewPose& pose, int& commandViewCount) {
+    firstViewAddress = 0;
+    commandViewCount = 0;
+    if (!renderer) return 0;
+    if (!GetCommandPose(renderer, pose)) {
+        const int eye = s_latestPendingEye.load(std::memory_order_acquire);
+        AcquireSRWLockShared(&s_pendingViewPoseLock);
+        pose = s_pendingViewPoses[eye];
+        ReleaseSRWLockShared(&s_pendingViewPoseLock);
+    }
+    if (!pose.active) return 0;
+
+    uintptr_t viewArray = 0;
+    __try {
+        const auto* bytes = reinterpret_cast<const unsigned char*>(renderer);
+        viewArray = *reinterpret_cast<const uintptr_t*>(bytes + 0x68);
+        commandViewCount = *reinterpret_cast<const int*>(bytes + 0x70);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    if (viewArray < 0x10000 || commandViewCount <= 0 || commandViewCount > 16) return 0;
+
+    int appliedCount = 0;
+    constexpr uintptr_t kCommandViewStride = 0x1750;
+    float stereoRotation[16] = {};
+    if (commandViewCount == 2) BuildViewRotation(pose.rotation, stereoRotation);
+    for (int index = 0; index < commandViewCount; ++index) {
+        const uintptr_t viewAddress = viewArray + index * kCommandViewStride;
+        PendingViewPose viewPose = pose;
+        if (commandViewCount == 2) {
+            const float side = (index == 0 ? -1.0f : 1.0f) * config::Get().ipd_mm * 0.05f;
+            viewPose.eye = index;
+            viewPose.location[0] = pose.headLocation[0] + stereoRotation[0] * side;
+            viewPose.location[1] = pose.headLocation[1] + stereoRotation[4] * side;
+            viewPose.location[2] = pose.headLocation[2] + stereoRotation[8] * side;
+        }
+        if (!ApplyPoseToView(viewAddress, viewPose)) continue;
+        if (!firstViewAddress) firstViewAddress = viewAddress;
+        ++appliedCount;
+    }
+    return appliedCount;
+}
+
 static void __fastcall HookedRenderScene(void* renderer) {
     static std::atomic<uint64_t> renderCount{0};
     const uint64_t count = ++renderCount;
-    if (count == 1) ProbeRendererCamera(renderer);
+    if (count == 1) {
+        ProbeRendererCamera(renderer);
+        void* frames[24] = {};
+        const USHORT frameCount = CaptureStackBackTrace(1, _countof(frames), frames, nullptr);
+        Log("[Camera] RenderScene call stack: frames=%u", frameCount);
+        for (USHORT frame = 0; frame < frameCount; ++frame) {
+            HMODULE owner = nullptr;
+            char ownerPath[MAX_PATH] = "<private>";
+            uintptr_t offset = 0;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(frames[frame]), &owner) && owner) {
+                GetModuleFileNameA(owner, ownerPath, MAX_PATH);
+                offset = reinterpret_cast<uintptr_t>(frames[frame]) -
+                         reinterpret_cast<uintptr_t>(owner);
+            }
+            Log("[Camera]   renderStack[%u]=%p module=%s+0x%llX", frame, frames[frame],
+                ownerPath, static_cast<unsigned long long>(offset));
+        }
+    }
     if (count == 1 || count % 600 == 0) {
         Log("[Camera] RenderScene heartbeat: count=%llu renderer=%p frame=%llu",
             count, renderer, xr::FrameLoop::Instance().GetFrameCount());
     }
+    uintptr_t viewAddress = 0;
+    PendingViewPose appliedPose = {};
+    int commandViewCount = 0;
+    const int finalPoseCount = ApplyFinalViewPose(
+        renderer, viewAddress, appliedPose, commandViewCount);
+    if (finalPoseCount > 0) {
+        static LONG loggedFinalPoseCounts[3] = {};
+        const int logSlot = commandViewCount >= 1 && commandViewCount <= 2
+            ? commandViewCount : 0;
+        if (InterlockedCompareExchange(&loggedFinalPoseCounts[logSlot], 1, 0) == 0) {
+            const bool alternateView = *reinterpret_cast<const int*>(viewAddress + 0x448) != 0;
+            Log("[Camera] Final command view pose applied: eye=%d views=%d/%d first=%p alt=%d "
+                "loc=(%.1f,%.1f,%.1f) rot=(%d,%d,%d)", appliedPose.eye,
+                finalPoseCount, commandViewCount, reinterpret_cast<void*>(viewAddress),
+                alternateView, appliedPose.location[0],
+                appliedPose.location[1], appliedPose.location[2],
+                appliedPose.rotation[0], appliedPose.rotation[1],
+                appliedPose.rotation[2]);
+        }
+    }
+    const bool completedNativeMultiview = finalPoseCount == 2 && commandViewCount == 2;
+    if (completedNativeMultiview && appliedPose.xrViewsValid)
+        xr::OpenXRContext::Instance().SetRenderedViewSnapshot(appliedPose.xrViews);
     s_originalRenderScene(renderer);
+    RemoveCommandPose(renderer);
+    if (completedNativeMultiview)
+        s_nativeMultiviewGeneration.fetch_add(1, std::memory_order_release);
+}
+
+static void LogRenderCommandLayout(const char* stage, void* command) {
+    if (!command) return;
+    __try {
+        const auto* bytes = reinterpret_cast<const unsigned char*>(command);
+        const uintptr_t familyViews = *reinterpret_cast<const uintptr_t*>(bytes + 0x08);
+        const int familyNum = *reinterpret_cast<const int*>(bytes + 0x10);
+        const int familyMax = *reinterpret_cast<const int*>(bytes + 0x14);
+        const uintptr_t ownedViews = *reinterpret_cast<const uintptr_t*>(bytes + 0x68);
+        const int ownedNum = *reinterpret_cast<const int*>(bytes + 0x70);
+        const int ownedMax = *reinterpret_cast<const int*>(bytes + 0x74);
+        Log("[StereoResearch] %s command=%p family=%p num/max=%d/%d "
+            "owned=%p num/max=%d/%d thread=%u", stage, command,
+            reinterpret_cast<void*>(familyViews), familyNum, familyMax,
+            reinterpret_cast<void*>(ownedViews), ownedNum, ownedMax,
+            GetCurrentThreadId());
+
+        const int viewCount = (std::min)(ownedNum, 4);
+        for (int index = 0; index < viewCount; ++index) {
+            constexpr uintptr_t kViewStride = 0x1750;
+            const uintptr_t owned = ownedViews + index * kViewStride;
+            const uintptr_t familyPointer = familyViews
+                ? *reinterpret_cast<const uintptr_t*>(familyViews + index * sizeof(uintptr_t)) : 0;
+            const uintptr_t ownerFamily = *reinterpret_cast<const uintptr_t*>(owned);
+            const float* viewport = reinterpret_cast<const float*>(owned + 0x50);
+            const int* viewportPixels = reinterpret_cast<const int*>(owned + 0x68);
+            const float* derivedRect = reinterpret_cast<const float*>(owned + 0x430);
+            Log("[StereoResearch]   view[%d]=%p familyPtr=%p owner=%p "
+                "rect=(%.1f,%.1f %.1fx%.1f) pixels=(%d,%d %dx%d) "
+                "derived=(%.3f,%.3f,%.3f,%.3f) alt=%d", index,
+                reinterpret_cast<void*>(owned), reinterpret_cast<void*>(familyPointer),
+                reinterpret_cast<void*>(ownerFamily), viewport[0], viewport[1],
+                viewport[2], viewport[3], viewportPixels[0], viewportPixels[1],
+                viewportPixels[2], viewportPixels[3], derivedRect[0], derivedRect[1],
+                derivedRect[2], derivedRect[3],
+                *reinterpret_cast<const int*>(owned + 0x448));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[StereoResearch] %s command layout exception: 0x%08X", stage,
+            GetExceptionCode());
+    }
+}
+
+static void* __fastcall HookedRenderCommandConstructor(void* destination, void* sourceViewFamily,
+                                                        void* argument3, void* argument4) {
+    void* constructorSource = sourceViewFamily;
+    alignas(16) unsigned char stereoFamily[0x60] = {};
+    alignas(16) unsigned char stereoSourceViews[2][0x1750] = {};
+    uintptr_t stereoViewPointers[2] = {};
+    bool stereoSource = false;
+    if (sourceViewFamily && s_camera.found) {
+        __try {
+            const auto* sourceBytes = reinterpret_cast<const unsigned char*>(sourceViewFamily);
+            const uintptr_t sourceViews = *reinterpret_cast<const uintptr_t*>(sourceBytes);
+            const int sourceViewCount = *reinterpret_cast<const int*>(sourceBytes + 0x08);
+            const uintptr_t sourceView = sourceViews
+                ? *reinterpret_cast<const uintptr_t*>(sourceViews) : 0;
+            if (sourceViewCount == 1 && sourceView >= 0x10000) {
+                const auto* origin = reinterpret_cast<const float*>(sourceView + 0x2C0);
+                const auto* viewport = reinterpret_cast<const float*>(sourceView + 0x50);
+                const auto* cameraLocation = reinterpret_cast<const float*>(
+                    s_camera.cameraCacheLocation);
+                const float originError = fabsf(origin[0] - cameraLocation[0]) +
+                    fabsf(origin[1] - cameraLocation[1]) +
+                    fabsf(origin[2] - cameraLocation[2]);
+                const bool principalViewport = viewport[2] >= 1280.0f && viewport[3] >= 720.0f;
+                if (originError <= 10.0f && principalViewport) {
+                    memcpy(stereoFamily, sourceViewFamily, sizeof(stereoFamily));
+                    memcpy(stereoSourceViews[0], reinterpret_cast<const void*>(sourceView),
+                           sizeof(stereoSourceViews[0]));
+                    memcpy(stereoSourceViews[1], reinterpret_cast<const void*>(sourceView),
+                           sizeof(stereoSourceViews[1]));
+                    const float halfWidth = viewport[2] * 0.5f;
+                    for (int eye = 0; eye < 2; ++eye) {
+                        auto* eyeViewport = reinterpret_cast<float*>(stereoSourceViews[eye] + 0x50);
+                        auto* eyePixels = reinterpret_cast<int*>(stereoSourceViews[eye] + 0x68);
+                        eyeViewport[0] = eye == 0 ? viewport[0] : viewport[0] + halfWidth;
+                        eyeViewport[1] = viewport[1];
+                        eyeViewport[2] = halfWidth;
+                        eyeViewport[3] = viewport[3];
+                        eyePixels[0] = static_cast<int>(eyeViewport[0]);
+                        eyePixels[1] = static_cast<int>(eyeViewport[1]);
+                        eyePixels[2] = static_cast<int>(eyeViewport[2]);
+                        eyePixels[3] = static_cast<int>(eyeViewport[3]);
+                        stereoViewPointers[eye] = reinterpret_cast<uintptr_t>(
+                            stereoSourceViews[eye]);
+                    }
+                    *reinterpret_cast<uintptr_t*>(stereoFamily) =
+                        reinterpret_cast<uintptr_t>(stereoViewPointers);
+                    *reinterpret_cast<int*>(stereoFamily + 0x08) = 2;
+                    *reinterpret_cast<int*>(stereoFamily + 0x0C) = 2;
+                    constructorSource = stereoFamily;
+                    stereoSource = true;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            constructorSource = sourceViewFamily;
+            stereoSource = false;
+        }
+    }
+
+    void* result = s_originalRenderCommandConstructor(
+        destination, constructorSource, argument3, argument4);
+    if (stereoSource) {
+        StoreCommandPose(destination);
+        s_nativeMultiviewActive = true;
+        static LONG loggedStereoSource = 0;
+        if (InterlockedCompareExchange(&loggedStereoSource, 1, 0) == 0)
+            Log("[StereoResearch] Principal source family expanded to two native view copies");
+    }
+    static LONG logged = 0;
+    if (InterlockedCompareExchange(&logged, 1, 0) == 0)
+        LogRenderCommandLayout("constructed", destination);
+    return result;
+}
+
+static void __fastcall HookedExecuteRenderCommand(void* command) {
+    static LONG logged = 0;
+    if (InterlockedCompareExchange(&logged, 1, 0) == 0)
+        LogRenderCommandLayout("execute", command);
+    s_originalExecuteRenderCommand(command);
+}
+
+static bool InstallRenderCommandProbes(uintptr_t moduleBase) {
+    constexpr uintptr_t kConstructorRva = 0x00445280;
+    constexpr uintptr_t kExecuteRva = 0x0046D630;
+    static constexpr unsigned char constructorSignature[] = {
+        0x48, 0x8B, 0xC4, 0x4C, 0x89, 0x40, 0x18, 0x48, 0x89, 0x48, 0x08
+    };
+    static constexpr unsigned char executeSignature[] = {
+        0x48, 0x8B, 0xC4, 0x55, 0x48, 0x8D, 0x68, 0xA1, 0x48, 0x81, 0xEC
+    };
+    const uintptr_t constructor = moduleBase + kConstructorRva;
+    const uintptr_t execute = moduleBase + kExecuteRva;
+    if (memcmp(reinterpret_cast<const void*>(constructor), constructorSignature,
+               sizeof(constructorSignature)) != 0 ||
+        memcmp(reinterpret_cast<const void*>(execute), executeSignature,
+               sizeof(executeSignature)) != 0) {
+        Log("[StereoResearch] Render command signature mismatch");
+        return false;
+    }
+
+    MH_STATUS constructorStatus = MH_CreateHook(
+        reinterpret_cast<void*>(constructor), &HookedRenderCommandConstructor,
+        reinterpret_cast<void**>(&s_originalRenderCommandConstructor));
+    MH_STATUS executeStatus = MH_CreateHook(
+        reinterpret_cast<void*>(execute), &HookedExecuteRenderCommand,
+        reinterpret_cast<void**>(&s_originalExecuteRenderCommand));
+    if (constructorStatus != MH_OK || executeStatus != MH_OK) {
+        Log("[StereoResearch] Command probe creation failed: ctor=%s execute=%s",
+            MH_StatusToString(constructorStatus), MH_StatusToString(executeStatus));
+        return false;
+    }
+    MH_QueueEnableHook(reinterpret_cast<void*>(constructor));
+    MH_QueueEnableHook(reinterpret_cast<void*>(execute));
+    const MH_STATUS applyStatus = MH_ApplyQueued();
+    if (applyStatus != MH_OK) {
+        Log("[StereoResearch] Command probe enable failed: %s",
+            MH_StatusToString(applyStatus));
+        return false;
+    }
+    Log("[StereoResearch] Hooked command constructor RVA 0x%llX and execute RVA 0x%llX",
+        static_cast<unsigned long long>(kConstructorRva),
+        static_cast<unsigned long long>(kExecuteRva));
+    return true;
 }
 
 static bool InstallRenderSceneProbe(uintptr_t moduleBase) {
@@ -320,8 +939,19 @@ static DWORD WINAPI ScannerThread(LPVOID) {
     GetModuleInformation(GetCurrentProcess(), gameModule, &modInfo, sizeof(modInfo));
     Log("[Camera] Game module: %p, size: 0x%X", modInfo.lpBaseOfDll, modInfo.SizeOfImage);
 
-    // Phase 1: Scan for UE3 globals and camera cache
-    bool success = ScanForUE3Globals(&s_globals, &s_camera);
+    // Loading screens do not have a live player controller or viewport yet.
+    // Retry instead of permanently falling back after a single early scan.
+    bool success = false;
+    for (int attempt = 1; attempt <= 20; ++attempt) {
+        s_globals = {};
+        s_camera = {};
+        success = ScanForUE3Globals(&s_globals, &s_camera);
+        if (success && s_camera.found) break;
+        if (attempt < 20) {
+            Log("[Camera] Live camera not ready (attempt %d/20); retrying in 3 seconds", attempt);
+            Sleep(3000);
+        }
+    }
 
     if (success) {
         Log("[Camera] UE3 globals discovered successfully");
@@ -341,6 +971,7 @@ static DWORD WINAPI ScannerThread(LPVOID) {
         }
         const bool drawHookInstalled = InstallViewportDrawHook(FindViewportDrawTarget(s_globals));
         InstallRenderSceneProbe(reinterpret_cast<uintptr_t>(gameModule));
+        InstallRenderCommandProbes(reinterpret_cast<uintptr_t>(gameModule));
         if (drawHookInstalled && s_camera.found) {
             config::Get().same_frame_stereo = false;
             Log("[Camera] Camera and Draw boundary validated, but double Draw is disabled: "

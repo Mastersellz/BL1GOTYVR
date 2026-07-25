@@ -4,11 +4,13 @@
 #include "../core/globals.hpp"
 #include "../input/InputHook.hpp"
 #include "../d3d11/D3D11Hooks.hpp"
+#include "../camera/CameraHook.hpp"
 #include "../config/Config.hpp"
 #include <cstring>
 #include <d3dcompiler.h>
 #include <dxgi1_5.h>
 #include <algorithm>
+#include <cmath>
 
 namespace bl1gotyvr { namespace xr {
 
@@ -33,6 +35,8 @@ void FrameLoop::Shutdown() {
     Log("[FrameLoop] Shutting down...");
     InvalidateBackbufferResources();
     if (m_blitConstants) { m_blitConstants->Release(); m_blitConstants = nullptr; }
+    if (m_blitDepthState) { m_blitDepthState->Release(); m_blitDepthState = nullptr; }
+    if (m_blitRasterizerState) { m_blitRasterizerState->Release(); m_blitRasterizerState = nullptr; }
     if (m_desktopCaptureTexture) {
         m_desktopCaptureTexture->Release();
         m_desktopCaptureTexture = nullptr;
@@ -63,9 +67,11 @@ void FrameLoop::InvalidateBackbufferResources() {
     m_sequentialCaptureFailed = false;
 }
 
-void FrameLoop::EnsureEyeTextures(ID3D11Device* device, ID3D11Texture2D* source) {
+void FrameLoop::EnsureEyeTextures(ID3D11Device* device, ID3D11Texture2D* source,
+                                  bool sideBySideSource) {
     D3D11_TEXTURE2D_DESC desc;
     source->GetDesc(&desc);
+    if (sideBySideSource) desc.Width /= 2;
 
     for (int i = 0; i < 2; i++) {
         if (m_eyeTextures[i]) {
@@ -88,7 +94,7 @@ void FrameLoop::EnsureEyeTextures(ID3D11Device* device, ID3D11Texture2D* source)
         texDesc.SampleDesc.Count = 1;
         texDesc.SampleDesc.Quality = 0;
         texDesc.Usage = D3D11_USAGE_DEFAULT;
-        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
         HRESULT hr = device->CreateTexture2D(&texDesc, nullptr, &m_eyeTextures[i]);
         if (FAILED(hr)) {
@@ -98,7 +104,8 @@ void FrameLoop::EnsureEyeTextures(ID3D11Device* device, ID3D11Texture2D* source)
 }
 
 bool FrameLoop::EnsureBlitResources(ID3D11Device* device) {
-    if (m_blitVertexShader && m_blitPixelShader && m_blitSampler && m_blitConstants) return true;
+    if (m_blitVertexShader && m_blitPixelShader && m_blitSampler && m_blitConstants &&
+        m_blitDepthState && m_blitRasterizerState) return true;
     static constexpr char vertexShader[] = R"(
 struct Output { float4 position : SV_Position; float2 uv : TEXCOORD0; };
 Output main(uint id : SV_VertexID) {
@@ -175,11 +182,27 @@ SamplerState sourceSampler : register(s0);
     constantsDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     hr = device->CreateBuffer(&constantsDesc, nullptr, &m_blitConstants);
     if (FAILED(hr)) Log("[FrameLoop] Create blit constants failed: 0x%08X", hr);
+    if (FAILED(hr)) return false;
+    D3D11_DEPTH_STENCIL_DESC depthDesc = {};
+    depthDesc.DepthEnable = FALSE;
+    depthDesc.StencilEnable = FALSE;
+    hr = device->CreateDepthStencilState(&depthDesc, &m_blitDepthState);
+    if (FAILED(hr)) {
+        Log("[FrameLoop] Create blit depth state failed: 0x%08X", hr);
+        return false;
+    }
+    D3D11_RASTERIZER_DESC rasterizerDesc = {};
+    rasterizerDesc.FillMode = D3D11_FILL_SOLID;
+    rasterizerDesc.CullMode = D3D11_CULL_NONE;
+    rasterizerDesc.DepthClipEnable = TRUE;
+    hr = device->CreateRasterizerState(&rasterizerDesc, &m_blitRasterizerState);
+    if (FAILED(hr)) Log("[FrameLoop] Create blit rasterizer state failed: 0x%08X", hr);
     return SUCCEEDED(hr);
 }
 
 bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* source,
-                            ID3D11Texture2D* destination, int eye) {
+                            ID3D11Texture2D* destination, int eye,
+                            bool sideBySideSource, int sourceEye) {
     ID3D11Device* device = nullptr;
     context->GetDevice(&device);
     if (!device || !EnsureBlitResources(device)) {
@@ -241,6 +264,12 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     ID3D11SamplerState* oldSampler = nullptr;
     ID3D11Buffer* oldConstants = nullptr;
     ID3D11InputLayout* oldLayout = nullptr;
+    ID3D11BlendState* oldBlend = nullptr;
+    ID3D11DepthStencilState* oldDepthState = nullptr;
+    ID3D11RasterizerState* oldRasterizerState = nullptr;
+    FLOAT oldBlendFactor[4] = {};
+    UINT oldSampleMask = 0;
+    UINT oldStencilRef = 0;
     D3D11_PRIMITIVE_TOPOLOGY oldTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
     D3D11_VIEWPORT oldViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
     UINT viewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
@@ -253,6 +282,9 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     context->PSGetConstantBuffers(0, 1, &oldConstants);
     context->IAGetInputLayout(&oldLayout);
     context->IAGetPrimitiveTopology(&oldTopology);
+    context->OMGetBlendState(&oldBlend, oldBlendFactor, &oldSampleMask);
+    context->OMGetDepthStencilState(&oldDepthState, &oldStencilRef);
+    context->RSGetState(&oldRasterizerState);
 
     D3D11_VIEWPORT viewport = {};
     viewport.Width = static_cast<float>(destinationDesc.Width);
@@ -266,16 +298,27 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     context->PSSetShader(m_blitPixelShader, nullptr, 0);
     context->PSSetShaderResources(0, 1, &sourceView);
     context->PSSetSamplers(0, 1, &m_blitSampler);
+    context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+    context->OMSetDepthStencilState(m_blitDepthState, 0);
+    context->RSSetState(m_blitRasterizerState);
     float convergenceShift = 0.0f;
     float uvScaleX = 1.0f, uvScaleY = 1.0f;
     float uvOffsetX = 0.0f, uvOffsetY = 0.0f;
     float projectionFov = 0.0f;
     const auto& vrSettings = config::Get();
+    const int sampledEye = sourceEye >= 0 ? sourceEye : eye;
+    const float sourceAspect = sideBySideSource
+        ? static_cast<float>(sourceDesc.Width / 2) / sourceDesc.Height
+        : static_cast<float>(sourceDesc.Width) / sourceDesc.Height;
     const bool projectionCrop = m_projectionCorrection &&
         OpenXRContext::Instance().GetProjectionCrop(eye,
-            static_cast<float>(sourceDesc.Width) / sourceDesc.Height,
+            sourceAspect,
             uvScaleX, uvScaleY, uvOffsetX, uvOffsetY, projectionFov);
-    if (!projectionCrop && vrSettings.convergence_m > 0.0f && eye >= 0 && eye < 2) {
+    if (sideBySideSource) {
+        uvScaleX *= 0.5f;
+        uvOffsetX = (sampledEye == 0 ? 0.0f : 0.5f) + uvOffsetX * 0.5f;
+    } else if (!m_submittingNativeEyes && !projectionCrop &&
+               vrSettings.convergence_m > 0.0f && eye >= 0 && eye < 2) {
         const float magnitude = (std::min)(0.20f, vrSettings.convergence_m * 0.01f);
         convergenceShift = eye == 0 ? -magnitude : magnitude;
     }
@@ -312,6 +355,9 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     context->PSSetShaderResources(0, 1, &oldResource);
     context->PSSetSamplers(0, 1, &oldSampler);
     context->PSSetConstantBuffers(0, 1, &oldConstants);
+    context->OMSetBlendState(oldBlend, oldBlendFactor, oldSampleMask);
+    context->OMSetDepthStencilState(oldDepthState, oldStencilRef);
+    context->RSSetState(oldRasterizerState);
 
     if (oldTarget) oldTarget->Release();
     if (oldDepth) oldDepth->Release();
@@ -321,6 +367,9 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     if (oldSampler) oldSampler->Release();
     if (oldConstants) oldConstants->Release();
     if (oldLayout) oldLayout->Release();
+    if (oldBlend) oldBlend->Release();
+    if (oldDepthState) oldDepthState->Release();
+    if (oldRasterizerState) oldRasterizerState->Release();
     destinationView->Release();
     sourceView->Release();
     return true;
@@ -541,7 +590,8 @@ ID3D11Texture2D* FrameLoop::CaptureGdiFrame(ID3D11Device* device,
     return m_gdiCaptureTexture;
 }
 
-bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* source, int eye) {
+bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* source, int eye,
+                                 bool sideBySideSource, int sourceEye) {
     auto& xr = OpenXRContext::Instance();
     EyeData& eyeData = (eye == 0) ? xr.GetLeftEye() : xr.GetRightEye();
 
@@ -573,11 +623,11 @@ bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* 
     destTex->GetDesc(&dstDesc);
 
     bool copied = true;
-    if (srcDesc.Width == dstDesc.Width && srcDesc.Height == dstDesc.Height &&
+    if (!sideBySideSource && srcDesc.Width == dstDesc.Width && srcDesc.Height == dstDesc.Height &&
         srcDesc.Format == dstDesc.Format) {
         context->CopyResource(destTex, source);
     } else {
-        if (!BlitTexture(context, source, destTex, eye)) {
+        if (!BlitTexture(context, source, destTex, eye, sideBySideSource, sourceEye)) {
             static bool loggedBlitFailure = false;
             if (!loggedBlitFailure) {
                 Log("[FrameLoop] ERROR: Failed to scale %ux%u source to %ux%u eye texture",
@@ -649,13 +699,18 @@ void FrameLoop::FinishSequentialRender() {
 }
 
 void FrameLoop::ToggleDesktopTestMode() {
-    m_desktopTestMode = !m_desktopTestMode;
-    if (m_desktopTestMode) {
+    const bool enabled = !m_desktopTestMode.load();
+    m_desktopTestMode = enabled;
+    if (enabled) {
         g_desktopTestMode = true;
+        AcquireSRWLockExclusive(&m_desktopPoseLock);
         m_desktopYaw = 0;
         m_desktopPitch = 0;
+        m_desktopRoll = 0;
         memset(m_desktopPosition, 0, sizeof(m_desktopPosition));
-        Log("[FrameLoop] Desktop test mode ENABLED (arrows=look, numpad=move, F6=toggle, F7=capture)");
+        ReleaseSRWLockExclusive(&m_desktopPoseLock);
+        Log("[FrameLoop] Desktop pose simulation ENABLED (arrows=yaw/pitch, "
+            "PgUp/PgDn=roll, numpad=move, Home=reset, F6=toggle)");
     } else {
         g_desktopTestMode = false;
         Log("[FrameLoop] Desktop test mode DISABLED");
@@ -663,17 +718,19 @@ void FrameLoop::ToggleDesktopTestMode() {
 }
 
 void FrameLoop::UpdateDesktopControls() {
-    if (!m_desktopTestMode) return;
+    if (!m_desktopTestMode.load()) return;
 
-    // Arrow keys for rotation
-    float rotSpeed = 0.02f;
+    AcquireSRWLockExclusive(&m_desktopPoseLock);
+    const float rotSpeed = 0.02f;
     if (GetAsyncKeyState(VK_LEFT) & 0x8000) m_desktopYaw -= rotSpeed;
     if (GetAsyncKeyState(VK_RIGHT) & 0x8000) m_desktopYaw += rotSpeed;
     if (GetAsyncKeyState(VK_UP) & 0x8000) m_desktopPitch -= rotSpeed;
     if (GetAsyncKeyState(VK_DOWN) & 0x8000) m_desktopPitch += rotSpeed;
+    if (GetAsyncKeyState(VK_PRIOR) & 0x8000) m_desktopRoll -= rotSpeed;
+    if (GetAsyncKeyState(VK_NEXT) & 0x8000) m_desktopRoll += rotSpeed;
 
-    // Numpad for position
-    float moveSpeed = 10.0f;
+    // Position is expressed in meters, matching OpenXR.
+    const float moveSpeed = 0.01f;
     if (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) m_desktopPosition[0] -= moveSpeed;
     if (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) m_desktopPosition[0] += moveSpeed;
     if (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) m_desktopPosition[2] -= moveSpeed;
@@ -685,8 +742,10 @@ void FrameLoop::UpdateDesktopControls() {
     if (GetAsyncKeyState(VK_HOME) & 0x8000) {
         m_desktopYaw = 0;
         m_desktopPitch = 0;
+        m_desktopRoll = 0;
         memset(m_desktopPosition, 0, sizeof(m_desktopPosition));
     }
+    ReleaseSRWLockExclusive(&m_desktopPoseLock);
 
     // F7 to capture
     static bool f7WasDown = false;
@@ -696,13 +755,26 @@ void FrameLoop::UpdateDesktopControls() {
     }
     f7WasDown = f7Down;
 
-    // F6 to toggle desktop test mode
-    static bool f6WasDown = false;
-    bool f6Down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-    if (f6Down && !f6WasDown) {
-        ToggleDesktopTestMode();
-    }
-    f6WasDown = f6Down;
+}
+
+void FrameLoop::GetDesktopHeadPose(float position[3], float rotation[4]) const {
+    AcquireSRWLockShared(&m_desktopPoseLock);
+    memcpy(position, m_desktopPosition, sizeof(m_desktopPosition));
+
+    const float halfYaw = m_desktopYaw * 0.5f;
+    const float halfPitch = m_desktopPitch * 0.5f;
+    const float halfRoll = m_desktopRoll * 0.5f;
+    const float cy = cosf(halfYaw), sy = sinf(halfYaw);
+    const float cp = cosf(halfPitch), sp = sinf(halfPitch);
+    const float cr = cosf(halfRoll), sr = sinf(halfRoll);
+
+    // OpenXR basis: +X right, +Y up, -Z forward. Compose yaw, pitch,
+    // then roll to emulate an HMD orientation in the same representation.
+    rotation[0] = cy * sp * cr + sy * cp * sr;
+    rotation[1] = sy * cp * cr - cy * sp * sr;
+    rotation[2] = cy * cp * sr - sy * sp * cr;
+    rotation[3] = cy * cp * cr + sy * sp * sr;
+    ReleaseSRWLockShared(&m_desktopPoseLock);
 }
 
 void FrameLoop::SaveStereoCapture() {
@@ -751,7 +823,6 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
 
     // Desktop test mode
     if (m_desktopTestMode) {
-        UpdateDesktopControls();
         // For desktop mode, still submit to compositor if available
         if (!xr.IsInitialized()) return;
     }
@@ -790,14 +861,17 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     ID3D11Texture2D* captureSource = backbuffer;
     D3D11_TEXTURE2D_DESC backDesc = {};
     backbuffer->GetDesc(&backDesc);
-    static int captureMode = 0;
+    // RenderDoc confirms that UE3 finishes world and UI composition in the
+    // SDR swapchain backbuffer. Capture it directly before Present.
+    static int captureMode = 1;
     static int trackedTargetIndex = 0;
     static bool f8WasDown = false;
     const bool f8Down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8Down && !f8WasDown) {
-        captureMode = (captureMode + 1) % 3;
-        Log("[FrameLoop] Capture mode changed: %s", captureMode == 0 ? "GDI fallback" :
-            (captureMode == 1 ? "internal backbuffer" : "tracked SDR target"));
+        captureMode = captureMode == 3 ? 1 : (captureMode == 1 ? 2 : 3);
+        Log("[FrameLoop] Capture mode changed: %s",
+            captureMode == 3 ? "GDI window" :
+                (captureMode == 1 ? "internal SDR backbuffer" : "tracked SDR target"));
     }
     f8WasDown = f8Down;
     static bool f10WasDown = false;
@@ -866,9 +940,31 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         }
     }
     ID3D11Texture2D* desktopTexture = nullptr;
-    ID3D11Texture2D* latestSdrTexture = d3d11::GetLatestSdrRenderTarget();
-    if (latestSdrTexture) latestSdrTexture->Release();
-    ID3D11Texture2D* sdrTexture = captureMode == 2
+    ID3D11Texture2D* latestSdrTexture = captureMode == 2
+        ? d3d11::GetLatestSdrRenderTarget() : nullptr;
+    if (latestSdrTexture) {
+        D3D11_TEXTURE2D_DESC sdrDesc = {};
+        latestSdrTexture->GetDesc(&sdrDesc);
+        ID3D11Device* sdrDevice = nullptr;
+        latestSdrTexture->GetDevice(&sdrDevice);
+        const bool knownSdrFormat =
+            sdrDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+            sdrDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+            sdrDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+            sdrDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+            sdrDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+            sdrDesc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        const bool validSdr = sdrDevice == device && sdrDesc.Width == backDesc.Width &&
+                              sdrDesc.Height == backDesc.Height &&
+                              sdrDesc.SampleDesc.Count == 1 && knownSdrFormat;
+        if (sdrDevice) sdrDevice->Release();
+        if (validSdr) captureSource = latestSdrTexture;
+        else {
+            latestSdrTexture->Release();
+            latestSdrTexture = nullptr;
+        }
+    }
+    ID3D11Texture2D* sdrTexture = captureMode == 2 && captureSource == backbuffer
         ? d3d11::GetTrackedRenderTarget(trackedTargetIndex) : nullptr;
     if (sdrTexture) {
         D3D11_TEXTURE2D_DESC sdrDesc = {};
@@ -885,36 +981,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
             sdrTexture = nullptr;
         }
     }
-    if (captureMode == 0 && captureSource == backbuffer) {
-        desktopTexture = CaptureDesktopFrame(device, context, swapChain);
-        if (desktopTexture) captureSource = desktopTexture;
-    }
-    ID3D11Texture2D* tonemapTexture = d3d11::GetLatestTonemapSource();
-    if (tonemapTexture) {
-        ++tonemapSeen;
-        D3D11_TEXTURE2D_DESC tonemapDesc = {};
-        tonemapTexture->GetDesc(&tonemapDesc);
-        ID3D11Device* tonemapDevice = nullptr;
-        tonemapTexture->GetDevice(&tonemapDevice);
-        const bool knownTonemapFormat =
-            tonemapDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-            tonemapDesc.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
-            tonemapDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-            tonemapDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        const bool validTonemap = captureMode == 0 && captureSource == backbuffer &&
-                                  tonemapDevice == device &&
-                                  tonemapDesc.Width == backDesc.Width &&
-                                  tonemapDesc.Height == backDesc.Height &&
-                                  tonemapDesc.SampleDesc.Count >= 1 && knownTonemapFormat;
-        if (tonemapDevice) tonemapDevice->Release();
-        if (validTonemap) {
-            captureSource = tonemapTexture;
-            ++tonemapAccepted;
-        } else {
-            tonemapTexture->Release();
-            tonemapTexture = nullptr;
-        }
-    }
+    ID3D11Texture2D* tonemapTexture = nullptr;
     ID3D11Texture2D* sceneTexture = d3d11::GetLatestSceneRenderTarget();
     if (sceneTexture && captureMode == 0 && captureSource == backbuffer) {
         D3D11_TEXTURE2D_DESC sceneDesc = {};
@@ -958,6 +1025,10 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         }
         activeRtv->Release();
     }
+    if (captureMode == 3 && captureSource == backbuffer) {
+        desktopTexture = CaptureDesktopFrame(device, context, swapChain);
+        if (desktopTexture) captureSource = desktopTexture;
+    }
 
     D3D11_TEXTURE2D_DESC captureDesc = {};
     captureSource->GetDesc(&captureDesc);
@@ -966,10 +1037,11 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         Log("[FrameLoop] Capture source=%p (%s) %ux%u fmt=%u samples=%u bind=0x%X",
             captureSource, captureSource == backbuffer ? "backbuffer" :
                 (captureSource == desktopTexture ? "desktop output" :
-                    (captureSource == sdrTexture ? "tracked SDR target" :
-                        (captureSource == tonemapTexture ? "tonemap SceneColor" :
-                            (captureSource == sceneTexture ? "tracked scene RTV" :
-                                (captureSource == composedTexture ? "composed source" : "active RTV"))))),
+                    (captureSource == latestSdrTexture ? "latest SDR target" :
+                        (captureSource == sdrTexture ? "tracked SDR target" :
+                            (captureSource == tonemapTexture ? "tonemap SceneColor" :
+                                (captureSource == sceneTexture ? "tracked scene RTV" :
+                                    (captureSource == composedTexture ? "composed source" : "active RTV")))))),
             captureDesc.Width, captureDesc.Height, captureDesc.Format,
             captureDesc.SampleDesc.Count, captureDesc.BindFlags);
         loggedSource = captureSource;
@@ -982,12 +1054,58 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
                 (captureSource == tonemapTexture ? "tonemap" : "fallback"));
     }
 
-    EnsureEyeTextures(device, captureSource);
+    const bool nativeMultiview = camera::IsNativeMultiviewActive();
+    const uint64_t nativeGeneration = camera::GetNativeMultiviewGeneration();
+    const bool freshNativePair = nativeMultiview &&
+        nativeGeneration != m_lastNativeMultiviewGeneration;
+    EnsureEyeTextures(device, captureSource, nativeMultiview);
 
-    // AFR: alternate which eye receives the backbuffer
     int renderEye = GetRenderEye();
     if (m_gdiLatencyCorrection && captureSource == desktopTexture) renderEye ^= 1;
-    if (m_eyeTextures[renderEye]) {
+    ID3D11RenderTargetView* boundTarget = nullptr;
+    ID3D11DepthStencilView* boundDepth = nullptr;
+    context->OMGetRenderTargets(1, &boundTarget, &boundDepth);
+    bool sourceBound = false;
+    if (boundTarget) {
+        ID3D11Resource* resource = nullptr;
+        boundTarget->GetResource(&resource);
+        ID3D11Texture2D* texture = nullptr;
+        if (resource) {
+            resource->QueryInterface(__uuidof(ID3D11Texture2D),
+                                     reinterpret_cast<void**>(&texture));
+            resource->Release();
+        }
+        sourceBound = texture == captureSource;
+        if (texture) texture->Release();
+    }
+    if (sourceBound) context->OMSetRenderTargets(0, nullptr, nullptr);
+    bool leftOk = false;
+    bool rightOk = false;
+    if (nativeMultiview) {
+        bool capturedPair = m_lastNativeMultiviewGeneration != 0;
+        if (freshNativePair) {
+            capturedPair = m_eyeTextures[0] && m_eyeTextures[1] &&
+                BlitTexture(context, captureSource, m_eyeTextures[0], 0, true, 0) &&
+                BlitTexture(context, captureSource, m_eyeTextures[1], 1, true, 1);
+            if (capturedPair)
+                m_lastNativeMultiviewGeneration = nativeGeneration;
+        } else {
+            static uint64_t reusedNativePairs = 0;
+            if (++reusedNativePairs == 1 || reusedNativePairs % 300 == 0) {
+                Log("[FrameLoop] Reusing synchronized native pair: count=%llu generation=%llu",
+                    reusedNativePairs, m_lastNativeMultiviewGeneration);
+            }
+        }
+        const bool reverseEyes = config::Get().reverse_eyes;
+        const int leftSource = reverseEyes ? 1 : 0;
+        const int rightSource = reverseEyes ? 0 : 1;
+        m_submittingNativeEyes = true;
+        leftOk = capturedPair && m_eyeTextures[leftSource] &&
+            CopyTextureToEye(context, m_eyeTextures[leftSource], 0);
+        rightOk = capturedPair && m_eyeTextures[rightSource] &&
+            CopyTextureToEye(context, m_eyeTextures[rightSource], 1);
+        m_submittingNativeEyes = false;
+    } else if (m_eyeTextures[renderEye]) {
         if (captureDesc.SampleDesc.Count > 1) {
             DXGI_FORMAT resolveFormat = captureDesc.Format;
             if (resolveFormat == DXGI_FORMAT_R8G8B8A8_TYPELESS)
@@ -999,30 +1117,34 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
             context->CopyResource(m_eyeTextures[renderEye], captureSource);
         }
     }
+    if (sourceBound) context->OMSetRenderTargets(1, &boundTarget, boundDepth);
+    if (boundTarget) boundTarget->Release();
+    if (boundDepth) boundDepth->Release();
     if (captureSource != backbuffer) captureSource->Release();
     backbuffer->Release();
 
-    // Submit both eyes
-    bool reverseEyes = config::Get().reverse_eyes;
-    int leftSource = reverseEyes ? 1 : 0;
-    int rightSource = reverseEyes ? 0 : 1;
-
-    bool leftOk = m_eyeTextures[leftSource] != nullptr;
-    bool rightOk = m_eyeTextures[rightSource] != nullptr;
-
-    if (leftOk) leftOk = CopyTextureToEye(context, m_eyeTextures[leftSource], 0);
-    if (rightOk) rightOk = CopyTextureToEye(context, m_eyeTextures[rightSource], 1);
+    if (!nativeMultiview) {
+        const bool reverseEyes = config::Get().reverse_eyes;
+        const int leftSource = reverseEyes ? 1 : 0;
+        const int rightSource = reverseEyes ? 0 : 1;
+        leftOk = m_eyeTextures[leftSource] != nullptr;
+        rightOk = m_eyeTextures[rightSource] != nullptr;
+        if (leftOk) leftOk = CopyTextureToEye(context, m_eyeTextures[leftSource], 0);
+        if (rightOk) rightOk = CopyTextureToEye(context, m_eyeTextures[rightSource], 1);
+    }
 
     // End frame
     const bool submitted = xr.EndFrame(leftOk && rightOk);
-    static bool loggedFirstSubmission = false;
-    if (submitted && !loggedFirstSubmission) {
-        Log("[FrameLoop] First AFR OpenXR frame submitted");
-        loggedFirstSubmission = true;
+    static bool loggedFirstSubmission[2] = {};
+    const int submissionMode = nativeMultiview ? 1 : 0;
+    if (submitted && !loggedFirstSubmission[submissionMode]) {
+        Log("[FrameLoop] First %s OpenXR frame submitted",
+            nativeMultiview ? "native multiview" : "AFR");
+        loggedFirstSubmission[submissionMode] = true;
     }
 
     m_frameCount++;
-    g_currentEye = renderEye;
+    g_currentEye = nativeMultiview ? -1 : renderEye;
 }
 
 }} // namespace bl1gotyvr::xr

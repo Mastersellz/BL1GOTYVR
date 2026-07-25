@@ -527,8 +527,13 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
             }
         }
 
-        // Initialize OpenXR on first frame with valid device
-        if (s_gameDevice && !xr::OpenXRContext::Instance().IsInitialized()) {
+        // Initialize OpenXR on the first frame, then retry periodically so a
+        // missing runtime does not stall and spam every Present.
+        static uint64_t lastOpenXrAttempt = 0;
+        const bool openXrRetryDue = lastOpenXrAttempt == 0 ||
+            g_frameCount.load() - lastOpenXrAttempt >= 300;
+        if (s_gameDevice && !xr::OpenXRContext::Instance().IsInitialized() && openXrRetryDue) {
+            lastOpenXrAttempt = g_frameCount.load();
             Log("[BL1GOTYVR] Attempting OpenXR init...");
             // Get backbuffer format
             ID3D11Texture2D* bb = nullptr;
@@ -543,10 +548,9 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
                 if (xr::OpenXRContext::Instance().Initialize(s_gameDevice, desc.Format)) {
                     Log("[BL1GOTYVR] OpenXR initialized (fmt=%u)", (uint32_t)desc.Format);
                 } else {
-                    // Retry in 300 frames
-                    if (g_frameCount % 300 == 0) {
-                        Log("[BL1GOTYVR] OpenXR init failed, retrying in 300 frames...");
-                    }
+                    Log("[BL1GOTYVR] OpenXR init failed; retrying in 300 frames");
+                    if (!xr::FrameLoop::Instance().IsDesktopTestMode())
+                        xr::FrameLoop::Instance().ToggleDesktopTestMode();
                 }
             }
         }
@@ -558,6 +562,7 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
             xr::FrameLoop::Instance().ToggleDesktopTestMode();
         }
         f6WasDown = f6Down;
+        xr::FrameLoop::Instance().UpdateDesktopControls();
 
         // Run frame loop (OpenXR submission)
         if (xr::OpenXRContext::Instance().IsInitialized()) {
@@ -658,7 +663,6 @@ bool InstallHooks() {
     void* copyResourceTarget = contextVtable[47];
     void* resolveTarget = contextVtable[57];
     void* omSetRenderTargetsTarget = contextVtable[33];
-    void* psSetShaderResourcesTarget = contextVtable[8];
     Log("[BL1GOTYVR] DXGI targets: Present=%p ResizeBuffers=%p", presentTarget, resizeTarget);
 
     // Tear down the temporary swapchain before patching global DXGI methods.
@@ -745,19 +749,15 @@ bool InstallHooks() {
         omSetRenderTargetsTarget, &HookedOMSetRenderTargets,
         reinterpret_cast<void**>(&oOMSetRenderTargets));
     if (omStatus == MH_OK) omStatus = MH_QueueEnableHook(omSetRenderTargetsTarget);
-    MH_STATUS psSrvStatus = MH_CreateHook(
-        psSetShaderResourcesTarget, &HookedPSSetShaderResources,
-        reinterpret_cast<void**>(&oPSSetShaderResources));
-    if (psSrvStatus == MH_OK) psSrvStatus = MH_QueueEnableHook(psSetShaderResourcesTarget);
     const MH_STATUS applyStatus = MH_ApplyQueued();
     if (presentStatus == MH_OK && applyStatus != MH_OK) presentStatus = applyStatus;
     if (presentStatus != MH_OK) {
         Log("[BL1GOTYVR] ERROR: Present hook failed: %s", MH_StatusToString(presentStatus));
         return false;
     }
-    Log("[BL1GOTYVR] Composition hooks queued: CopyResource=%s ResolveSubresource=%s OMSetRT=%s PSSetSRV=%s Apply=%s",
+    Log("[BL1GOTYVR] Composition hooks queued: CopyResource=%s ResolveSubresource=%s OMSetRT=%s Apply=%s",
         MH_StatusToString(copyStatus), MH_StatusToString(resolveStatus), MH_StatusToString(omStatus),
-        MH_StatusToString(psSrvStatus), MH_StatusToString(applyStatus));
+        MH_StatusToString(applyStatus));
     Log("[BL1GOTYVR] ResizeBuffers hook deferred until Present path is stable (target=%p)",
         resizeTarget);
     Log("[BL1GOTYVR] Real DXGI Present hook installed");

@@ -50,6 +50,7 @@ add_library(BL1GOTYVR SHARED
     src/xr/OpenXRContext.cpp
     src/xr/FrameLoop.cpp
     src/input/InputHook.cpp
+    src/input/XRInput.cpp
     src/config/Config.cpp
     src/hook/MinHookWrapper.cpp)
 

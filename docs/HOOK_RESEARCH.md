@@ -65,14 +65,61 @@ The standard temporary D3D11 device/swapchain technique now works when executed 
 
 MinHook activation is queued for all six hooks and applied atomically with `MH_ApplyQueued`. Enabling hooks individually caused an intermittent execute access violation while the render thread was active.
 
-The game backbuffer does not consistently expose final gameplay composition. The current stable source is GDI window capture at 1920x1080, uploaded to D3D11 and submitted through OpenXR. This adds capture latency but preserves the final image.
+RenderDoc capture `capturas-frame5917.rdc` confirms that the complete frame, including `Post-PostProcessRendering` and `FGFxEngine::RenderUI`, finishes in the SDR swapchain backbuffer (`R8G8B8A8_UNORM`, captured resource 11745 / RTV 11756). The default path temporarily unbinds this RTV, copies it to the AFR eye texture, and restores the render targets before `Present`. Copying while it remained bound could silently preserve an old loading frame. HDR resources are not observed or submitted. `F8` can switch diagnostically between direct SDR backbuffer, tracked SDR targets, and GDI.
+
+The renderer view object is reachable through `renderer+0x68`. Its camera origin is currently at view `+0x2C0`, and a validated inverse projection matrix starts at view `+0x240`. A reciprocal projection-like matrix was found at view `+0xC0`, but writing asymmetric offsets there removed the world render while leaving HUD composition active. Engine projection writes are disabled; `F9` only controls the non-destructive submission crop.
+
+The `RenderScene` call stack shows that `FSceneView` belongs to a render-thread command (`0x1F7CB0 -> 0x436A19 -> 0x435ECE -> 0x4578BC -> 0x46D77F -> 0x468220`). Restoring its matrices after `RenderScene` caused a general protection fault because the command may destroy the view before returning. The command contains an array at `renderer+0x68`, a count at `+0x70`, and a view stride of `0x1750`. `RenderScene+0x2A7` copies the active matrices into private backup fields beginning at view `+0x590`, then restores them for later render phases. Phase 2 has another restore path guarded by view `+0x448`, sourcing ViewProjection matrices from `+0x490`, `+0x4D0`, `+0x510`, and `+0x550`; these must also receive the tracked pose. The experimental path writes every validated principal view and both restore caches before `RenderScene`, then never accesses the command after the call.
 
 ## Remaining Work
 
-1. Replace GDI capture with a reliable in-process final composition target to reduce latency.
-2. Evaluate a safe inner scene boundary if same-frame stereo is still required. Never reenter `GameViewportClient::Draw`.
-3. Remove the post-process convergence shift when a projection-matrix hook provides proper asymmetric per-eye projections.
+1. Validate visible side-by-side output from the two native command views.
+2. Route each same-frame view into its matching OpenXR eye texture.
+3. Locate projection creation and frustum construction for asymmetric per-eye projection.
 4. Add motion-controller input and HUD depth handling.
+
+## Native Multiview Stereo Progress (2026-07-19)
+
+Same-frame geometric stereo now uses UE3's native multi-view command construction instead of re-entering `GameViewportClient::Draw`.
+
+Validated command layout:
+
+| Item | Location | Runtime result |
+|---|---:|---|
+| Render command constructor | RVA `0x445280` | Producer/game thread |
+| Render command execution | RVA `0x46D630` | Render thread |
+| Copied `FSceneViewFamily::Views` | command `+0x08` | `TArray<FSceneView*>` |
+| Owned view copies | command `+0x68` | `TArray<FSceneView>` |
+| View count/capacity | command `+0x70/+0x74` | Normal frame `1/1` |
+| Owned view stride | `0x1750` | Confirmed in constructor, renderer, and destructor |
+| Native view copy constructor | RVA `0x447150` | Non-trivial; never replace with `memcpy` for owned views |
+| Command destructor | RVA `0x44A9A0` | Destroys every owned view after `RenderScene` |
+
+The normal command has no spare capacity, so changing only `Num` from one to two is unsafe. The implemented approach supplies the original command constructor with a temporary source family containing two principal-view pointers. UE3 then performs all allocation, copy construction, resource registration, family pointer repair, aggregate calculations, and destruction itself.
+
+Runtime validation reached more than 3,900 frames with:
+
+```text
+family num/max=2/2
+owned num/max=2/2
+view[0].Family == command+0x08
+view[1].Family == command+0x08
+family.Views[0] == owned view[0]
+family.Views[1] == owned view[1]
+```
+
+No exception, heap corruption, or process hang occurred. This validates native multi-view lifetime and traversal. The next build creates two temporary source views with half-width rectangles and applies opposite IPD offsets to the two owned command views. Its purpose is to validate visible side-by-side geometric parallax without a headset.
+
+Current continuation point:
+
+1. Run `build/Release/injector.exe` and confirm the desktop backbuffer contains left/right half-width views.
+2. Read `[StereoResearch]` logs and confirm both constructed rectangles and `Final command view pose applied ... views=2/2`.
+3. Verify parallax using the simulated pose controls (`F6`, arrows, `Page Up/Page Down`, numpad).
+4. Split the side-by-side source in `FrameLoop` and copy each half into its matching OpenXR eye texture in one frame.
+5. Replace symmetric FOV plus image shift with OpenXR asymmetric per-eye projections and rebuild frustum planes before culling.
+6. Keep AFR only as a fallback; same-frame multiview is the target architecture.
+
+The main BasePass is part of `RenderScene`'s four-phase loop. Lower candidates such as RVA `0x46D060`, `0x4817F0`, and `0x4821C0` are only prepass, target binding, or clear operations and are not complete replay boundaries. Native multi-view avoids replaying those mutable phases manually.
 
 ## Diagnostic Tools
 

@@ -59,6 +59,20 @@ void Load(const char* path) {
     s_settings.downsample_threshold = std::clamp(static_cast<int>(GetPrivateProfileIntA(
         "Rendering", "DownsampleThreshold", s_settings.downsample_threshold, path)), 1280, 7680);
 
+    /* Input / Locomotion */
+    s_settings.turn_mode = static_cast<int>(std::clamp<int>(
+        GetPrivateProfileIntA("Input", "TurnMode", s_settings.turn_mode, path), 0, 2));
+    s_settings.snap_turn_angle = std::clamp(
+        ReadFloat("Input", "SnapTurnAngle", s_settings.snap_turn_angle, path), 5.0f, 90.0f);
+    s_settings.smooth_turn_speed = std::clamp(
+        ReadFloat("Input", "SmoothTurnSpeed", s_settings.smooth_turn_speed, path), 10.0f, 360.0f);
+    s_settings.locomotion_deadzone = std::clamp(
+        ReadFloat("Input", "LocomotionDeadzone", s_settings.locomotion_deadzone, path), 0.0f, 0.5f);
+
+    /* Weapon 6DoF */
+    s_settings.weapon_position_scale = std::clamp(
+        ReadFloat("Weapon", "PositionScale", s_settings.weapon_position_scale, path), 0.0f, 1.0f);
+
     Log("[Config] Loaded %s: %dx%d scale=%.2f FOV=%.1f IPD=%.1fmm convergenceShift=%.2f%%",
         path, s_settings.render_width, s_settings.render_height, s_settings.resolution_scale,
         s_settings.fov_degrees, s_settings.ipd_mm, s_settings.convergence_m);
@@ -107,6 +121,16 @@ void Save(const char* path) {
     WritePrivateProfileStringA("Debug", "Logging", s_settings.debug_logging ? "1" : "0", path);
     sprintf_s(text, "%d", s_settings.downsample_threshold);
     WritePrivateProfileStringA("Rendering", "DownsampleThreshold", text, path);
+
+    /* Input / Locomotion */
+    sprintf_s(text, "%d", s_settings.turn_mode);
+    WritePrivateProfileStringA("Input", "TurnMode", text, path);
+    WriteFloat("Input", "SnapTurnAngle", s_settings.snap_turn_angle, path);
+    WriteFloat("Input", "SmoothTurnSpeed", s_settings.smooth_turn_speed, path);
+    WriteFloat("Input", "LocomotionDeadzone", s_settings.locomotion_deadzone, path);
+
+    /* Weapon 6DoF */
+    WriteFloat("Weapon", "PositionScale", s_settings.weapon_position_scale, path);
 }
 
 }} // namespace bl1gotyvr::config

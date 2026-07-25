@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <cstdio>
+#include <cstring>
 
 static DWORD FindProcess(const char* name) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -23,7 +24,6 @@ static DWORD FindProcess(const char* name) {
 
 int main() {
     const char* targetExe = "BorderlandsGOTY.exe";
-    const char* dllPath = "BL1GOTYVR.dll";
 
     printf("[Injector] Waiting for %s...\n", targetExe);
 
@@ -37,9 +37,18 @@ int main() {
     printf("[Injector] Waiting 5 seconds for game to initialize...\n");
     Sleep(5000);
 
-    // Get full path to DLL
-    char fullPath[MAX_PATH];
-    GetFullPathNameA(dllPath, MAX_PATH, fullPath, nullptr);
+    // Resolve the DLL beside this injector, not from the caller's working directory.
+    char fullPath[MAX_PATH] = {};
+    if (!GetModuleFileNameA(nullptr, fullPath, MAX_PATH)) {
+        printf("[Injector] ERROR: GetModuleFileName failed: %lu\n", GetLastError());
+        return 1;
+    }
+    char* fileName = strrchr(fullPath, '\\');
+    if (!fileName || strcpy_s(fileName + 1, MAX_PATH - (fileName + 1 - fullPath),
+                              "BL1GOTYVR.dll") != 0) {
+        printf("[Injector] ERROR: Could not resolve DLL beside injector\n");
+        return 1;
+    }
     printf("[Injector] DLL path: %s\n", fullPath);
 
     // Open process

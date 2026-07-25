@@ -1,6 +1,7 @@
 #include "OpenXRContext.hpp"
 #include "../core/VRMod.hpp"
 #include "../config/Config.hpp"
+#include "../input/XRInput.hpp"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -34,8 +35,34 @@ bool OpenXRContext::GetProjectionCrop(int eye, float sourceAspect, float& scaleX
 
 void OpenXRContext::MarkEyeRendered(int eye) {
     if (eye < 0 || eye > 1 || !m_viewsValid) return;
+    AcquireSRWLockExclusive(&m_poseLock);
     m_renderedViews[eye] = m_views[eye];
     m_renderedViewValid[eye] = true;
+    ReleaseSRWLockExclusive(&m_poseLock);
+}
+
+bool OpenXRContext::GetPoseSnapshot(float headPosition[3], float headRotation[4],
+                                    XrView views[2]) const {
+    AcquireSRWLockShared(&m_poseLock);
+    const bool valid = m_poseValid && m_viewsValid.load();
+    if (valid) {
+        memcpy(headPosition, m_headPosition, sizeof(m_headPosition));
+        memcpy(headRotation, m_headRotation, sizeof(m_headRotation));
+        views[0] = m_views[0];
+        views[1] = m_views[1];
+    }
+    ReleaseSRWLockShared(&m_poseLock);
+    return valid;
+}
+
+void OpenXRContext::SetRenderedViewSnapshot(const XrView views[2]) {
+    if (!views) return;
+    AcquireSRWLockExclusive(&m_poseLock);
+    m_renderedViews[0] = views[0];
+    m_renderedViews[1] = views[1];
+    m_renderedViewValid[0] = true;
+    m_renderedViewValid[1] = true;
+    ReleaseSRWLockExclusive(&m_poseLock);
 }
 
 XrResult OpenXRContext::CheckResult(XrResult result, const char* call) {
@@ -64,12 +91,19 @@ bool OpenXRContext::Initialize(ID3D11Device* device, DXGI_FORMAT backbufferForma
 
     m_initialized = true;
     Log("[OpenXR] Initialized successfully (IPD=%.1fmm)", m_ipd * 1000.0f);
+
+    // Initialize XR input system
+    input::XRInput::Instance().Initialize(m_instance, m_session, m_stageSpace);
+
     return true;
 }
 
 void OpenXRContext::Shutdown() {
     if (!m_initialized) return;
     Log("[OpenXR] Shutting down...");
+
+    // Shutdown XR input
+    input::XRInput::Instance().Shutdown();
 
     // Destroy swapchains
     if (m_leftEye.swapchain != XR_NULL_HANDLE) {
@@ -411,6 +445,7 @@ bool OpenXRContext::LocateViews() {
     XrResult r = xrLocateViews(m_session, &locInfo, &viewState, 2, &viewCount, views);
     if (r != XR_SUCCESS || viewCount < 2) return false;
 
+    AcquireSRWLockExclusive(&m_poseLock);
     m_poseValid = (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                   (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
 
@@ -506,6 +541,7 @@ bool OpenXRContext::LocateViews() {
     }
 
     m_viewsValid = true;
+    ReleaseSRWLockExclusive(&m_poseLock);
     return true;
 }
 
@@ -524,8 +560,10 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer) {
     if (submitProjectionLayer && m_viewsValid && ShouldRender()) {
         for (int i = 0; i < 2; i++) {
             EyeData& eye = (i == 0) ? m_leftEye : m_rightEye;
-            const XrView& submittedView = m_useRenderedViewPoses && m_renderedViewValid[i]
+            AcquireSRWLockShared(&m_poseLock);
+            const XrView submittedView = m_useRenderedViewPoses && m_renderedViewValid[i]
                 ? m_renderedViews[i] : m_views[i];
+            ReleaseSRWLockShared(&m_poseLock);
 
             projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
             projViews[i].pose = submittedView.pose;

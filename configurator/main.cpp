@@ -33,7 +33,7 @@ constexpr std::array<Field, 10> kFields = {{
     {103, "Resolution scale", "Display", "ResolutionScale", "1.00", 0.5f, 2.0f, false},
     {104, "Camera FOV (deg)", "Display", "FOV", "100.0", 60.0f, 150.0f, false},
     {105, "IPD (mm)", "Stereo", "IPD", "64.0", 50.0f, 80.0f, false},
-    {106, "Convergence shift (%)", "Stereo", "Convergence", "0.0", 0.0f, 20.0f, false},
+    {106, "Convergence shift (% per eye)", "Stereo", "Convergence", "10.0", 0.0f, 20.0f, false},
     {107, "Near plane", "Rendering", "NearPlane", "0.10", 0.01f, 10.0f, false},
     {108, "Far plane", "Rendering", "FarPlane", "10000", 100.0f, 100000.0f, false},
     {109, "Position scale", "Tracking", "PositionScale", "1.00", 0.0f, 5.0f, false},
@@ -73,7 +73,7 @@ void LoadSettings(HWND window) {
     CheckDlgButton(window, kReverseEyesCheck,
         GetPrivateProfileIntA("Stereo", "ReverseEyes", 0, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(window, kRollCheck,
-        GetPrivateProfileIntA("Tracking", "RollEnabled", 0, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
+        GetPrivateProfileIntA("Tracking", "RollEnabled", 1, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(window, kLoggingCheck,
         GetPrivateProfileIntA("Debug", "Logging", 1, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
 }
@@ -210,7 +210,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         CreateWindowExA(0, "BUTTON", "Defaults", WS_CHILD | WS_VISIBLE,
                         278, 542, 100, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultsButton)), nullptr, nullptr);
-        CreateLabel(window, "Convergence 0 = parallel; 20 = maximum. Applies live after Save.",
+        CreateLabel(window, "Convergence 10 = recommended; 0 = parallel. Applies live after Save.",
                     66, 592, 430);
         LoadSettings(window);
         return 0;
