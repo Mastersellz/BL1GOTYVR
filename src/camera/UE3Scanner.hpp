@@ -28,6 +28,7 @@ struct CameraInfo {
 // Scan the game module for UE3 globals and camera cache
 // Runs in background thread, writes to output structs
 bool ScanForUE3Globals(UE3Globals* globals, CameraInfo* camera);
+bool RefreshCameraCache(const UE3Globals& globals, CameraInfo* camera);
 uintptr_t FindViewportDrawTarget(const UE3Globals& globals);
 
 }} // namespace bl1gotyvr::camera

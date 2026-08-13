@@ -1,21 +1,27 @@
 #include "D3D11Hooks.hpp"
+#include "../display/DisplayHooks.hpp"
 #include "../core/VRMod.hpp"
 #include "../core/globals.hpp"
 #include "../hook/MinHookWrapper.hpp"
 #include "../xr/OpenXRContext.hpp"
 #include "../xr/FrameLoop.hpp"
 #include "../config/Config.hpp"
+#include "../player/ArmIKSystem.hpp"
 
 #include <d3d11.h>
 #include <dxgi.h>
 #include <dxgi1_4.h>
 #include <Windows.h>
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 
 namespace bl1gotyvr { namespace d3d11 {
+
+using ::uint64_t;
 
 // Original function pointers
 using PresentFn = HRESULT(WINAPI*)(IDXGISwapChain*, UINT, UINT);
@@ -137,6 +143,11 @@ ID3D11Texture2D* AcquireCurrentBackbuffer(IDXGISwapChain* swapChain, UINT* buffe
     return backbuffer;
 }
 
+static std::atomic<uint64_t> s_hookFiredCount{0};
+uint64_t GetHookFiredCount() {
+    return s_hookFiredCount.load(std::memory_order_relaxed);
+}
+
 static void ObserveBackbuffer(IDXGISwapChain* swapChain) {
     ID3D11Texture2D* backbuffer = AcquireCurrentBackbuffer(swapChain);
     if (!backbuffer) return;
@@ -166,6 +177,7 @@ static void STDMETHODCALLTYPE HookedCopyResource(ID3D11DeviceContext* context,
                                                   ID3D11Resource* source) {
     oCopyResource(context, destination, source);
     if (s_insidePresent) return;
+    s_hookFiredCount.fetch_add(1, std::memory_order_relaxed);
     RememberComposedSource(destination, source);
 }
 
@@ -178,6 +190,7 @@ static void STDMETHODCALLTYPE HookedResolveSubresource(ID3D11DeviceContext* cont
     oResolveSubresource(context, destination, destinationSubresource,
                         source, sourceSubresource, format);
     if (s_insidePresent) return;
+    s_hookFiredCount.fetch_add(1, std::memory_order_relaxed);
     RememberComposedSource(destination, source);
 }
 
@@ -256,6 +269,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* cont
         oOMSetRenderTargets(context, viewCount, views, depthView);
         return;
     }
+    s_hookFiredCount.fetch_add(1, std::memory_order_relaxed);
     bool backbufferBound = false;
     for (UINT i = 0; i < viewCount && views; ++i) {
         if (!views[i]) continue;
@@ -455,17 +469,25 @@ static void STDMETHODCALLTYPE HookedPSSetShaderResources(ID3D11DeviceContext* co
 }
 
 // Present hook — main frame entry point
+struct SwapChainObservation {
+    IDXGISwapChain* swapChain;
+    uint64_t presents;
+};
+static SwapChainObservation s_observations[8] = {};
+static uint64_t s_lastOpenXrAttempt = 0;
+
+static bool IsDesktopTestForced() {
+    char value[8] = {};
+    return GetEnvironmentVariableA("BL1GOTYVR_DESKTOP_TEST", value, sizeof(value)) > 0 &&
+        value[0] != '0';
+}
+
 static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT flags) {
+    const bool forceDesktopTest = IsDesktopTestForced();
     s_insidePresent = true;
     __try {
-        config::ReloadIfChanged();
-        struct SwapChainObservation {
-            IDXGISwapChain* swapChain;
-            uint64_t presents;
-        };
-        static SwapChainObservation observations[8] = {};
         SwapChainObservation* observation = nullptr;
-        for (auto& current : observations) {
+        for (auto& current : s_observations) {
             if (current.swapChain == sc) {
                 observation = &current;
                 break;
@@ -488,7 +510,9 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
                 "size=%ux%u buffers=%u format=%u swapEffect=%u windowed=%d",
                 sc, swapDevice, swapDesc.OutputWindow, title, className,
                 swapDesc.BufferDesc.Width, swapDesc.BufferDesc.Height, swapDesc.BufferCount,
-                swapDesc.BufferDesc.Format, swapDesc.SwapEffect, swapDesc.Windowed);
+                 swapDesc.BufferDesc.Format, swapDesc.SwapEffect, swapDesc.Windowed);
+            if (swapDesc.OutputWindow)
+                display::ApplyGameWindowResolution(swapDesc.OutputWindow);
             if (swapDevice) swapDevice->Release();
         }
         if (observation) {
@@ -498,7 +522,16 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
                     sc, observation->presents);
             }
         }
-        s_gameSwapChain = sc;
+        if (!s_gameSwapChain) {
+            s_gameSwapChain = sc;
+        } else if (s_gameSwapChain != sc) {
+            s_insidePresent = false;
+            return oPresent(sc, syncInterval, flags);
+        }
+        if (config::ReloadIfChanged()) {
+            player::ArmIKSystem::Instance().SetVisibilityEnabled(
+                config::Get().hide_player_body_and_arms);
+        }
         ObserveBackbuffer(sc);
         g_frameCount++;
 
@@ -523,17 +556,21 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
                 // Initialize FrameLoop
                 Log("[BL1GOTYVR] Initializing FrameLoop...");
                 xr::FrameLoop::Instance().Initialize();
+                if (forceDesktopTest && !xr::FrameLoop::Instance().IsDesktopTestMode()) {
+                    xr::FrameLoop::Instance().ToggleDesktopTestMode();
+                    Log("[BL1GOTYVR] Forced desktop stereo validation; OpenXR disabled");
+                }
                 Log("[BL1GOTYVR] FrameLoop initialized");
             }
         }
 
         // Initialize OpenXR on the first frame, then retry periodically so a
         // missing runtime does not stall and spam every Present.
-        static uint64_t lastOpenXrAttempt = 0;
-        const bool openXrRetryDue = lastOpenXrAttempt == 0 ||
-            g_frameCount.load() - lastOpenXrAttempt >= 300;
-        if (s_gameDevice && !xr::OpenXRContext::Instance().IsInitialized() && openXrRetryDue) {
-            lastOpenXrAttempt = g_frameCount.load();
+        const bool openXrRetryDue = s_lastOpenXrAttempt == 0 ||
+            g_frameCount.load() - s_lastOpenXrAttempt >= 300;
+        if (!forceDesktopTest && s_gameDevice &&
+            !xr::OpenXRContext::Instance().IsInitialized() && openXrRetryDue) {
+            s_lastOpenXrAttempt = g_frameCount.load();
             Log("[BL1GOTYVR] Attempting OpenXR init...");
             // Get backbuffer format
             ID3D11Texture2D* bb = nullptr;
@@ -565,7 +602,8 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
         xr::FrameLoop::Instance().UpdateDesktopControls();
 
         // Run frame loop (OpenXR submission)
-        if (xr::OpenXRContext::Instance().IsInitialized()) {
+        if (xr::OpenXRContext::Instance().IsInitialized() ||
+            xr::FrameLoop::Instance().IsDesktopTestMode()) {
             xr::FrameLoop::Instance().OnPresent(s_gameDevice, s_gameContext, sc);
         }
 
@@ -705,8 +743,12 @@ bool InstallHooks() {
         detourAddress = destination;
     }
     if (steamOverlayDetour) {
+        HMODULE dxgiOwner = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(presentTarget), &dxgiOwner);
         char dxgiPath[MAX_PATH] = {};
-        GetModuleFileNameA(GetModuleHandleA("dxgi.dll"), dxgiPath, MAX_PATH);
+        GetModuleFileNameA(dxgiOwner, dxgiPath, MAX_PATH);
         HANDLE file = CreateFileA(dxgiPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         HANDLE mapping = file != INVALID_HANDLE_VALUE
@@ -717,7 +759,7 @@ bool InstallHooks() {
             : nullptr;
         if (cleanImage) {
             const uintptr_t rva = reinterpret_cast<uintptr_t>(presentTarget) -
-                                  reinterpret_cast<uintptr_t>(GetModuleHandleA("dxgi.dll"));
+                                  reinterpret_cast<uintptr_t>(dxgiOwner);
             DWORD oldProtect = 0;
             if (VirtualProtect(presentTarget, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
                 memcpy(presentTarget, cleanImage + rva, 5);

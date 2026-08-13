@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(BL1GOTYVR LANGUAGES CXX)
+project(BL1GOTYVR LANGUAGES CXX ASM_MASM)
 
 if(NOT WIN32)
     message(FATAL_ERROR "BL1GOTYVR is Windows-only")
@@ -41,7 +41,9 @@ FetchContent_MakeAvailable(MinHook)
 # Main VR mod DLL
 add_library(BL1GOTYVR SHARED
     src/core/VRMod.cpp
+    src/core/CommandSystem.cpp
     src/d3d11/D3D11Hooks.cpp
+    src/display/DisplayHooks.cpp
     src/camera/CameraHook.cpp
     src/camera/UE3Scanner.cpp
     src/camera/SignatureScanner.cpp
@@ -51,6 +53,12 @@ add_library(BL1GOTYVR SHARED
     src/xr/FrameLoop.cpp
     src/input/InputHook.cpp
     src/input/XRInput.cpp
+    src/input/XInputBridge.cpp
+    src/input/AimHook.cpp
+    src/input/WeaponAimSystem.cpp
+    src/player/TwoBoneIK.cpp
+    src/player/ArmIKSystem.cpp
+    src/render/HudBlitter.cpp
     src/config/Config.cpp
     src/hook/MinHookWrapper.cpp)
 
@@ -58,9 +66,21 @@ target_include_directories(BL1GOTYVR PRIVATE src include)
 target_link_libraries(BL1GOTYVR PRIVATE minhook openxr_loader d3d11 dxgi dxguid d3dcompiler gdi32)
 target_compile_definitions(BL1GOTYVR PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+# Automatic loader placed beside BorderlandsGOTY.exe. It forwards DXGI to
+# System32 and loads BL1GOTYVR.dll before the game's first DXGI factory call.
+add_library(dxgi_proxy SHARED
+    src/dxgi_proxy.cpp
+    src/dxgi_proxy_stubs.asm
+    src/dxgi_proxy.def)
+set_target_properties(dxgi_proxy PROPERTIES
+    OUTPUT_NAME "dxgi"
+    ARCHIVE_OUTPUT_NAME "dxgi_proxy")
+target_compile_definitions(dxgi_proxy PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+
 # Injector
 add_executable(injector injector/main.cpp)
 target_compile_definitions(injector PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(injector PRIVATE shell32)
 
 # Standalone diagnostic used to inspect an unmodified DXGI Present prologue.
 add_executable(clean_present tools/clean_present.cpp)

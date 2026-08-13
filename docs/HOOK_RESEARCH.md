@@ -59,6 +59,18 @@ Validated stereo uses geometric AFR:
 
 Runtime and headset validation confirmed geometric parallax and head tracking. A stability run exceeded 5,700 frames without errors.
 
+### Coherent AER Reimplementation (2026-07-30)
+
+The active stereo path now follows the validated Mass Effect 2 VR pair protocol rather than the later experimental native-multiview path:
+
+1. Eye 0 snapshots the OpenXR head pose, both runtime eye positions/FOVs, and the unmodified BL1 camera state.
+2. Eye 1 restores that same BL1 camera state and reuses the exact eye-0 OpenXR snapshot.
+3. Each completed Draw publishes a `{pairSerial, eye}` ticket to the pre-Present capture path.
+4. Eye textures are submitted only when both captures carry the same serial.
+5. The exact rendered `XrView` pair is used for submission; projection crop uses the same frozen FOV and render aspect as the camera.
+
+IPD comes from the OpenXR runtime in headset mode. The configured IPD remains only as the desktop-simulation fallback. `RenderScene`, render-command multiview, and double-Draw hooks are not installed, so camera pose and projection are applied at one authority only: the validated `WillowPlayerController` camera cache around a single `GameViewportClient::Draw` call.
+
 ## D3D11 and OpenXR
 
 The standard temporary D3D11 device/swapchain technique now works when executed from the initialization thread outside `DllMain`. It provides the real DXGI and D3D11 method addresses.
@@ -78,7 +90,7 @@ The `RenderScene` call stack shows that `FSceneView` belongs to a render-thread 
 3. Locate projection creation and frustum construction for asymmetric per-eye projection.
 4. Add motion-controller input and HUD depth handling.
 
-## Native Multiview Stereo Progress (2026-07-19)
+## Historical Native Multiview Stereo Progress (2026-07-19, inactive)
 
 Same-frame geometric stereo now uses UE3's native multi-view command construction instead of re-entering `GameViewportClient::Draw`.
 

@@ -13,6 +13,9 @@
 
 namespace bl1gotyvr { namespace xr {
 
+// Format equivalence check for cross-runtime compatibility (SteamVR, VDXR, WMR).
+bool AreFormatsCompatible(DXGI_FORMAT a, DXGI_FORMAT b);
+
 struct EyeData {
     XrSwapchain swapchain = XR_NULL_HANDLE;
     uint32_t width = 0;
@@ -34,12 +37,23 @@ public:
     bool WaitForFrame();
     bool BeginFrame();
     bool LocateViews();
-    bool EndFrame(bool submitProjectionLayer = true);
+    void PollSessionEvents() { PollEvents(); }
+    bool EndFrame(bool submitProjectionLayer = true,
+                   const XrView* exactRenderedViews = nullptr,
+                   bool submitHudLayer = false,
+                   uint64_t hudPairSerial = 0);
+    bool CanSubmitHud() const;
+    bool ShouldSeparateHud() const;
+    bool ShouldSubmitCurrentViews() const { return m_integratedHud; }
+    bool PrepareHudTexture(ID3D11Texture2D* texture, uint64_t pairSerial);
+    void InvalidateHudResources();
 
     bool IsFrameActive() const { return m_frameActive; }
     bool HasLocatedViews() const { return m_viewsValid; }
     bool ShouldRender() const { return m_frameState.shouldRender == XR_TRUE; }
+    XrTime GetPredictedDisplayTime() const { return m_frameState.predictedDisplayTime; }
     bool HasValidPose() const { return m_poseValid; }
+    int GetSessionState() const { return (int)m_sessionState; }
     bool GetPoseSnapshot(float headPosition[3], float headRotation[4],
                          XrView views[2]) const;
 
@@ -57,9 +71,14 @@ public:
     float GetIPD() const { return m_ipd; }
     bool GetProjectionCrop(int eye, float sourceAspect, float& scaleX, float& scaleY,
                            float& offsetX, float& offsetY, float& horizontalFovDegrees) const;
+    bool GetProjectionCrop(const XrView& view, float sourceAspect,
+                           float& scaleX, float& scaleY, float& offsetX, float& offsetY,
+                           float& horizontalFovDegrees) const;
+    void SetSourceProjectionTans(float halfTanX, float halfTanY);
+    bool GetSourceProjectionTans(float& halfTanX, float& halfTanY) const;
     void MarkEyeRendered(int eye);
-    void SetRenderedViewSnapshot(const XrView views[2]);
     void SetUseRenderedViewPoses(bool enabled) { m_useRenderedViewPoses = enabled; }
+    DXGI_FORMAT GetSwapchainFormat() const { return m_swapchainFormat; }
 
     // Device
     ID3D11Device* GetDevice() { return m_device; }
@@ -71,6 +90,8 @@ private:
     bool CreateSession();
     bool CreateSpaces();
     bool CreateSwapchains();
+    bool CreateHudSwapchain(uint32_t width, uint32_t height);
+    void DestroyHudSwapchain();
     void PollEvents();
 
     XrResult CheckResult(XrResult result, const char* call);
@@ -83,13 +104,17 @@ private:
     XrSystemId m_systemId = XR_NULL_SYSTEM_ID;
     XrSession m_session = XR_NULL_HANDLE;
     XrSessionState m_sessionState = XR_SESSION_STATE_UNKNOWN;
+    XrSystemProperties m_systemProperties = {XR_TYPE_SYSTEM_PROPERTIES};
+    char m_runtimeName[XR_MAX_RUNTIME_NAME_SIZE] = {};
+    bool m_isVdxr = false;
+    bool m_integratedHud = false;
 
     // Spaces
     XrSpace m_stageSpace = XR_NULL_HANDLE;
     XrSpace m_viewSpace = XR_NULL_HANDLE;
 
     // Frame
-    XrFrameState m_frameState = {};
+    XrFrameState m_frameState = {XR_TYPE_FRAME_STATE};
     std::atomic<bool> m_frameActive{false};
     XrView m_views[2] = {};
     XrView m_renderedViews[2] = {};
@@ -100,10 +125,19 @@ private:
     // Eyes
     EyeData m_leftEye;
     EyeData m_rightEye;
+    EyeData m_hud;
+    bool m_hudPrepared = false;
+    uint64_t m_hudPreparedPairSerial = 0;
+    SRWLOCK m_hudLock = SRWLOCK_INIT;
 
     // Computed matrices (row-major, 4x4)
     float m_viewMatrices[2][4][4] = {};
     float m_projectionMatrices[2][4][4] = {};
+
+    // Game-rendered source image half-tangents (measured from FSceneView
+    // projection). tanHalfX = 1/projection[0], tanHalfY = 1/projection[5].
+    std::atomic<float> m_sourceHalfTanX{0.0f};
+    std::atomic<float> m_sourceHalfTanY{0.0f};
 
     // Pose
     float m_headPosition[3] = {};

@@ -1,5 +1,6 @@
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <ShlObj.h>
 #include <cstdio>
 #include <cstring>
 
@@ -25,6 +26,53 @@ static DWORD FindProcess(const char* name) {
 int main() {
     const char* targetExe = "BorderlandsGOTY.exe";
 
+    char injectorDirectory[MAX_PATH] = {};
+    if (!GetModuleFileNameA(nullptr, injectorDirectory, MAX_PATH)) {
+        printf("[Injector] ERROR: GetModuleFileName failed: %lu\n", GetLastError());
+        return 1;
+    }
+    char* directoryEnd = strrchr(injectorDirectory, '\\');
+    if (!directoryEnd) {
+        printf("[Injector] ERROR: Could not resolve injector directory\n");
+        return 1;
+    }
+    *directoryEnd = '\0';
+
+    char modIni[MAX_PATH] = {};
+    sprintf_s(modIni, "%s\\BL1GOTYVR.ini", injectorDirectory);
+    const int renderWidth = GetPrivateProfileIntA("Display", "Width", 2048, modIni);
+    const int renderHeight = GetPrivateProfileIntA("Display", "Height", 2048, modIni);
+    char documents[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_PERSONAL, nullptr,
+                                   SHGFP_TYPE_CURRENT, documents))) {
+        char gameIni[MAX_PATH] = {};
+        sprintf_s(gameIni, "%s\\My Games\\Borderlands Game of the Year\\"
+                           "WillowGame\\Config\\WillowEngine.ini", documents);
+        if (GetFileAttributesA(gameIni) != INVALID_FILE_ATTRIBUTES) {
+            char widthText[16] = {};
+            char heightText[16] = {};
+            sprintf_s(widthText, "%d", renderWidth);
+            sprintf_s(heightText, "%d", renderHeight);
+            const BOOL widthWritten = WritePrivateProfileStringA(
+                "SystemSettings", "ResX", widthText, gameIni);
+            const BOOL heightWritten = WritePrivateProfileStringA(
+                "SystemSettings", "ResY", heightText, gameIni);
+            // Texture streaming must stay ON (disabling it leaves BL1 GOTY
+            // textures black). Prevent VR head-turn pop-in instead by growing
+            // the streaming pool so mips are not evicted.
+            const BOOL streamingWritten = WritePrivateProfileStringA(
+                "Engine.Engine", "bUseTextureStreaming", "True", gameIni);
+            const BOOL poolWritten = WritePrivateProfileStringA(
+                "TextureStreaming", "PoolSize", "8192", gameIni);
+            const BOOL dynamicStreamingWritten = WritePrivateProfileStringA(
+                "TextureStreaming", "DynamicStreaming", "2", gameIni);
+            printf("[Injector] Prepared game resolution %dx%d: %s\n", renderWidth,
+                   renderHeight, widthWritten && heightWritten ? "OK" : "FAILED");
+            printf("[Injector] Texture streaming pool enlarged (pop-in fix): %s\n",
+                   streamingWritten && poolWritten && dynamicStreamingWritten ? "OK" : "FAILED");
+        }
+    }
+
     printf("[Injector] Waiting for %s...\n", targetExe);
 
     DWORD pid = 0;
@@ -34,18 +82,11 @@ int main() {
     }
 
     printf("[Injector] Found %s (PID %lu)\n", targetExe, pid);
-    printf("[Injector] Waiting 5 seconds for game to initialize...\n");
-    Sleep(5000);
+    printf("[Injector] Injecting immediately so display hooks precede viewport setup...\n");
 
     // Resolve the DLL beside this injector, not from the caller's working directory.
     char fullPath[MAX_PATH] = {};
-    if (!GetModuleFileNameA(nullptr, fullPath, MAX_PATH)) {
-        printf("[Injector] ERROR: GetModuleFileName failed: %lu\n", GetLastError());
-        return 1;
-    }
-    char* fileName = strrchr(fullPath, '\\');
-    if (!fileName || strcpy_s(fileName + 1, MAX_PATH - (fileName + 1 - fullPath),
-                              "BL1GOTYVR.dll") != 0) {
+    if (sprintf_s(fullPath, "%s\\BL1GOTYVR.dll", injectorDirectory) < 0) {
         printf("[Injector] ERROR: Could not resolve DLL beside injector\n");
         return 1;
     }

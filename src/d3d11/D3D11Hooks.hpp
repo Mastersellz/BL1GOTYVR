@@ -2,6 +2,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <dxgi1_4.h>
+#include <cstdint>
 
 namespace bl1gotyvr { namespace d3d11 {
 
@@ -17,5 +18,6 @@ ID3D11Texture2D* GetTrackedRenderTarget(int index);
 ID3D11Texture2D* GetLatestTonemapSource();
 ID3D11Texture2D* GetPostTonemapTexture();
 ID3D11Texture2D* AcquireCurrentBackbuffer(IDXGISwapChain* swapChain, UINT* bufferIndex = nullptr);
+uint64_t GetHookFiredCount();
 
 }} // namespace bl1gotyvr::d3d11

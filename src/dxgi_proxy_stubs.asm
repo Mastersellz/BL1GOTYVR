@@ -1,0 +1,47 @@
+option casemap:none
+
+EXTERN g_real_ApplyCompatResolutionQuirking:QWORD
+EXTERN g_real_CompatString:QWORD
+EXTERN g_real_CompatValue:QWORD
+EXTERN g_real_DXGIDumpJournal:QWORD
+EXTERN g_real_PIXBeginCapture:QWORD
+EXTERN g_real_PIXEndCapture:QWORD
+EXTERN g_real_PIXGetCaptureState:QWORD
+EXTERN g_real_SetAppCompatStringPointer:QWORD
+EXTERN g_real_UpdateHMDEmulationStatus:QWORD
+EXTERN g_real_DXGID3D10CreateDevice:QWORD
+EXTERN g_real_DXGID3D10CreateLayeredDevice:QWORD
+EXTERN g_real_DXGID3D10GetLayeredDeviceSize:QWORD
+EXTERN g_real_DXGID3D10RegisterLayers:QWORD
+EXTERN g_real_DXGIDeclareAdapterRemovalSupport:QWORD
+EXTERN g_real_DXGIDisableVBlankVirtualization:QWORD
+EXTERN g_real_DXGIGetDebugInterface1:QWORD
+EXTERN g_real_DXGIReportAdapterConfiguration:QWORD
+
+.code
+
+PROXY_JUMP MACRO name
+Proxy_&name PROC
+    jmp QWORD PTR [g_real_&name]
+Proxy_&name ENDP
+ENDM
+
+PROXY_JUMP ApplyCompatResolutionQuirking
+PROXY_JUMP CompatString
+PROXY_JUMP CompatValue
+PROXY_JUMP DXGIDumpJournal
+PROXY_JUMP PIXBeginCapture
+PROXY_JUMP PIXEndCapture
+PROXY_JUMP PIXGetCaptureState
+PROXY_JUMP SetAppCompatStringPointer
+PROXY_JUMP UpdateHMDEmulationStatus
+PROXY_JUMP DXGID3D10CreateDevice
+PROXY_JUMP DXGID3D10CreateLayeredDevice
+PROXY_JUMP DXGID3D10GetLayeredDeviceSize
+PROXY_JUMP DXGID3D10RegisterLayers
+PROXY_JUMP DXGIDeclareAdapterRemovalSupport
+PROXY_JUMP DXGIDisableVBlankVirtualization
+PROXY_JUMP DXGIGetDebugInterface1
+PROXY_JUMP DXGIReportAdapterConfiguration
+
+END

@@ -582,7 +582,16 @@ static void FindCameraCache(const UE3Globals* globals, CameraInfo* camera, uintp
         ++namedObjects;
         Log("[UE3Scanner] Camera instance: index=%d object=%p name=%s_%d class=%s",
             i, reinterpret_cast<void*>(object), objectName, nameNumber, className);
-        if (strcmp(className, "WillowPlayerController") == 0) activeController = object;
+        if (strcmp(className, "WillowPlayerController") == 0) {
+            uintptr_t pawn = 0;
+            uintptr_t controllerBackReference = 0;
+            const bool livePlayer =
+                ReadMem(object + 0x260, &pawn, sizeof(pawn)) && pawn >= 0x10000 &&
+                ReadMem(pawn + 0x26C, &controllerBackReference,
+                        sizeof(controllerBackReference)) &&
+                controllerBackReference == object;
+            if (livePlayer || !activeController) activeController = object;
+        }
 
         scanCameraObject(object, className,
                          strcmp(className, "WillowPlayerController") == 0 ? 0x3000 : 0x2000);
@@ -706,6 +715,23 @@ bool ScanForUE3Globals(UE3Globals* globals, CameraInfo* camera) {
         camera->found ? "FOUND" : "not found");
 
     return globals->gNamesValid || globals->gObjectsValid;
+}
+
+bool RefreshCameraCache(const UE3Globals& globals, CameraInfo* camera) {
+    if (!camera || !globals.gNamesValid || !globals.gObjectsValid) return false;
+    HMODULE gameModule = GetModuleHandleA("BorderlandsGOTY.exe");
+    if (!gameModule) return false;
+
+    MODULEINFO modInfo = {};
+    if (!GetModuleInformation(GetCurrentProcess(), gameModule, &modInfo, sizeof(modInfo)))
+        return false;
+
+    CameraInfo refreshed = {};
+    FindCameraCache(&globals, &refreshed,
+        reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll), modInfo.SizeOfImage);
+    if (!refreshed.found) return false;
+    *camera = refreshed;
+    return true;
 }
 
 uintptr_t FindViewportDrawTarget(const UE3Globals& globals) {

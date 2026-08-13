@@ -45,6 +45,10 @@ void Load(const char* path) {
         ReadFloat("Tracking", "PositionScale", s_settings.positional_scale, path), 0.0f, 5.0f);
     s_settings.rotation_scale = std::clamp(
         ReadFloat("Tracking", "RotationScale", s_settings.rotation_scale, path), 0.0f, 5.0f);
+    s_settings.head_yaw_scale = std::clamp(
+        ReadFloat("Tracking", "HeadYawScale", s_settings.head_yaw_scale, path), 0.0f, 1.0f);
+    s_settings.head_pitch_scale = std::clamp(
+        ReadFloat("Tracking", "HeadPitchScale", s_settings.head_pitch_scale, path), 0.0f, 1.0f);
     s_settings.roll_enabled = GetPrivateProfileIntA(
         "Tracking", "RollEnabled", s_settings.roll_enabled, path) != 0;
     s_settings.same_frame_stereo_requested = GetPrivateProfileIntA(
@@ -59,6 +63,24 @@ void Load(const char* path) {
     s_settings.downsample_threshold = std::clamp(static_cast<int>(GetPrivateProfileIntA(
         "Rendering", "DownsampleThreshold", s_settings.downsample_threshold, path)), 1280, 7680);
 
+    s_settings.hud_enabled = GetPrivateProfileIntA(
+        "HUD", "Enabled", s_settings.hud_enabled, path) != 0;
+    s_settings.hud_distance = std::clamp(
+        ReadFloat("HUD", "Distance", s_settings.hud_distance, path), 0.5f, 10.0f);
+    s_settings.hud_width_degrees = std::clamp(
+        ReadFloat("HUD", "WidthDegrees", s_settings.hud_width_degrees, path), 10.0f, 150.0f);
+    s_settings.hud_scale = std::clamp(
+        ReadFloat("HUD", "Scale", s_settings.hud_scale, path), 0.25f, 2.0f);
+    s_settings.hud_opacity = std::clamp(
+        ReadFloat("HUD", "Opacity", s_settings.hud_opacity, path), 0.0f, 1.0f);
+    s_settings.hud_horizontal_offset = std::clamp(
+        ReadFloat("HUD", "HorizontalOffset", s_settings.hud_horizontal_offset, path), -2.0f, 2.0f);
+    s_settings.hud_vertical_offset = std::clamp(
+        ReadFloat("HUD", "VerticalOffset", s_settings.hud_vertical_offset, path), -2.0f, 2.0f);
+
+    s_settings.debug_force_no_hud_layer = GetPrivateProfileIntA(
+        "Debug", "ForceNoHudLayer", s_settings.debug_force_no_hud_layer, path) != 0;
+
     /* Input / Locomotion */
     s_settings.turn_mode = static_cast<int>(std::clamp<int>(
         GetPrivateProfileIntA("Input", "TurnMode", s_settings.turn_mode, path), 0, 2));
@@ -72,10 +94,19 @@ void Load(const char* path) {
     /* Weapon 6DoF */
     s_settings.weapon_position_scale = std::clamp(
         ReadFloat("Weapon", "PositionScale", s_settings.weapon_position_scale, path), 0.0f, 1.0f);
+    s_settings.aim_pitch_degrees = std::clamp(
+        ReadFloat("Weapon", "AimPitch", s_settings.aim_pitch_degrees, path), -45.0f, 45.0f);
+    s_settings.aim_yaw_degrees = std::clamp(
+        ReadFloat("Weapon", "AimYaw", s_settings.aim_yaw_degrees, path), -45.0f, 45.0f);
 
-    Log("[Config] Loaded %s: %dx%d scale=%.2f FOV=%.1f IPD=%.1fmm convergenceShift=%.2f%%",
+    s_settings.hide_player_body_and_arms = GetPrivateProfileIntA(
+        "Visibility", "HidePlayerBodyAndArms", 0, path) != 0;
+
+    Log("[Config] Loaded %s: %dx%d scale=%.2f FOV=%.1f IPD=%.1fmm "
+        "convergenceShift=%.2f%% aim=(%.2f,%.2f)",
         path, s_settings.render_width, s_settings.render_height, s_settings.resolution_scale,
-        s_settings.fov_degrees, s_settings.ipd_mm, s_settings.convergence_m);
+        s_settings.fov_degrees, s_settings.ipd_mm, s_settings.convergence_m,
+        s_settings.aim_pitch_degrees, s_settings.aim_yaw_degrees);
     WIN32_FILE_ATTRIBUTE_DATA attributes = {};
     if (GetFileAttributesExA(path, GetFileExInfoStandard, &attributes))
         s_lastWriteTime = attributes.ftLastWriteTime;
@@ -114,6 +145,8 @@ void Save(const char* path) {
     WriteFloat("Rendering", "FarPlane", s_settings.far_plane, path);
     WriteFloat("Tracking", "PositionScale", s_settings.positional_scale, path);
     WriteFloat("Tracking", "RotationScale", s_settings.rotation_scale, path);
+    WriteFloat("Tracking", "HeadYawScale", s_settings.head_yaw_scale, path);
+    WriteFloat("Tracking", "HeadPitchScale", s_settings.head_pitch_scale, path);
     WritePrivateProfileStringA("Tracking", "RollEnabled", s_settings.roll_enabled ? "1" : "0", path);
     WritePrivateProfileStringA("Stereo", "SameFrameStereo",
         s_settings.same_frame_stereo_requested ? "1" : "0", path);
@@ -121,6 +154,17 @@ void Save(const char* path) {
     WritePrivateProfileStringA("Debug", "Logging", s_settings.debug_logging ? "1" : "0", path);
     sprintf_s(text, "%d", s_settings.downsample_threshold);
     WritePrivateProfileStringA("Rendering", "DownsampleThreshold", text, path);
+
+    WritePrivateProfileStringA("HUD", "Enabled", s_settings.hud_enabled ? "1" : "0", path);
+    WriteFloat("HUD", "Distance", s_settings.hud_distance, path);
+    WriteFloat("HUD", "WidthDegrees", s_settings.hud_width_degrees, path);
+    WriteFloat("HUD", "Scale", s_settings.hud_scale, path);
+    WriteFloat("HUD", "Opacity", s_settings.hud_opacity, path);
+    WriteFloat("HUD", "HorizontalOffset", s_settings.hud_horizontal_offset, path);
+    WriteFloat("HUD", "VerticalOffset", s_settings.hud_vertical_offset, path);
+
+    WritePrivateProfileStringA("Debug", "ForceNoHudLayer",
+        s_settings.debug_force_no_hud_layer ? "1" : "0", path);
 
     /* Input / Locomotion */
     sprintf_s(text, "%d", s_settings.turn_mode);
@@ -131,6 +175,21 @@ void Save(const char* path) {
 
     /* Weapon 6DoF */
     WriteFloat("Weapon", "PositionScale", s_settings.weapon_position_scale, path);
+    WriteFloat("Weapon", "AimPitch", s_settings.aim_pitch_degrees, path);
+    WriteFloat("Weapon", "AimYaw", s_settings.aim_yaw_degrees, path);
+    WritePrivateProfileStringA("Visibility", "HidePlayerBodyAndArms",
+        s_settings.hide_player_body_and_arms ? "1" : "0", path);
+    WritePrivateProfileStringA(nullptr, nullptr, nullptr, path);
+
+    WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &attributes))
+        s_lastWriteTime = attributes.ftLastWriteTime;
+}
+
+bool SaveLoaded() {
+    if (!s_configPath[0]) return false;
+    Save(s_configPath);
+    return true;
 }
 
 }} // namespace bl1gotyvr::config

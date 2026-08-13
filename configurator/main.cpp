@@ -15,6 +15,11 @@ constexpr int kSameFrameCheck = 202;
 constexpr int kReverseEyesCheck = 203;
 constexpr int kRollCheck = 204;
 constexpr int kLoggingCheck = 205;
+constexpr int kLowPreset = 210;
+constexpr int kMediumPreset = 211;
+constexpr int kHighPreset = 212;
+constexpr int kUltraPreset = 213;
+constexpr int kMegaUltraPreset = 214;
 
 struct Field {
     int id;
@@ -28,8 +33,8 @@ struct Field {
 };
 
 constexpr std::array<Field, 10> kFields = {{
-    {101, "Render width", "Display", "Width", "1920", 640.0f, 7680.0f, true},
-    {102, "Render height", "Display", "Height", "1080", 480.0f, 4320.0f, true},
+    {101, "Render width", "Display", "Width", "2048", 640.0f, 7680.0f, true},
+    {102, "Render height", "Display", "Height", "2048", 480.0f, 4320.0f, true},
     {103, "Resolution scale", "Display", "ResolutionScale", "1.00", 0.5f, 2.0f, false},
     {104, "Camera FOV (deg)", "Display", "FOV", "100.0", 60.0f, 150.0f, false},
     {105, "IPD (mm)", "Stereo", "IPD", "64.0", 50.0f, 80.0f, false},
@@ -38,6 +43,21 @@ constexpr std::array<Field, 10> kFields = {{
     {108, "Far plane", "Rendering", "FarPlane", "10000", 100.0f, 100000.0f, false},
     {109, "Position scale", "Tracking", "PositionScale", "1.00", 0.0f, 5.0f, false},
     {110, "Rotation scale", "Tracking", "RotationScale", "1.00", 0.0f, 5.0f, false},
+}};
+
+struct RenderPreset {
+    int id;
+    const char* width;
+    const char* height;
+    const char* scale;
+};
+
+constexpr std::array<RenderPreset, 5> kRenderPresets = {{
+    {kLowPreset, "1536", "1536", "0.75"},
+    {kMediumPreset, "2048", "2048", "1.00"},
+    {kHighPreset, "2560", "2560", "1.25"},
+    {kUltraPreset, "3072", "3072", "1.40"},
+    {kMegaUltraPreset, "4096", "4096", "1.50"},
 }};
 
 std::string ExeDirectory() {
@@ -58,6 +78,16 @@ void SetDefaults(HWND window) {
     CheckDlgButton(window, kReverseEyesCheck, BST_UNCHECKED);
     CheckDlgButton(window, kRollCheck, BST_UNCHECKED);
     CheckDlgButton(window, kLoggingCheck, BST_CHECKED);
+}
+
+void ApplyRenderPreset(HWND window, int id) {
+    for (const auto& preset : kRenderPresets) {
+        if (preset.id != id) continue;
+        SetDlgItemTextA(window, 101, preset.width);
+        SetDlgItemTextA(window, 102, preset.height);
+        SetDlgItemTextA(window, 103, preset.scale);
+        return;
+    }
 }
 
 void LoadSettings(HWND window) {
@@ -159,7 +189,7 @@ void SaveSettings(HWND window) {
 
     const bool gameIniUpdated = UpdateGameResolution(width, height);
     const char* message = gameIniUpdated
-        ? "Settings saved. FOV, IPD, convergence and tracking scales apply live. Restart only for resolution changes."
+        ? "Settings saved. Restart the game after changing a render preset, resolution, or resolution scale."
         : "Settings saved. Optical settings apply live. WillowEngine.ini was not found; set the resolution in-game and restart.";
     MessageBoxA(window, message, "BL1 GOTY VR Config", MB_OK | MB_ICONINFORMATION);
 }
@@ -179,9 +209,18 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     switch (message) {
     case WM_CREATE: {
         CreateWindowExA(0, "BUTTON", "Display and optics", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                        16, 12, 500, 238, window, nullptr, nullptr, nullptr);
+                        16, 12, 500, 270, window, nullptr, nullptr, nullptr);
         CreateWindowExA(0, "BUTTON", "Tracking and rendering", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                        16, 258, 500, 194, window, nullptr, nullptr, nullptr);
+                        16, 290, 500, 194, window, nullptr, nullptr, nullptr);
+
+        CreateLabel(window, "Render preset", 34, 42, 90);
+        const char* presetLabels[] = {"Low", "Medium", "High", "Ultra", "Mega"};
+        for (size_t i = 0; i < kRenderPresets.size(); ++i) {
+            CreateWindowExA(0, "BUTTON", presetLabels[i], WS_CHILD | WS_VISIBLE,
+                            120 + static_cast<int>(i) * 76, 37, 70, 27, window,
+                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRenderPresets[i].id)),
+                            nullptr, nullptr);
+        }
 
         for (size_t i = 0; i < kFields.size(); ++i) {
             const bool lowerGroup = i >= 6;
@@ -190,7 +229,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 ? (rightColumn ? static_cast<int>(i) - 9 : static_cast<int>(i) - 6)
                 : static_cast<int>(i);
             const int x = rightColumn ? 274 : 34;
-            const int y = lowerGroup ? 290 + localIndex * 32 : 46 + localIndex * 32;
+            const int y = lowerGroup ? 322 + localIndex * 32 : 78 + localIndex * 32;
             CreateLabel(window, kFields[i].label, x, y, 128);
             CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
                             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
@@ -199,25 +238,27 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                             nullptr, nullptr);
         }
 
-        CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 470);
-        CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 470);
-        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 500);
-        CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 500);
+        CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 502);
+        CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 502);
+        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 532);
+        CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 532);
 
         CreateWindowExA(0, "BUTTON", "Save settings", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                        154, 542, 110, 34, window,
+                        154, 574, 110, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveButton)), nullptr, nullptr);
         CreateWindowExA(0, "BUTTON", "Defaults", WS_CHILD | WS_VISIBLE,
-                        278, 542, 100, 34, window,
+                        278, 574, 100, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultsButton)), nullptr, nullptr);
         CreateLabel(window, "Convergence 10 = recommended; 0 = parallel. Applies live after Save.",
-                    66, 592, 430);
+                    66, 624, 430);
         LoadSettings(window);
         return 0;
     }
     case WM_COMMAND:
         if (LOWORD(wParam) == kSaveButton) SaveSettings(window);
         if (LOWORD(wParam) == kDefaultsButton) SetDefaults(window);
+        if (LOWORD(wParam) >= kLowPreset && LOWORD(wParam) <= kMegaUltraPreset)
+            ApplyRenderPreset(window, LOWORD(wParam));
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -241,7 +282,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
 
     HWND window = CreateWindowExA(0, windowClass.lpszClassName, "Borderlands GOTY Enhanced VR Config",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 550, 660, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 550, 700, nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
     ShowWindow(window, showCommand);
     UpdateWindow(window);

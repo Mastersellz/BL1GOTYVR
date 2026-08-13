@@ -2,21 +2,27 @@
 
 #include <openxr/openxr.h>
 #include <cstdint>
+#include <Windows.h>
 
 namespace bl1gotyvr { namespace input {
 
 struct ControllerState {
     float position[3] = {};
     float rotation[4] = {};     // quaternion [x,y,z,w]
+    float aimPosition[3] = {};
+    float aimRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     float eulerPitch = 0, eulerYaw = 0, eulerRoll = 0;
     float thumbstickX = 0, thumbstickY = 0;  // normalized -1..1
     float trigger = 0;          // 0..1
     float grip = 0;             // 0..1
     bool buttonA = false;
     bool buttonB = false;
+    bool buttonX = false;
+    bool buttonY = false;
     bool thumbstickClick = false;
     bool menuButton = false;
     bool valid = false;
+    bool aimValid = false;
 };
 
 class XRInput {
@@ -25,14 +31,13 @@ public:
 
     bool Initialize(XrInstance instance, XrSession session, XrSpace space);
     void Shutdown();
-    void SyncActions();
-    void UpdateControllerState(int hand);  // 0=left, 1=right
-
-    const ControllerState& GetLeft() const { return m_controllers[0]; }
-    const ControllerState& GetRight() const { return m_controllers[1]; }
+    bool SyncActions();
+    void UpdateControllerStates(XrTime displayTime);
+    bool GetControllerSnapshot(ControllerState controllers[2], uint64_t* generation = nullptr) const;
 
 private:
     XRInput() = default;
+    void UpdateControllerStateUnlocked(int hand, XrTime displayTime);
 
     XrInstance m_instance = XR_NULL_HANDLE;
     XrSession m_session = XR_NULL_HANDLE;
@@ -43,8 +48,10 @@ private:
     // Pose actions
     XrAction m_leftPose = XR_NULL_HANDLE;
     XrAction m_rightPose = XR_NULL_HANDLE;
+    XrAction m_rightAimPose = XR_NULL_HANDLE;
     XrSpace m_leftPoseSpace = XR_NULL_HANDLE;
     XrSpace m_rightPoseSpace = XR_NULL_HANDLE;
+    XrSpace m_rightAimPoseSpace = XR_NULL_HANDLE;
 
     // Thumbstick
     XrAction m_leftThumbstick = XR_NULL_HANDLE;
@@ -61,11 +68,15 @@ private:
     // Buttons
     XrAction m_buttonA = XR_NULL_HANDLE;
     XrAction m_buttonB = XR_NULL_HANDLE;
+    XrAction m_buttonX = XR_NULL_HANDLE;
+    XrAction m_buttonY = XR_NULL_HANDLE;
     XrAction m_leftThumbstickClick = XR_NULL_HANDLE;
     XrAction m_rightThumbstickClick = XR_NULL_HANDLE;
     XrAction m_menuButton = XR_NULL_HANDLE;
 
     ControllerState m_controllers[2] = {};
+    uint64_t m_generation = 0;
+    mutable SRWLOCK m_controllerLock = SRWLOCK_INIT;
 };
 
 }} // namespace bl1gotyvr::input
