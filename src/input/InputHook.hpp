@@ -59,6 +59,7 @@ public:
     }
     void ApplyRightHand(int eye);
     void ApplyLeftHand(int eye);
+    bool ReapplyWeaponPose(void* component);
     void Restore();
 
 private:
@@ -130,6 +131,12 @@ private:
     uintptr_t m_lastDrivenComponent = 0;
     uint64_t m_lastWeaponRefreshGeneration = 0;
     uint64_t m_nextWeaponComponentScanMs = 0;
+    SRWLOCK m_weaponPoseWriteLock = SRWLOCK_INIT;
+    uintptr_t m_renderWeaponComponent = 0;
+    int m_renderWeaponMatrixOffset = 0;
+    float m_renderWeaponMatrix[16] = {};
+    bool m_renderWeaponStampActive = false;
+    std::atomic<uint64_t> m_postAnimationWeaponWrites{0};
 
     /* Ballistic calibration */
     uint32_t m_aimTuningKeysDown = 0;

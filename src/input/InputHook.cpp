@@ -635,6 +635,11 @@ void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
 
 void InputHook::ApplyRightHand(int eye) {
     (void)eye;
+    AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
+    m_renderWeaponStampActive = false;
+    m_renderWeaponComponent = 0;
+    m_renderWeaponMatrixOffset = 0;
+    ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
     m_componentCount = 0;
     m_weaponPoseActive.store(false, std::memory_order_release);
     if (!m_canonicalWeaponPoseValid) return;
@@ -771,6 +776,12 @@ void InputHook::ApplyRightHand(int eye) {
     SIZE_T bytesWritten = 0;
     if (!WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(matrixAddress),
             driven, sizeof(driven), &bytesWritten) || bytesWritten != sizeof(driven)) return;
+    AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
+    m_renderWeaponComponent = active->component;
+    m_renderWeaponMatrixOffset = active->localToWorldOffset;
+    memcpy(m_renderWeaponMatrix, driven, sizeof(m_renderWeaponMatrix));
+    m_renderWeaponStampActive = true;
+    ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
     weapon.valid = true;
     m_componentCount = 1;
     m_weaponPoseActive.store(true, std::memory_order_release);
@@ -792,7 +803,34 @@ void InputHook::ApplyLeftHand(int eye) {
     (void)eye;
 }
 
+bool InputHook::ReapplyWeaponPose(void* component) {
+    if (!component) return false;
+    bool written = false;
+    AcquireSRWLockShared(&m_weaponPoseWriteLock);
+    if (m_renderWeaponStampActive &&
+        m_renderWeaponComponent == reinterpret_cast<uintptr_t>(component) &&
+        m_renderWeaponMatrixOffset > 0) {
+        SIZE_T bytesWritten = 0;
+        written = WriteProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<void*>(m_renderWeaponComponent +
+                                    m_renderWeaponMatrixOffset),
+            m_renderWeaponMatrix, sizeof(m_renderWeaponMatrix), &bytesWritten) &&
+            bytesWritten == sizeof(m_renderWeaponMatrix);
+    }
+    ReleaseSRWLockShared(&m_weaponPoseWriteLock);
+    if (written) {
+        const uint64_t count = m_postAnimationWeaponWrites.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (count == 1) {
+            Log("[WeaponPose] First post-animation stereo stamp applied: component=%p",
+                component);
+        }
+    }
+    return written;
+}
+
 void InputHook::Restore() {
+    AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
     for (int i = 0; i < m_componentCount; ++i) {
         WeaponComponent& w = m_components[i];
         if (!w.valid || !w.address || !w.matrixOffset) continue;
@@ -801,6 +839,10 @@ void InputHook::Restore() {
         w.valid = false;
     }
     m_componentCount = 0;
+    m_renderWeaponStampActive = false;
+    m_renderWeaponComponent = 0;
+    m_renderWeaponMatrixOffset = 0;
+    ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
 }
 
 void InputHook::Shutdown() {

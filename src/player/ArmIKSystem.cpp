@@ -5,6 +5,7 @@
 #include "../camera/UE3Scanner.hpp"
 #include "../config/Config.hpp"
 #include "../core/VRMod.hpp"
+#include "../input/InputHook.hpp"
 #include "../input/WeaponAimSystem.hpp"
 #include "../input/XRInput.hpp"
 #include "../hook/MinHookWrapper.hpp"
@@ -704,6 +705,7 @@ void __fastcall ArmIKSystem::HookedUpdateSkelPose(void* component, float deltaTi
         return;
     }
     system.ObserveComponent(component);
+    input::InputHook::Instance().ReapplyWeaponPose(component);
     const uint64_t calls = system.m_poseHookCalls.fetch_add(
         1, std::memory_order_relaxed) + 1;
     if (calls == 1)
