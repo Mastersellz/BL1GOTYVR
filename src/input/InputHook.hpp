@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <openxr/openxr.h>
+#include <atomic>
 #include <cstdint>
 
 namespace bl1gotyvr { namespace input {
@@ -16,6 +17,26 @@ struct WeaponComponent {
     bool valid = false;
 };
 
+struct WeaponMountCacheEntry {
+    uintptr_t pawn = 0;
+    uintptr_t weapon = 0;
+    uintptr_t component = 0;
+    float matrix[16] = {};
+    bool valid = false;
+};
+
+struct WeaponAimProfile {
+    uint64_t stableKey = 0;
+    uintptr_t pawn = 0;
+    uintptr_t weapon = 0;
+    uintptr_t component = 0;
+    float pitch = 0.0f;
+    float yaw = 0.0f;
+    char name[64] = {};
+    bool persistent = false;
+    bool valid = false;
+};
+
 class InputHook {
 public:
     static InputHook& Instance();
@@ -26,6 +47,16 @@ public:
 
     // Weapon motion
     void CacheWeaponComponent(int index, uintptr_t address, int matrixOffset);
+    void SetCanonicalWeaponPose(const float controllerPosition[3],
+                                const float controllerForward[3],
+                                const float controllerUp[3],
+                                const float cameraPosition[3],
+                                const float cameraForward[3],
+                                const float cameraUp[3]);
+    void ClearCanonicalWeaponPose();
+    bool IsWeaponPoseActive() const {
+        return m_weaponPoseActive.load(std::memory_order_acquire);
+    }
     void ApplyRightHand(int eye);
     void ApplyLeftHand(int eye);
     void Restore();
@@ -35,6 +66,10 @@ private:
 
     void ProcessTurn();
     void PollAimTuningKeys();
+    void ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
+                                  const char* outerName, const char* meshName,
+                                  uintptr_t component);
+    bool SaveActiveAimProfile();
     void PressKey(int vk);
     void ReleaseKey(int vk);
     void ReleaseAllInput();
@@ -76,11 +111,38 @@ private:
     WeaponComponent m_components[7] = {};
     int m_componentCount = 0;
     unsigned int m_applyCalls = 0;
+    float m_canonicalWeaponPosition[3] = {};
+    float m_canonicalWeaponForward[3] = {1.0f, 0.0f, 0.0f};
+    float m_canonicalWeaponUp[3] = {0.0f, 0.0f, 1.0f};
+    float m_nativeCameraPosition[3] = {};
+    float m_nativeCameraForward[3] = {1.0f, 0.0f, 0.0f};
+    float m_nativeCameraUp[3] = {0.0f, 0.0f, 1.0f};
+    bool m_canonicalWeaponPoseValid = false;
+    std::atomic<bool> m_weaponPoseActive{false};
+    float m_weaponMountMatrix[16] = {};
+    uintptr_t m_mountWeapon = 0;
+    uintptr_t m_mountComponent = 0;
+    bool m_weaponMountValid = false;
+    static constexpr int kWeaponMountCacheCapacity = 16;
+    WeaponMountCacheEntry m_weaponMountCache[kWeaponMountCacheCapacity] = {};
+    int m_weaponMountCacheCursor = 0;
+    uintptr_t m_lastDrivenWeapon = 0;
+    uintptr_t m_lastDrivenComponent = 0;
+    uint64_t m_lastWeaponRefreshGeneration = 0;
+    uint64_t m_nextWeaponComponentScanMs = 0;
 
     /* Ballistic calibration */
     uint32_t m_aimTuningKeysDown = 0;
+    uint64_t m_aimTuningNextRepeatMs[5] = {};
+    bool m_aimTuningDirty = false;
     float m_aimTrimPitch = 0.0f;
     float m_aimTrimYaw = 0.0f;
+    float m_defaultAimTrimPitch = 0.0f;
+    float m_defaultAimTrimYaw = 0.0f;
+    static constexpr int kWeaponAimProfileCapacity = 64;
+    WeaponAimProfile m_weaponAimProfiles[kWeaponAimProfileCapacity] = {};
+    int m_weaponAimProfileCursor = 0;
+    int m_activeWeaponAimProfile = -1;
 };
 
 }} // namespace bl1gotyvr::input

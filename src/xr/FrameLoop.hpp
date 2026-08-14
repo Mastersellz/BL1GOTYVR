@@ -20,6 +20,7 @@ struct StereoRenderTicket {
     float headPosition[3] = {};
     float headRotation[4] = {};
     bool rightAimValid = false;
+    float rightAimPosition[3] = {};
     float rightAimRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     float aimPitchDegrees = 0.0f;
     float aimYawDegrees = 0.0f;
@@ -69,7 +70,8 @@ private:
     bool EnsureEyeTextures(ID3D11Device* device, ID3D11Texture2D* source,
                            bool sideBySideSource = false);
     bool CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* source, int eye,
-                          bool sideBySideSource = false, int sourceEye = -1);
+                           bool sideBySideSource = false, int sourceEye = -1,
+                           ID3D11Texture2D* hudOverlay = nullptr);
     bool EnsureSwapchainUploadTexture(ID3D11Device* device,
                                       const D3D11_TEXTURE2D_DESC& destinationDesc,
                                       int eye);
@@ -89,6 +91,12 @@ private:
     void ValidateDesktopStereoPair(ID3D11Device* device, ID3D11DeviceContext* context);
     bool ConsumeRenderedTicket(StereoRenderTicket& ticket);
     bool EnsureHudExtractionTexture(ID3D11Device* device, ID3D11Texture2D* source);
+    bool ValidateHudPair(ID3D11Device* device, ID3D11DeviceContext* context,
+                         ID3D11Texture2D* finalFrame, ID3D11Texture2D* worldFrame,
+                         uint64_t pairSerial);
+    bool CompositeHudIntoProjection(ID3D11DeviceContext* context,
+                                    ID3D11Texture2D* hudTexture,
+                                    ID3D11Texture2D* target, int eye);
     void ResetHudCaptureMetadata();
     void ResetStereoPair();
     void StartWaitWorker();
@@ -134,6 +142,7 @@ private:
     float m_submissionRightAimRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     float m_submissionAimPitchDegrees = 0.0f;
     float m_submissionAimYawDegrees = 0.0f;
+    float m_lastDotSettings[2][4] = {};
     bool m_submissionProjectionCorrection = true;
     float m_submissionRenderAspect = 1.0f;
 
@@ -142,6 +151,10 @@ private:
     ID3D11Texture2D* m_swapchainUploadTextures[2] = {};
     ID3D11Texture2D* m_worldBeforeHudTextures[2] = {};
     ID3D11Texture2D* m_hudExtractionTexture = nullptr;
+    ID3D11Texture2D* m_hudValidationTexture = nullptr;
+    ID3D11Texture2D* m_hudValidationStaging = nullptr;
+    bool m_hudWorldValidated = false;
+    uint64_t m_nextHudValidationPair = 0;
     uint64_t m_worldCapturePairSerial = 0;
     uint64_t m_worldCaptureSerial[2] = {};
     uint8_t m_worldCaptureMask = 0;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace bl1gotyvr { namespace config {
 
 struct Settings {
@@ -56,5 +58,8 @@ void Load(const char* path);
 void Save(const char* path);
 bool SaveLoaded();
 bool ReloadIfChanged();
+bool LoadWeaponAimProfile(uint64_t key, float& pitch, float& yaw);
+bool SaveWeaponAimProfile(uint64_t key, float pitch, float yaw,
+                          const char* profileName);
 
 }} // namespace bl1gotyvr::config

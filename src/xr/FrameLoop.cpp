@@ -140,6 +140,16 @@ void FrameLoop::InvalidateBackbufferResources() {
         m_hudExtractionTexture->Release();
         m_hudExtractionTexture = nullptr;
     }
+    if (m_hudValidationTexture) {
+        m_hudValidationTexture->Release();
+        m_hudValidationTexture = nullptr;
+    }
+    if (m_hudValidationStaging) {
+        m_hudValidationStaging->Release();
+        m_hudValidationStaging = nullptr;
+    }
+    m_hudWorldValidated = false;
+    m_nextHudValidationPair = 0;
     ResetHudCaptureMetadata();
     ReleaseSRWLockExclusive(&m_captureLock);
     render::HudBlitter::Instance().Shutdown();
@@ -510,6 +520,7 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     }
     float dotU = 0.5f, dotV = 0.5f, dotEnabled = 0.0f;
     if (m_submissionRightAimValid && m_submissionViewsValid &&
+        input::InputHook::Instance().IsWeaponPoseActive() &&
         sampledEye >= 0 && sampledEye < 2) {
         auto rotate = [](const float quaternion[4], const float vector[3], float output[3]) {
             const float qx = quaternion[0], qy = quaternion[1];
@@ -568,6 +579,12 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
         selectedSwapchainIsSrgb && sourceIsDisplayEncodedUnorm ? 1.0f : 0.0f,
         0.0f, 0.0f
     };
+    if (sampledEye >= 0 && sampledEye < 2) {
+        m_lastDotSettings[sampledEye][0] = dotU;
+        m_lastDotSettings[sampledEye][1] = dotV;
+        m_lastDotSettings[sampledEye][2] = 0.006f;
+        m_lastDotSettings[sampledEye][3] = dotEnabled;
+    }
     context->UpdateSubresource(m_blitConstants, 0, nullptr, settings, 0, 0);
     context->PSSetConstantBuffers(0, 1, &m_blitConstants);
     context->Draw(3, 0);
@@ -819,7 +836,8 @@ ID3D11Texture2D* FrameLoop::CaptureGdiFrame(ID3D11Device* device,
 }
 
 bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* source, int eye,
-                                 bool sideBySideSource, int sourceEye) {
+                                  bool sideBySideSource, int sourceEye,
+                                  ID3D11Texture2D* hudOverlay) {
     auto& xr = OpenXRContext::Instance();
     EyeData& eyeData = (eye == 0) ? xr.GetLeftEye() : xr.GetRightEye();
 
@@ -870,6 +888,11 @@ bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* 
                     uploadDesc.Width, uploadDesc.Height, uploadDesc.Format, dstDesc.Format);
                 loggedBlitFailure = true;
             }
+            copied = false;
+        } else if (hudOverlay && !CompositeHudIntoProjection(
+                       context, hudOverlay, uploadTexture,
+                       sourceEye >= 0 ? sourceEye : eye)) {
+            Log("[HUD] Projection HUD composition failed for eye %d; reverting pair", eye);
             copied = false;
         } else {
             context->CopyResource(destTex, uploadTexture);
@@ -939,6 +962,8 @@ bool FrameLoop::AcquireRenderTicket(StereoRenderTicket& ticket) {
         m_activePair.aimYawDegrees = config::Get().aim_yaw_degrees;
         m_activePair.rightAimValid = controllers[1].aimValid;
         if (m_activePair.rightAimValid) {
+            memcpy(m_activePair.rightAimPosition, controllers[1].aimPosition,
+                   sizeof(m_activePair.rightAimPosition));
             memcpy(m_activePair.rightAimRotation, controllers[1].aimRotation,
                    sizeof(m_activePair.rightAimRotation));
         }
@@ -991,7 +1016,7 @@ void FrameLoop::ResetHudCaptureMetadata() {
 
 void FrameLoop::CaptureWorldBeforeHud(uint64_t pairSerial, int eye) {
     if (!pairSerial || eye < 0 || eye > 1 ||
-        !OpenXRContext::Instance().ShouldSeparateHud() ||
+        !OpenXRContext::Instance().WantsHudCapture() ||
         m_desktopTestMode.load(std::memory_order_acquire)) return;
 
     ID3D11Device* device = d3d11::GetGameDevice();
@@ -1151,6 +1176,237 @@ bool FrameLoop::EnsureHudExtractionTexture(ID3D11Device* device,
     sourceDesc.MiscFlags = 0;
     return SUCCEEDED(device->CreateTexture2D(
         &sourceDesc, nullptr, &m_hudExtractionTexture));
+}
+
+bool FrameLoop::ValidateHudPair(ID3D11Device* device,
+                                ID3D11DeviceContext* context,
+                                ID3D11Texture2D* finalFrame,
+                                ID3D11Texture2D* worldFrame,
+                                uint64_t pairSerial) {
+    if (m_hudWorldValidated) return true;
+    if (!device || !context || !finalFrame || !worldFrame ||
+        pairSerial < m_nextHudValidationPair) return false;
+
+    D3D11_TEXTURE2D_DESC finalDesc = {}, worldDesc = {};
+    finalFrame->GetDesc(&finalDesc);
+    worldFrame->GetDesc(&worldDesc);
+    const bool supportedFormat = finalDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+        finalDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+        finalDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+        finalDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+        finalDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+        finalDesc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    if (!supportedFormat || finalDesc.Width != worldDesc.Width ||
+        finalDesc.Height != worldDesc.Height || finalDesc.Format != worldDesc.Format ||
+        finalDesc.SampleDesc.Count != 1 || worldDesc.SampleDesc.Count != 1) {
+        m_nextHudValidationPair = pairSerial + 120;
+        return false;
+    }
+
+    bool recreate = !m_hudValidationTexture || !m_hudValidationStaging;
+    if (!recreate) {
+        D3D11_TEXTURE2D_DESC current = {};
+        m_hudValidationTexture->GetDesc(&current);
+        recreate = current.Format != finalDesc.Format;
+    }
+    if (recreate) {
+        if (m_hudValidationTexture) {
+            m_hudValidationTexture->Release();
+            m_hudValidationTexture = nullptr;
+        }
+        if (m_hudValidationStaging) {
+            m_hudValidationStaging->Release();
+            m_hudValidationStaging = nullptr;
+        }
+        D3D11_TEXTURE2D_DESC sampleDesc = {};
+        sampleDesc.Width = 8;
+        sampleDesc.Height = 4;
+        sampleDesc.MipLevels = 1;
+        sampleDesc.ArraySize = 1;
+        sampleDesc.Format = finalDesc.Format;
+        sampleDesc.SampleDesc.Count = 1;
+        sampleDesc.Usage = D3D11_USAGE_DEFAULT;
+        if (FAILED(device->CreateTexture2D(
+                &sampleDesc, nullptr, &m_hudValidationTexture))) {
+            m_nextHudValidationPair = pairSerial + 120;
+            return false;
+        }
+        sampleDesc.Usage = D3D11_USAGE_STAGING;
+        sampleDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(device->CreateTexture2D(
+                &sampleDesc, nullptr, &m_hudValidationStaging))) {
+            m_hudValidationTexture->Release();
+            m_hudValidationTexture = nullptr;
+            m_nextHudValidationPair = pairSerial + 120;
+            return false;
+        }
+    }
+
+    for (UINT y = 0; y < 4; ++y) {
+        for (UINT x = 0; x < 4; ++x) {
+            constexpr UINT sampleNumerators[4] = {1, 3, 4, 7};
+            const UINT sourceX = (std::min)(finalDesc.Width - 1,
+                (sampleNumerators[x] * finalDesc.Width) / 8);
+            const UINT sourceY = (std::min)(finalDesc.Height - 1,
+                (sampleNumerators[y] * finalDesc.Height) / 8);
+            const D3D11_BOX sample = {
+                sourceX, sourceY, 0, sourceX + 1, sourceY + 1, 1};
+            context->CopySubresourceRegion(
+                m_hudValidationTexture, 0, x, y, 0, worldFrame, 0, &sample);
+            context->CopySubresourceRegion(
+                m_hudValidationTexture, 0, x + 4, y, 0, finalFrame, 0, &sample);
+        }
+    }
+    context->CopyResource(m_hudValidationStaging, m_hudValidationTexture);
+    context->Flush();
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context->Map(
+            m_hudValidationStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
+        m_nextHudValidationPair = pairSerial + 120;
+        return false;
+    }
+
+    float worldAverage = 0.0f;
+    float finalAverage = 0.0f;
+    float differenceAverage = 0.0f;
+    unsigned changedSamples = 0;
+    for (UINT y = 0; y < 4; ++y) {
+        const auto* row = static_cast<const unsigned char*>(mapped.pData) +
+            static_cast<size_t>(y) * mapped.RowPitch;
+        for (UINT x = 0; x < 4; ++x) {
+            const unsigned char* world = row + static_cast<size_t>(x) * 4;
+            const unsigned char* final = row + static_cast<size_t>(x + 4) * 4;
+            float sampleDifference = 0.0f;
+            for (int channel = 0; channel < 3; ++channel) {
+                worldAverage += world[channel] / 255.0f;
+                finalAverage += final[channel] / 255.0f;
+                sampleDifference += std::abs(
+                    static_cast<int>(world[channel]) - static_cast<int>(final[channel])) /
+                    255.0f;
+            }
+            differenceAverage += sampleDifference / 3.0f;
+            if (sampleDifference / 3.0f > 0.08f) ++changedSamples;
+        }
+    }
+    context->Unmap(m_hudValidationStaging, 0);
+    worldAverage /= 48.0f;
+    finalAverage /= 48.0f;
+    differenceAverage /= 16.0f;
+    const bool valid = worldAverage >= 0.015f && finalAverage >= 0.015f &&
+        differenceAverage >= 0.0002f && differenceAverage <= 0.30f &&
+        changedSamples >= 1 && changedSamples <= 12;
+    Log("[HUD] Pre-HUD validation: pair=%llu world=%.4f final=%.4f "
+        "difference=%.4f changed=%u/16 valid=%d",
+        static_cast<unsigned long long>(pairSerial), worldAverage, finalAverage,
+        differenceAverage, changedSamples, valid ? 1 : 0);
+    if (valid) {
+        m_hudWorldValidated = true;
+    } else {
+        m_nextHudValidationPair = pairSerial + 120;
+    }
+    return valid;
+}
+
+bool FrameLoop::CompositeHudIntoProjection(ID3D11DeviceContext* context,
+                                           ID3D11Texture2D* hudTexture,
+                                           ID3D11Texture2D* target, int eye) {
+    if (!context || !hudTexture || !target || eye < 0 || eye > 1 ||
+        !m_submissionViewsValid) return false;
+    D3D11_TEXTURE2D_DESC sourceDesc = {}, targetDesc = {};
+    hudTexture->GetDesc(&sourceDesc);
+    target->GetDesc(&targetDesc);
+    if (!sourceDesc.Width || !sourceDesc.Height ||
+        !targetDesc.Width || !targetDesc.Height) return false;
+
+    const XrView& eyeView = m_submissionViews[eye];
+    const float tanLeft = tanf(eyeView.fov.angleLeft);
+    const float tanRight = tanf(eyeView.fov.angleRight);
+    const float runtimeTanUp = tanf(eyeView.fov.angleUp);
+    const float runtimeTanDown = tanf(eyeView.fov.angleDown);
+    const float verticalHalfSpan = (runtimeTanUp - runtimeTanDown) * 0.5f;
+    const float horizontalSpan = tanRight - tanLeft;
+    const float verticalSpan = verticalHalfSpan * 2.0f;
+    if (horizontalSpan <= 0.0f || verticalSpan <= 0.0f) return false;
+
+    const auto& hud = config::Get();
+    constexpr float kDegreesToRadians = 0.01745329251994329577f;
+    const float angularWidth = (std::min)(150.0f, hud.hud_width_degrees) *
+        kDegreesToRadians;
+    float viewportWidth = static_cast<float>(targetDesc.Width) *
+        (2.0f * tanf(angularWidth * 0.5f) * hud.hud_scale) / horizontalSpan;
+    float viewportHeight = viewportWidth * static_cast<float>(sourceDesc.Height) /
+        static_cast<float>(sourceDesc.Width);
+
+    const XrVector3f centerPosition = {
+        (m_submissionViews[0].pose.position.x +
+         m_submissionViews[1].pose.position.x) * 0.5f,
+        (m_submissionViews[0].pose.position.y +
+         m_submissionViews[1].pose.position.y) * 0.5f,
+        (m_submissionViews[0].pose.position.z +
+         m_submissionViews[1].pose.position.z) * 0.5f};
+    const float eyeDelta[3] = {
+        eyeView.pose.position.x - centerPosition.x,
+        eyeView.pose.position.y - centerPosition.y,
+        eyeView.pose.position.z - centerPosition.z};
+    const XrQuaternionf& orientation = eyeView.pose.orientation;
+    const float inverse[4] = {
+        -orientation.x, -orientation.y, -orientation.z, orientation.w};
+    auto rotate = [](const float quaternion[4], const float vector[3], float output[3]) {
+        const float tx = 2.0f * (quaternion[1] * vector[2] - quaternion[2] * vector[1]);
+        const float ty = 2.0f * (quaternion[2] * vector[0] - quaternion[0] * vector[2]);
+        const float tz = 2.0f * (quaternion[0] * vector[1] - quaternion[1] * vector[0]);
+        output[0] = vector[0] + quaternion[3] * tx +
+            (quaternion[1] * tz - quaternion[2] * ty);
+        output[1] = vector[1] + quaternion[3] * ty +
+            (quaternion[2] * tx - quaternion[0] * tz);
+        output[2] = vector[2] + quaternion[3] * tz +
+            (quaternion[0] * ty - quaternion[1] * tx);
+    };
+    float localEye[3] = {};
+    rotate(inverse, eyeDelta, localEye);
+    const float distance = (std::max)(0.5f, hud.hud_distance);
+    const float projectedX = (hud.hud_horizontal_offset - localEye[0]) / distance;
+    const float projectedY = (hud.hud_vertical_offset - localEye[1]) / distance;
+    const float centerU = (projectedX - tanLeft) / horizontalSpan;
+    const float centerV = (verticalHalfSpan - projectedY) / verticalSpan;
+    const float centerX = centerU * targetDesc.Width;
+    const float centerY = centerV * targetDesc.Height;
+    if (centerX <= 0.0f || centerX >= targetDesc.Width ||
+        centerY <= 0.0f || centerY >= targetDesc.Height) return false;
+
+    const float availableWidth = 2.0f * (std::min)(
+        centerX, static_cast<float>(targetDesc.Width) - centerX);
+    const float availableHeight = 2.0f * (std::min)(
+        centerY, static_cast<float>(targetDesc.Height) - centerY);
+    const float fitScale = (std::min)(1.0f, (std::min)(
+        availableWidth / viewportWidth, availableHeight / viewportHeight));
+    viewportWidth *= fitScale;
+    viewportHeight *= fitScale;
+    D3D11_VIEWPORT viewport = {};
+    viewport.TopLeftX = centerX - viewportWidth * 0.5f;
+    viewport.TopLeftY = centerY - viewportHeight * 0.5f;
+    viewport.Width = viewportWidth;
+    viewport.Height = viewportHeight;
+    viewport.MaxDepth = 1.0f;
+
+    ID3D11Device* device = nullptr;
+    context->GetDevice(&device);
+    const bool composed = device && render::HudBlitter::Instance().Composite(
+        device, context, hudTexture, target, viewport, hud.hud_opacity,
+        m_lastDotSettings[eye],
+        static_cast<float>(targetDesc.Width) / targetDesc.Height);
+    if (device) device->Release();
+    if (composed) {
+        static std::atomic<uint64_t> composeCount{0};
+        const uint64_t count = composeCount.fetch_add(1) + 1;
+        if (count <= 2 || count % 600 == 0) {
+            Log("[HUD] Projection-baked HUD: eye=%d viewport=(%.0f,%.0f %.0fx%.0f) "
+                "distance=%.2f count=%llu", eye, viewport.TopLeftX, viewport.TopLeftY,
+                viewport.Width, viewport.Height, distance,
+                static_cast<unsigned long long>(count));
+        }
+    }
+    return composed;
 }
 
 bool FrameLoop::ConsumeRenderedTicket(StereoRenderTicket& ticket) {
@@ -1943,6 +2199,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     bool leftOk = false;
     bool rightOk = false;
     bool hudSeparated = false;
+    bool hudQuadPrepared = false;
     XrView submittedViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
     bool xrFrameBegun = false;
     bool preparedWaitConsumed = false;
@@ -2002,8 +2259,10 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         if (m_eyeTextures[1]) m_eyeTextures[1]->GetDesc(&finalDesc[1]);
         if (m_worldBeforeHudTextures[0]) m_worldBeforeHudTextures[0]->GetDesc(&worldDesc[0]);
         if (m_worldBeforeHudTextures[1]) m_worldBeforeHudTextures[1]->GetDesc(&worldDesc[1]);
+        const bool bakeHud = xr.ShouldBakeHud();
+        const bool separateHud = xr.ShouldSeparateHud();
         const bool worldPairMatches = m_eyeCaptureWasBackbuffer[0] &&
-            m_eyeCaptureWasBackbuffer[1] && xr.ShouldSeparateHud() &&
+            m_eyeCaptureWasBackbuffer[1] && (bakeHud || separateHud) &&
             m_worldCapturePairSerial == renderedTicket.pairSerial &&
             m_worldCaptureMask == 0x3u &&
             m_worldCaptureSerial[0] == renderedTicket.pairSerial &&
@@ -2022,23 +2281,32 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
             worldDesc[1].Height == finalDesc[1].Height &&
             worldDesc[1].Format == finalDesc[1].Format &&
             worldDesc[1].SampleDesc.Count == 1;
-        if (worldPairMatches && EnsureHudExtractionTexture(device, m_eyeTextures[0])) {
-            hudSeparated = render::HudBlitter::Instance().ExtractDifference(
-                device, context, m_eyeTextures[0], m_worldBeforeHudTextures[0],
-                m_hudExtractionTexture) && xr.PrepareHudTexture(
-                    m_hudExtractionTexture, renderedTicket.pairSerial);
+        // Eye 1 is the final AER pass and therefore owns the freshest mono HUD.
+        if (worldPairMatches && ValidateHudPair(
+                device, context, m_eyeTextures[1], m_worldBeforeHudTextures[1],
+                renderedTicket.pairSerial) &&
+            EnsureHudExtractionTexture(device, m_eyeTextures[1])) {
+            const bool extracted = render::HudBlitter::Instance().ExtractDifference(
+                device, context, m_eyeTextures[1], m_worldBeforeHudTextures[1],
+                m_hudExtractionTexture);
+            hudQuadPrepared = extracted && separateHud && xr.PrepareHudTexture(
+                m_hudExtractionTexture, renderedTicket.pairSerial);
+            hudSeparated = extracted && (bakeHud || hudQuadPrepared);
         }
 
+        ID3D11Texture2D* bakedHud = hudSeparated && bakeHud
+            ? m_hudExtractionTexture : nullptr;
         ID3D11Texture2D* leftProjection = hudSeparated
             ? m_worldBeforeHudTextures[leftSource] : m_eyeTextures[leftSource];
         ID3D11Texture2D* rightProjection = hudSeparated
             ? m_worldBeforeHudTextures[rightSource] : m_eyeTextures[rightSource];
         leftOk = leftProjection &&
-            CopyTextureToEye(context, leftProjection, 0, false, leftSource);
+            CopyTextureToEye(context, leftProjection, 0, false, leftSource, bakedHud);
         rightOk = rightProjection &&
-            CopyTextureToEye(context, rightProjection, 1, false, rightSource);
+            CopyTextureToEye(context, rightProjection, 1, false, rightSource, bakedHud);
         if (hudSeparated && (!leftOk || !rightOk)) {
             hudSeparated = false;
+            hudQuadPrepared = false;
             leftOk = m_eyeTextures[leftSource] &&
                 CopyTextureToEye(context, m_eyeTextures[leftSource], 0, false, leftSource);
             rightOk = m_eyeTextures[rightSource] &&
@@ -2058,8 +2326,8 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     // the next pair, matching ME2VR's synchronized AER cadence.
     const bool submitted = xrFrameBegun && xr.EndFrame(
         completePair, completePair ? submittedViews : nullptr,
-        completePair && hudSeparated,
-        completePair && hudSeparated ? renderedTicket.pairSerial : 0);
+        completePair && hudQuadPrepared,
+        completePair && hudQuadPrepared ? renderedTicket.pairSerial : 0);
     if (preparedWaitConsumed && m_waitRequestEvent) SetEvent(m_waitRequestEvent);
     static bool loggedFirstSubmission = false;
     if (submitted && completePair && !loggedFirstSubmission) {

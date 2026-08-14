@@ -1314,6 +1314,22 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
                         ValidateMatrix(localToWorld.values)) {
                         entry.localToWorldOffset = kPrimitiveLocalToWorldOffset;
                     }
+                    for (int pointerOffset = 0x80; pointerOffset <= 0x700;
+                         pointerOffset += 4) {
+                        uintptr_t mesh = 0;
+                        char meshClass[128] = {};
+                        if (!ReadMemory(object + pointerOffset, &mesh, sizeof(mesh)) ||
+                            !mesh || !ReadClassName(globals, mesh, meshClass,
+                                                    sizeof(meshClass))) continue;
+                        const std::string meshClassLower = Lower(meshClass);
+                        if (meshClassLower.find("skeletalmesh") == std::string::npos ||
+                            meshClassLower.find("component") != std::string::npos) continue;
+                        entry.skeletalMesh = mesh;
+                        entry.skeletalMeshOffset = pointerOffset;
+                        ReadObjectName(globals, mesh, entry.meshName,
+                                       sizeof(entry.meshName));
+                        break;
+                    }
                 }
                 ReadMemory(object + globals.gObjectNameOffset - 8,
                            &entry.outer, sizeof(entry.outer));

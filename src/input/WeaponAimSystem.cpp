@@ -571,36 +571,10 @@ void __fastcall WeaponAimSystem::HookedScriptInvoke(void* object, void* frame,
     };
     float origin[3] = {};
     const bool originReadable = locals && ReadDirect(locals, origin, sizeof(origin));
-    bool finiteTargetUsed = false;
-    if (desiredValid && originReadable &&
-        system.m_aimTargetValid.load(std::memory_order_acquire)) {
-        const float originDx = origin[0] -
-            system.m_aimOriginX.load(std::memory_order_relaxed);
-        const float originDy = origin[1] -
-            system.m_aimOriginY.load(std::memory_order_relaxed);
-        const float originDz = origin[2] -
-            system.m_aimOriginZ.load(std::memory_order_relaxed);
-        const float originDistanceSquared = originDx * originDx +
-            originDy * originDy + originDz * originDz;
-        const float targetDirection[3] = {
-            system.m_aimTargetX.load(std::memory_order_relaxed) - origin[0],
-            system.m_aimTargetY.load(std::memory_order_relaxed) - origin[1],
-            system.m_aimTargetZ.load(std::memory_order_relaxed) - origin[2],
-        };
-        const float targetHorizontal = sqrtf(targetDirection[0] * targetDirection[0] +
-            targetDirection[1] * targetDirection[1]);
-        if (std::isfinite(originDistanceSquared) &&
-            originDistanceSquared < 1000.0f * 1000.0f &&
-            std::isfinite(targetHorizontal) && std::isfinite(targetDirection[2]) &&
-            targetHorizontal + fabsf(targetDirection[2]) > 1.0e-5f) {
-            desired[0] = static_cast<int32_t>(lroundf(
-                atan2f(targetDirection[2], targetHorizontal) * kRadiansToUnis));
-            desired[1] = static_cast<int32_t>(lroundf(
-                atan2f(targetDirection[1], targetDirection[0]) * kRadiansToUnis));
-            desired[2] = 0;
-            finiteTargetUsed = true;
-        }
-    }
+    // The projection dot represents this angular direction at infinity. Write
+    // the same direction so calibration moves the marker and projectile path
+    // together instead of converging bullets to a separate 20 m target.
+    const bool finiteTargetUsed = false;
     bool overrideEnabled = false;
     bool resultReadable = false;
     bool written = false;
@@ -608,7 +582,7 @@ void __fastcall WeaponAimSystem::HookedScriptInvoke(void* object, void* frame,
     overrideEnabled = system.m_ballisticOverrideEnabled.load(std::memory_order_acquire);
     resultReadable = result && (periodicSample || overrideEnabled) &&
         ReadDirect(reinterpret_cast<uintptr_t>(result), rotation, sizeof(rotation));
-    if (overrideEnabled && desiredValid && resultReadable) {
+    if (overrideEnabled && firing && desiredValid && resultReadable) {
         written = WriteDirect(reinterpret_cast<uintptr_t>(result), desired, sizeof(desired));
     }
     ReleaseSRWLockShared(&system.m_ballisticOverrideLock);
@@ -811,13 +785,10 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
     if (getAdjustedAim && weaponValid) {
         InstallScriptInvokeProbe(getAdjustedAim, moduleBase, moduleSize);
     }
-    if (getAdjustedAim && aimNameToken && weaponValid &&
-        !m_hookInstalled.load(std::memory_order_acquire)) {
-        const uintptr_t processEvent = FindProcessEvent(
-            controllerAddress, moduleBase, moduleSize);
-        if (processEvent) Install(processEvent);
-    }
-    Log("[WeaponAim] Ballistic writes disabled; aim probes are read-only");
+    Log("[WeaponAim] Ballistic path: script=%d override=%d aimFunction=%p",
+        m_scriptInvokeInstalled.load(std::memory_order_acquire),
+        m_ballisticOverrideEnabled.load(std::memory_order_acquire),
+        reinterpret_cast<void*>(getAdjustedAim));
     m_initialized.store(true, std::memory_order_release);
 }
 
@@ -841,7 +812,6 @@ int32_t __fastcall WeaponAimSystem::HookedProcessEvent(
     const bool firing = system.m_fireActive.load(std::memory_order_acquire);
     const bool periodicSample = firing ? (count <= 8 || count % 120 == 0) :
         (count <= 8 || count % 600 == 0);
-    if (!periodicSample) return status;
 
     float origin[3] = {};
     int32_t rotation[3] = {};
@@ -849,6 +819,7 @@ int32_t __fastcall WeaponAimSystem::HookedProcessEvent(
         reinterpret_cast<uintptr_t>(params), origin, sizeof(origin));
     const bool resultReadable = result && ReadMem(
         reinterpret_cast<uintptr_t>(result), rotation, sizeof(rotation));
+    if (!periodicSample) return status;
     Log("[WeaponAim] ProcessEvent GetAdjustedAim probe call=%llu firing=%d "
         "object=%p name=0x%llX params=%p originReadable=%d origin=(%.3f,%.3f,%.3f) "
         "result=%p resultReadable=%d rot=(%d,%d,%d)",
@@ -917,7 +888,7 @@ PlayerIdentitySnapshot WeaponAimSystem::GetPlayerIdentity() {
             const uintptr_t selectedAimOwner =
                 m_getAdjustedAimOwnerClass.load(std::memory_order_acquire);
             const bool selectedAimCompatible = selectedAimFunction == 0 ||
-                selectedAimOwner == weaponClass;
+                ClassDistance(weaponClass, selectedAimOwner) >= 0;
             AcquireSRWLockExclusive(&m_identityLock);
             uintptr_t publishWeapon = 0;
             uintptr_t publishOwner = 0;

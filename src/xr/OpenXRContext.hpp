@@ -43,7 +43,9 @@ public:
                    bool submitHudLayer = false,
                    uint64_t hudPairSerial = 0);
     bool CanSubmitHud() const;
+    bool WantsHudCapture() const;
     bool ShouldSeparateHud() const;
+    bool ShouldBakeHud() const;
     bool ShouldSubmitCurrentViews() const { return m_integratedHud; }
     bool PrepareHudTexture(ID3D11Texture2D* texture, uint64_t pairSerial);
     void InvalidateHudResources();

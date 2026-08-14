@@ -575,11 +575,21 @@ bool OpenXRContext::CanSubmitHud() const {
         m_systemProperties.graphicsProperties.maxLayerCount >= 2;
 }
 
+bool OpenXRContext::WantsHudCapture() const {
+    return m_initialized && config::Get().hud_enabled &&
+        !config::Get().debug_force_no_hud_layer;
+}
+
 bool OpenXRContext::ShouldSeparateHud() const {
     // VDXR showed the HUD quad while the pre-HUD projection snapshots were
     // black. Submit the complete final eye images there; SteamVR keeps the
     // dedicated VIEW-space HUD layer.
     return CanSubmitHud() && !m_integratedHud &&
+        !config::Get().debug_force_no_hud_layer;
+}
+
+bool OpenXRContext::ShouldBakeHud() const {
+    return WantsHudCapture() && (m_integratedHud || !CanSubmitHud()) &&
         !config::Get().debug_force_no_hud_layer;
 }
 
@@ -674,9 +684,10 @@ bool OpenXRContext::PrepareHudTexture(ID3D11Texture2D* texture,
     waitInfo.timeout = XR_INFINITE_DURATION;
     result = xrWaitSwapchainImage(m_hud.swapchain, &waitInfo);
     if (result != XR_SUCCESS) {
-        Log("[HUD] xrWaitSwapchainImage failed: %d; recreating HUD swapchain",
+        // OpenXR only permits release after a successful wait. Keep the
+        // swapchain intact and fall back to the complete projection pair.
+        Log("[HUD] xrWaitSwapchainImage failed: %d; disabling this HUD frame",
             (int)result);
-        DestroyHudSwapchain();
         ReleaseSRWLockExclusive(&m_hudLock);
         return false;
     }

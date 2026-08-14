@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <cmath>
 
 namespace bl1gotyvr { namespace config {
 
@@ -189,6 +190,45 @@ void Save(const char* path) {
 bool SaveLoaded() {
     if (!s_configPath[0]) return false;
     Save(s_configPath);
+    return true;
+}
+
+static void FormatWeaponAimSection(uint64_t key, char section[40]) {
+    sprintf_s(section, 40, "WeaponAim.%016llX",
+              static_cast<unsigned long long>(key));
+}
+
+bool LoadWeaponAimProfile(uint64_t key, float& pitch, float& yaw) {
+    if (!s_configPath[0] || key == 0) return false;
+    char section[40] = {};
+    char pitchText[32] = {};
+    char yawText[32] = {};
+    FormatWeaponAimSection(key, section);
+    if (!GetPrivateProfileStringA(section, "Pitch", "", pitchText,
+                                  sizeof(pitchText), s_configPath) ||
+        !GetPrivateProfileStringA(section, "Yaw", "", yawText,
+                                  sizeof(yawText), s_configPath)) return false;
+    const float loadedPitch = static_cast<float>(atof(pitchText));
+    const float loadedYaw = static_cast<float>(atof(yawText));
+    if (!std::isfinite(loadedPitch) || !std::isfinite(loadedYaw)) return false;
+    pitch = std::clamp(loadedPitch, -45.0f, 45.0f);
+    yaw = std::clamp(loadedYaw, -45.0f, 45.0f);
+    return true;
+}
+
+bool SaveWeaponAimProfile(uint64_t key, float pitch, float yaw,
+                          const char* profileName) {
+    if (!s_configPath[0] || key == 0) return false;
+    char section[40] = {};
+    FormatWeaponAimSection(key, section);
+    WriteFloat(section, "Pitch", std::clamp(pitch, -45.0f, 45.0f), s_configPath);
+    WriteFloat(section, "Yaw", std::clamp(yaw, -45.0f, 45.0f), s_configPath);
+    if (profileName && *profileName)
+        WritePrivateProfileStringA(section, "Name", profileName, s_configPath);
+    WritePrivateProfileStringA(nullptr, nullptr, nullptr, s_configPath);
+    WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+    if (GetFileAttributesExA(s_configPath, GetFileExInfoStandard, &attributes))
+        s_lastWriteTime = attributes.ftLastWriteTime;
     return true;
 }
 

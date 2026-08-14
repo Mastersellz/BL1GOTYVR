@@ -11,6 +11,10 @@ public:
     bool Blit(ID3D11Device* device, ID3D11DeviceContext* context,
               ID3D11Texture2D* source, ID3D11Texture2D* target,
               float opacity);
+    bool Composite(ID3D11Device* device, ID3D11DeviceContext* context,
+                   ID3D11Texture2D* source, ID3D11Texture2D* target,
+                   const D3D11_VIEWPORT& viewport, float opacity,
+                   const float protectedDot[4], float targetAspect);
     bool ExtractDifference(ID3D11Device* device, ID3D11DeviceContext* context,
                            ID3D11Texture2D* finalFrame,
                            ID3D11Texture2D* worldFrame,
@@ -21,9 +25,11 @@ private:
     HudBlitter() = default;
     bool Initialize(ID3D11Device* device);
     bool Render(ID3D11Device* device, ID3D11DeviceContext* context,
-                ID3D11Texture2D* source, ID3D11Texture2D* secondarySource,
-                ID3D11Texture2D* target, float opacity,
-                ID3D11PixelShader* pixelShader);
+                 ID3D11Texture2D* source, ID3D11Texture2D* secondarySource,
+                 ID3D11Texture2D* target, float opacity,
+                 ID3D11PixelShader* pixelShader,
+                 const D3D11_VIEWPORT* viewport, bool clearTarget,
+                 const float protectedDot[4], float targetAspect);
 
     ID3D11Device* m_device = nullptr;
     ID3D11VertexShader* m_vertexShader = nullptr;

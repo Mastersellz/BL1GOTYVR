@@ -4,6 +4,7 @@
 
 #include <d3dcompiler.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace bl1gotyvr { namespace render {
@@ -58,8 +59,18 @@ Output main(uint vertexId : SV_VertexID) {
     static constexpr char pixelSource[] = R"(
 Texture2D hudTexture : register(t0);
 SamplerState hudSampler : register(s0);
-cbuffer HudConstants : register(b0) { float opacity; float3 padding; };
+    cbuffer HudConstants : register(b0) {
+        float opacity; float3 padding;
+        float4 protectedDot;
+        float2 targetSize; float targetAspect; float padding2;
+    };
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    if (protectedDot.w > 0.5) {
+        float2 screenUv = position.xy / targetSize;
+        float2 delta = screenUv - protectedDot.xy;
+        delta.x *= targetAspect;
+        if (length(delta) < protectedDot.z * 1.15) return 0.0;
+    }
     return hudTexture.Sample(hudSampler, uv) * opacity;
 }
 )";
@@ -70,6 +81,11 @@ Texture2D finalTexture : register(t0);
 Texture2D worldTexture : register(t1);
 SamplerState hudSampler : register(s0);
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    // The game reticle is camera-centered and does not represent the VR shot
+    // direction. Remove it from the extracted HUD; FrameLoop draws the guarded
+    // controller/ballistic dot after the world projection.
+    float2 centerDelta = uv - 0.5;
+    if (length(centerDelta) < 0.025) return 0.0;
     float3 finalColor = finalTexture.Sample(hudSampler, uv).rgb;
     float3 worldColor = worldTexture.Sample(hudSampler, uv).rgb;
     float3 increase = saturate(
@@ -137,7 +153,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     Release(differenceBlob);
 
     D3D11_BUFFER_DESC constantDesc = {};
-    constantDesc.ByteWidth = 16;
+    constantDesc.ByteWidth = 48;
     constantDesc.Usage = D3D11_USAGE_DYNAMIC;
     constantDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     constantDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -189,7 +205,17 @@ bool HudBlitter::Blit(ID3D11Device* device, ID3D11DeviceContext* context,
                       ID3D11Texture2D* source, ID3D11Texture2D* target,
                       float opacity) {
     return Initialize(device) && Render(device, context, source, nullptr, target,
-                                        opacity, m_pixelShader);
+                                        opacity, m_pixelShader, nullptr, true,
+                                        nullptr, 1.0f);
+}
+
+bool HudBlitter::Composite(ID3D11Device* device, ID3D11DeviceContext* context,
+                           ID3D11Texture2D* source, ID3D11Texture2D* target,
+                           const D3D11_VIEWPORT& viewport, float opacity,
+                           const float protectedDot[4], float targetAspect) {
+    return Initialize(device) && Render(device, context, source, nullptr, target,
+                                        opacity, m_pixelShader, &viewport, false,
+                                        protectedDot, targetAspect);
 }
 
 bool HudBlitter::ExtractDifference(ID3D11Device* device,
@@ -198,13 +224,17 @@ bool HudBlitter::ExtractDifference(ID3D11Device* device,
                                    ID3D11Texture2D* worldFrame,
                                    ID3D11Texture2D* target) {
     return Initialize(device) && Render(device, context, finalFrame, worldFrame,
-                                        target, 1.0f, m_differencePixelShader);
+                                         target, 1.0f, m_differencePixelShader,
+                                         nullptr, true, nullptr, 1.0f);
 }
 
 bool HudBlitter::Render(ID3D11Device* device, ID3D11DeviceContext* context,
-                        ID3D11Texture2D* source, ID3D11Texture2D* secondarySource,
-                        ID3D11Texture2D* target, float opacity,
-                        ID3D11PixelShader* pixelShader) {
+                         ID3D11Texture2D* source, ID3D11Texture2D* secondarySource,
+                         ID3D11Texture2D* target, float opacity,
+                         ID3D11PixelShader* pixelShader,
+                         const D3D11_VIEWPORT* requestedViewport,
+                         bool clearTarget, const float protectedDot[4],
+                         float targetAspect) {
     if (!device || !context || !source || !target || !pixelShader) return false;
     opacity = (std::max)(0.0f, (std::min)(opacity, 1.0f));
 
@@ -217,6 +247,13 @@ bool HudBlitter::Render(ID3D11Device* device, ID3D11DeviceContext* context,
          secondaryDesc.Width != sourceDesc.Width ||
          secondaryDesc.Height != sourceDesc.Height ||
          secondaryDesc.Format != sourceDesc.Format))) return false;
+    if (requestedViewport && (!std::isfinite(requestedViewport->TopLeftX) ||
+        !std::isfinite(requestedViewport->TopLeftY) ||
+        !std::isfinite(requestedViewport->Width) ||
+        !std::isfinite(requestedViewport->Height) ||
+        requestedViewport->Width <= 0.0f || requestedViewport->Height <= 0.0f)) {
+        return false;
+    }
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sourceViewDesc = {};
     sourceViewDesc.Format = TypedColorFormat(sourceDesc.Format);
@@ -248,7 +285,14 @@ bool HudBlitter::Render(ID3D11Device* device, ID3D11DeviceContext* context,
         Release(targetView);
         return false;
     }
-    const float constants[4] = {opacity, 0.0f, 0.0f, 0.0f};
+    const float constants[12] = {
+        opacity, 0.0f, 0.0f, 0.0f,
+        protectedDot ? protectedDot[0] : 0.0f,
+        protectedDot ? protectedDot[1] : 0.0f,
+        protectedDot ? protectedDot[2] : 0.0f,
+        protectedDot ? protectedDot[3] : 0.0f,
+        static_cast<float>(targetDesc.Width),
+        static_cast<float>(targetDesc.Height), targetAspect, 0.0f};
     memcpy(mapped.pData, constants, sizeof(constants));
     context->Unmap(m_constantBuffer, 0);
 
@@ -284,16 +328,20 @@ bool HudBlitter::Render(ID3D11Device* device, ID3D11DeviceContext* context,
     context->PSGetSamplers(0, 1, &oldSampler);
     context->PSGetConstantBuffers(0, 1, &oldConstantBuffer);
 
-    const float transparent[4] = {};
-    context->ClearRenderTargetView(targetView, transparent);
+    if (clearTarget) {
+        const float transparent[4] = {};
+        context->ClearRenderTargetView(targetView, transparent);
+    }
     context->OMSetRenderTargets(1, &targetView, nullptr);
     context->OMSetBlendState(m_blend, nullptr, 0xFFFFFFFF);
     context->OMSetDepthStencilState(m_depthDisabled, 0);
     context->RSSetState(m_rasterizer);
-    D3D11_VIEWPORT viewport = {};
-    viewport.Width = static_cast<float>(targetDesc.Width);
-    viewport.Height = static_cast<float>(targetDesc.Height);
-    viewport.MaxDepth = 1.0f;
+    D3D11_VIEWPORT viewport = requestedViewport ? *requestedViewport : D3D11_VIEWPORT{};
+    if (!requestedViewport) {
+        viewport.Width = static_cast<float>(targetDesc.Width);
+        viewport.Height = static_cast<float>(targetDesc.Height);
+        viewport.MaxDepth = 1.0f;
+    }
     context->RSSetViewports(1, &viewport);
     context->IASetInputLayout(nullptr);
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
