@@ -7,6 +7,7 @@
 #include "../xr/FrameLoop.hpp"
 #include "../config/Config.hpp"
 #include "../player/ArmIKSystem.hpp"
+#include "handonly_ib_data.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -33,7 +34,9 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT
                                                        ID3D11RenderTargetView* const*,
                                                        ID3D11DepthStencilView*);
 using PSSetShaderResourcesFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT,
-                                                         ID3D11ShaderResourceView* const*);
+                                                          ID3D11ShaderResourceView* const*);
+using IASetIndexBufferFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*,
+                                                     DXGI_FORMAT, UINT);
 
 static PresentFn       oPresent = nullptr;
 static ResizeBuffersFn oResizeBuffers = nullptr;
@@ -41,6 +44,7 @@ static CopyResourceFn oCopyResource = nullptr;
 static ResolveSubresourceFn oResolveSubresource = nullptr;
 static OMSetRenderTargetsFn oOMSetRenderTargets = nullptr;
 static PSSetShaderResourcesFn oPSSetShaderResources = nullptr;
+static IASetIndexBufferFn oIASetIndexBuffer = nullptr;
 
 static ID3D11Device*        s_gameDevice = nullptr;
 static ID3D11DeviceContext*  s_gameContext = nullptr;
@@ -60,6 +64,20 @@ static uint64_t              s_postTonemapGeneration = 0;
 static uint64_t              s_consumedPostTonemapGeneration = 0;
 static SRWLOCK               s_captureLock = SRWLOCK_INIT;
 static thread_local bool     s_insidePresent = false;
+static ID3D11Buffer*         s_handOnlyIndexBuffer = nullptr;
+static ID3D11Device*         s_handOnlyDevice = nullptr;
+static ID3D11Buffer*         s_targetVertexBuffer = nullptr;
+static ID3D11Buffer*         s_targetIndexBuffer = nullptr;
+static uintptr_t             s_targetComponent = 0;
+static uintptr_t             s_targetSkeletalMesh = 0;
+static ID3D11Buffer*         s_replacedSourceIndexBuffer = nullptr;
+static std::atomic<bool>     s_vanillaHandsFilterEnabled{false};
+static bool                  s_handOnlyBufferAttempted = false;
+
+static constexpr UINT kHandsVertexBufferSize = 89760;
+static constexpr UINT kHandsVertexStride = 32;
+static constexpr UINT kHandsIndexBufferSize = s_handOnlyIndexCount * sizeof(uint16_t);
+static_assert(sizeof(s_handOnlyIndices) == kHandsIndexBufferSize);
 
 ID3D11Device* GetGameDevice() { return s_gameDevice; }
 ID3D11DeviceContext* GetGameContext() { return s_gameContext; }
@@ -468,6 +486,134 @@ static void STDMETHODCALLTYPE HookedPSSetShaderResources(ID3D11DeviceContext* co
     }
 }
 
+static void ReleaseReplacedSourceIndexBuffer() {
+    if (!s_replacedSourceIndexBuffer) return;
+    s_replacedSourceIndexBuffer->Release();
+    s_replacedSourceIndexBuffer = nullptr;
+}
+
+static void ResetHandViewmodelIdentity() {
+    if (s_targetVertexBuffer) {
+        s_targetVertexBuffer->Release();
+        s_targetVertexBuffer = nullptr;
+    }
+    if (s_targetIndexBuffer) {
+        s_targetIndexBuffer->Release();
+        s_targetIndexBuffer = nullptr;
+    }
+    s_targetComponent = 0;
+    s_targetSkeletalMesh = 0;
+}
+
+static void RestoreSourceIndexBuffer(ID3D11DeviceContext* context) {
+    if (!context || context != s_gameContext || !s_replacedSourceIndexBuffer ||
+        !oIASetIndexBuffer) return;
+    oIASetIndexBuffer(context, s_replacedSourceIndexBuffer, DXGI_FORMAT_R16_UINT, 0);
+    ReleaseReplacedSourceIndexBuffer();
+}
+
+static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* context,
+                                                      ID3D11Buffer* indexBuffer,
+                                                      DXGI_FORMAT format, UINT offset) {
+    if (context == s_gameContext) ReleaseReplacedSourceIndexBuffer();
+    if (s_insidePresent || context != s_gameContext ||
+        !s_vanillaHandsFilterEnabled.load(std::memory_order_acquire) ||
+        !s_handOnlyIndexBuffer || !indexBuffer ||
+        format != DXGI_FORMAT_R16_UINT || offset != 0) {
+        oIASetIndexBuffer(context, indexBuffer, format, offset);
+        return;
+    }
+
+    D3D11_BUFFER_DESC indexDesc = {};
+    indexBuffer->GetDesc(&indexDesc);
+    if (indexDesc.ByteWidth != kHandsIndexBufferSize) {
+        oIASetIndexBuffer(context, indexBuffer, format, offset);
+        return;
+    }
+
+    const player::ArmRigStatus rig = player::ArmIKSystem::Instance().GetStatus();
+    if (!rig.rigValid || !rig.skeletalMesh) {
+        ResetHandViewmodelIdentity();
+        oIASetIndexBuffer(context, indexBuffer, format, offset);
+        return;
+    }
+    if ((s_targetComponent && s_targetComponent != rig.component) ||
+        (s_targetSkeletalMesh && s_targetSkeletalMesh != rig.skeletalMesh))
+        ResetHandViewmodelIdentity();
+
+    ID3D11Buffer* vertexBuffer = nullptr;
+    UINT vertexStride = 0;
+    UINT vertexOffset = 0;
+    context->IAGetVertexBuffers(0, 1, &vertexBuffer, &vertexStride, &vertexOffset);
+    D3D11_BUFFER_DESC vertexDesc = {};
+    if (vertexBuffer) vertexBuffer->GetDesc(&vertexDesc);
+    const bool signatureMatches = vertexBuffer &&
+        vertexStride == kHandsVertexStride &&
+        vertexDesc.ByteWidth == kHandsVertexBufferSize;
+    const bool identityMatches = !s_targetVertexBuffer ||
+        (vertexBuffer == s_targetVertexBuffer && indexBuffer == s_targetIndexBuffer);
+    if (signatureMatches && identityMatches) {
+        if (!s_targetVertexBuffer) {
+            s_targetVertexBuffer = vertexBuffer;
+            s_targetVertexBuffer->AddRef();
+            s_targetIndexBuffer = indexBuffer;
+            s_targetIndexBuffer->AddRef();
+            s_targetComponent = rig.component;
+            s_targetSkeletalMesh = rig.skeletalMesh;
+            Log("[VanillaHands] Viewmodel buffers locked: VB=%p IB=%p",
+                s_targetVertexBuffer, s_targetIndexBuffer);
+        }
+        indexBuffer->AddRef();
+        s_replacedSourceIndexBuffer = indexBuffer;
+        static std::atomic<bool> loggedSwap{false};
+        if (!loggedSwap.exchange(true, std::memory_order_relaxed)) {
+            Log("[VanillaHands] Geometry cut active: VB=%u stride=%u IB=%u indices=%u",
+                vertexDesc.ByteWidth, vertexStride, indexDesc.ByteWidth,
+                s_handOnlyIndexCount);
+        }
+        if (vertexBuffer) vertexBuffer->Release();
+        oIASetIndexBuffer(context, s_handOnlyIndexBuffer, format, 0);
+        return;
+    }
+    if (vertexBuffer) vertexBuffer->Release();
+    oIASetIndexBuffer(context, indexBuffer, format, offset);
+}
+
+static void EnsureHandOnlyIndexBuffer(ID3D11Device* device) {
+    if (!device ||
+        !s_vanillaHandsFilterEnabled.load(std::memory_order_acquire)) return;
+    if (s_handOnlyIndexBuffer && s_handOnlyDevice == device) return;
+    if (s_handOnlyDevice && s_handOnlyDevice != device) {
+        if (s_handOnlyIndexBuffer) {
+            s_handOnlyIndexBuffer->Release();
+            s_handOnlyIndexBuffer = nullptr;
+        }
+        s_handOnlyDevice->Release();
+        s_handOnlyDevice = nullptr;
+        ResetHandViewmodelIdentity();
+        s_handOnlyBufferAttempted = false;
+    }
+    if (s_handOnlyBufferAttempted) return;
+    s_handOnlyBufferAttempted = true;
+
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth = kHandsIndexBufferSize;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA data = {};
+    data.pSysMem = s_handOnlyIndices;
+    const HRESULT result = device->CreateBuffer(&desc, &data, &s_handOnlyIndexBuffer);
+    if (FAILED(result)) {
+        Log("[VanillaHands] ERROR: hand-only index buffer creation failed: 0x%08X",
+            result);
+        return;
+    }
+    s_handOnlyDevice = device;
+    s_handOnlyDevice->AddRef();
+    Log("[VanillaHands] Hand-only index buffer ready: %u indices (%u bytes)",
+        s_handOnlyIndexCount, desc.ByteWidth);
+}
+
 // Present hook — main frame entry point
 struct SwapChainObservation {
     IDXGISwapChain* swapChain;
@@ -528,10 +674,14 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
             s_insidePresent = false;
             return oPresent(sc, syncInterval, flags);
         }
+        RestoreSourceIndexBuffer(s_gameContext);
         if (config::ReloadIfChanged()) {
             player::ArmIKSystem::Instance().SetVisibilityEnabled(
                 config::Get().hide_player_body_and_arms);
         }
+        s_vanillaHandsFilterEnabled.store(
+            config::Get().vanilla_hands_filter, std::memory_order_release);
+        if (!config::Get().vanilla_hands_filter) ResetHandViewmodelIdentity();
         ObserveBackbuffer(sc);
         g_frameCount++;
 
@@ -563,6 +713,7 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
                 Log("[BL1GOTYVR] FrameLoop initialized");
             }
         }
+        EnsureHandOnlyIndexBuffer(s_gameDevice);
 
         // Initialize OpenXR on the first frame, then retry periodically so a
         // missing runtime does not stall and spam every Present.
@@ -701,6 +852,7 @@ bool InstallHooks() {
     void* copyResourceTarget = contextVtable[47];
     void* resolveTarget = contextVtable[57];
     void* omSetRenderTargetsTarget = contextVtable[33];
+    void* iaSetIndexBufferTarget = contextVtable[19];
     Log("[BL1GOTYVR] DXGI targets: Present=%p ResizeBuffers=%p", presentTarget, resizeTarget);
 
     // Tear down the temporary swapchain before patching global DXGI methods.
@@ -791,6 +943,11 @@ bool InstallHooks() {
         omSetRenderTargetsTarget, &HookedOMSetRenderTargets,
         reinterpret_cast<void**>(&oOMSetRenderTargets));
     if (omStatus == MH_OK) omStatus = MH_QueueEnableHook(omSetRenderTargetsTarget);
+    MH_STATUS indexBufferStatus = MH_CreateHook(
+        iaSetIndexBufferTarget, &HookedIASetIndexBuffer,
+        reinterpret_cast<void**>(&oIASetIndexBuffer));
+    if (indexBufferStatus == MH_OK)
+        indexBufferStatus = MH_QueueEnableHook(iaSetIndexBufferTarget);
     const MH_STATUS applyStatus = MH_ApplyQueued();
     if (presentStatus == MH_OK && applyStatus != MH_OK) presentStatus = applyStatus;
     if (presentStatus != MH_OK) {
@@ -800,6 +957,8 @@ bool InstallHooks() {
     Log("[BL1GOTYVR] Composition hooks queued: CopyResource=%s ResolveSubresource=%s OMSetRT=%s Apply=%s",
         MH_StatusToString(copyStatus), MH_StatusToString(resolveStatus), MH_StatusToString(omStatus),
         MH_StatusToString(applyStatus));
+    Log("[VanillaHands] Geometry hook queued: IASetIB=%s",
+        MH_StatusToString(indexBufferStatus));
     Log("[BL1GOTYVR] ResizeBuffers hook deferred until Present path is stable (target=%p)",
         resizeTarget);
     Log("[BL1GOTYVR] Real DXGI Present hook installed");
