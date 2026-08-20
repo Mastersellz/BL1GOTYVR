@@ -558,10 +558,6 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                         armCameraLocation, gamePitch, gameYaw, s_poseReferencePosition,
                         s_poseReferenceRotation);
             }
-            player::ArmIKSystem::Instance().SetRenderContext(
-                simulatedPose ? count : renderTicket.pairSerial,
-                renderTicket.armTargetGeneration);
-
             if (renderTicket.rightAimValid) {
                 if (!s_aimBasisValid) {
                     memcpy(s_aimBasisRotation, s_poseReferenceRotation,
@@ -733,6 +729,14 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
     input::InputHook::Instance().ApplyRightHand(eye);
     input::InputHook::Instance().ApplyLeftHand(eye);
     s_originalViewportDraw(viewportClient, viewport, canvas);
+    // Publish new controller targets only after both AFR eyes consumed the
+    // previous palette. UpdateSkelPose then prepares one coherent palette for
+    // the next pair instead of advancing only the right eye.
+    if (simulatedPose || eye == 1) {
+        player::ArmIKSystem::Instance().SetRenderContext(
+            simulatedPose ? count : renderTicket.pairSerial,
+            renderTicket.armTargetGeneration);
+    }
     input::InputHook::Instance().Restore();
     if (realPoseValid) {
         if (cameraOffsetApplied) frameLoop.CommitRenderedEye(renderTicket);

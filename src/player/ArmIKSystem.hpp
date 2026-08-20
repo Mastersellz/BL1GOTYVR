@@ -86,6 +86,7 @@ public:
     bool IsSimulationEnabled() const { return m_simulationEnabled.load(); }
     void RequestRescan();
     void RequestInventoryScan();
+    void RequestCalibrationReset();
     uint64_t UpdateTargets(const float cameraLocation[3], float gamePitchRadians,
                            float gameYawRadians,
                            const float trackingReferencePosition[3],
@@ -124,6 +125,7 @@ private:
     std::atomic<bool> m_enabled{false};
     std::atomic<bool> m_visibilityEnabled{false};
     std::atomic<bool> m_simulationEnabled{false};
+    std::atomic<bool> m_calibrationResetRequested{false};
     std::atomic<bool> m_discoveryRequested{false};
     std::atomic<uint64_t> m_inventoryRequestGeneration{0};
     std::atomic<uint64_t> m_inventoryCompletedGeneration{0};

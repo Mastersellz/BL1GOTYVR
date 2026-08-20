@@ -266,7 +266,9 @@ void InputHook::UpdateState(XrTime displayTime) {
     if (bothSticksClicked && !m_recenterChordLatched) {
         m_recenterChordLatched = true;
         camera::RequestRecenter();
-        Log("[Input] Camera recentered by L3+R3");
+        player::ArmIKSystem::Instance().RequestCalibrationReset();
+        RequestMotionCalibrationReset();
+        Log("[Input] Camera, hands, and weapon recentered by L3+R3");
     }
     const bool suppressStickClicks = m_recenterChordLatched;
     if (m_recenterChordLatched && !left.thumbstickClick && !right.thumbstickClick)
@@ -470,6 +472,11 @@ void InputHook::ClearCanonicalWeaponPose() {
     m_weaponPoseActive.store(false, std::memory_order_release);
 }
 
+void InputHook::RequestMotionCalibrationReset() {
+    m_weaponCalibrationResetRequested.store(true, std::memory_order_release);
+    Log("[WeaponPose] Preserved pre-motion weapon mount requested");
+}
+
 static bool BuildFrameMatrix(const float position[3], const float forwardInput[3],
                              const float upInput[3], float output[16]) {
     float forward[3] = {forwardInput[0], forwardInput[1], forwardInput[2]};
@@ -642,6 +649,15 @@ void InputHook::ApplyRightHand(int eye) {
     ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
     m_componentCount = 0;
     m_weaponPoseActive.store(false, std::memory_order_release);
+    if (m_weaponCalibrationResetRequested.exchange(false, std::memory_order_acq_rel)) {
+        m_weaponMountValid = false;
+        m_mountWeapon = 0;
+        m_mountComponent = 0;
+        memset(m_weaponMountMatrix, 0, sizeof(m_weaponMountMatrix));
+        m_lastDrivenWeapon = 0;
+        m_lastDrivenComponent = 0;
+        Log("[WeaponPose] Pre-motion weapon mount restore requested");
+    }
     if (!m_canonicalWeaponPoseValid) return;
 
     const auto inventory = player::ArmIKSystem::Instance().GetComponentInventory();

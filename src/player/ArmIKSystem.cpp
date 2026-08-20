@@ -648,6 +648,7 @@ void ArmIKSystem::StartDiscovery() {
     m_targets = new TargetSnapshot[kTargetHistorySize]();
     m_stop = false;
     m_shuttingDown = false;
+    m_calibrationResetRequested = false;
     m_visibilityEnabled.store(
         config::Get().hide_player_body_and_arms, std::memory_order_release);
     m_inventoryRequestGeneration.fetch_add(1, std::memory_order_acq_rel);
@@ -810,6 +811,11 @@ void ArmIKSystem::SetSimulationEnabled(bool enabled) {
     m_simulationEnabled = enabled;
     if (!enabled) m_latestTargetGeneration = 0;
     Log("[ArmIK] Simulated controllers %s", enabled ? "enabled" : "disabled");
+}
+
+void ArmIKSystem::RequestCalibrationReset() {
+    m_calibrationResetRequested.store(true, std::memory_order_release);
+    Log("[ArmIK] Pre-motion hand pose restore requested");
 }
 
 void ArmIKSystem::RequestRescan() {
@@ -1996,6 +2002,17 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
 
 void ArmIKSystem::SetRenderContext(uint64_t renderGeneration,
                                    uint64_t targetGeneration) {
+    if (m_calibrationResetRequested.exchange(false, std::memory_order_acq_rel)) {
+        AcquireSRWLockExclusive(&m_rigLock);
+        if (m_rig) {
+            m_rig->solvedGeneration = 0;
+            m_rig->cachedPoseGeneration = 0;
+            memset(m_rig->cachedPoseBone, 0, sizeof(m_rig->cachedPoseBone));
+            m_rig->cachedLocalToWorldValid = false;
+        }
+        ReleaseSRWLockExclusive(&m_rigLock);
+        Log("[ArmIK] Preserved pre-motion hand calibration restored");
+    }
     m_renderTargetGeneration.store(targetGeneration, std::memory_order_release);
     m_renderGeneration.store(renderGeneration, std::memory_order_release);
 }

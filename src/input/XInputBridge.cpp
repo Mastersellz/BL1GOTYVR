@@ -167,6 +167,7 @@ void XInputBridge::Publish(const VrGamepadState& state) {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     m_vrState = state;
     m_vrStateUpdatedMs = state.active ? GetTickCount64() : 0;
+    if (state.active) m_virtualConnected = true;
 }
 
 void XInputBridge::ReleaseVrState() {
@@ -209,7 +210,11 @@ DWORD XInputBridge::MergeVrState(
         now - bridge.m_vrStateUpdatedMs > 250) {
         bridge.m_vrState = {};
         bridge.m_vrStateUpdatedMs = 0;
-        return originalResult;
+        if (originalResult == ERROR_SUCCESS || !bridge.m_virtualConnected)
+            return originalResult;
+        std::memset(state, 0, sizeof(*state));
+        state->dwPacketNumber = bridge.m_packetNumber;
+        return ERROR_SUCCESS;
     }
     if (originalResult != ERROR_SUCCESS) std::memset(state, 0, sizeof(*state));
 
@@ -263,6 +268,7 @@ void XInputBridge::Shutdown() {
     m_slots.clear();
     m_originalGetState = nullptr;
     m_originalGetStateEx = nullptr;
+    m_virtualConnected = false;
     m_lastPublished = {};
     m_packetNumber = 1;
     Log("[XInput] Bridge shutdown");

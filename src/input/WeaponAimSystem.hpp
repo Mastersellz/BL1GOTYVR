@@ -87,7 +87,7 @@ private:
     std::atomic<float> m_aimTargetY{0.0f};
     std::atomic<float> m_aimTargetZ{0.0f};
     std::atomic<bool> m_aimTargetValid{false};
-    std::atomic<bool> m_ballisticOverrideEnabled{false};
+    std::atomic<bool> m_ballisticOverrideEnabled{true};
     mutable SRWLOCK m_ballisticOverrideLock = SRWLOCK_INIT;
     std::atomic<uint64_t> m_overrideCount{0};
     std::atomic<uintptr_t> m_pawnAimRotationAddr{0};

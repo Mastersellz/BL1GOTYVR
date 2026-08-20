@@ -54,6 +54,7 @@ public:
                                 const float cameraForward[3],
                                 const float cameraUp[3]);
     void ClearCanonicalWeaponPose();
+    void RequestMotionCalibrationReset();
     bool IsWeaponPoseActive() const {
         return m_weaponPoseActive.load(std::memory_order_acquire);
     }
@@ -137,6 +138,7 @@ private:
     float m_renderWeaponMatrix[16] = {};
     bool m_renderWeaponStampActive = false;
     std::atomic<uint64_t> m_postAnimationWeaponWrites{0};
+    std::atomic<bool> m_weaponCalibrationResetRequested{false};
 
     /* Ballistic calibration */
     uint32_t m_aimTuningKeysDown = 0;

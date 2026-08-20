@@ -54,6 +54,7 @@ private:
     mutable std::mutex m_stateMutex;
     VrGamepadState m_vrState;
     std::uint64_t m_vrStateUpdatedMs = 0;
+    bool m_virtualConnected = false;
     XINPUT_GAMEPAD m_lastPublished = {};
     DWORD m_packetNumber = 1;
     XInputGetStateFn m_originalGetState = nullptr;

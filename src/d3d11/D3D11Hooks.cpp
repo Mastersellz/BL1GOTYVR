@@ -7,15 +7,16 @@
 #include "../xr/FrameLoop.hpp"
 #include "../config/Config.hpp"
 #include "../player/ArmIKSystem.hpp"
-#include "handonly_ib_data.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
 #include <dxgi1_4.h>
 #include <Windows.h>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <vector>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -74,10 +75,39 @@ static ID3D11Buffer*         s_replacedSourceIndexBuffer = nullptr;
 static std::atomic<bool>     s_vanillaHandsFilterEnabled{false};
 static bool                  s_handOnlyBufferAttempted = false;
 
-static constexpr UINT kHandsVertexBufferSize = 89760;
 static constexpr UINT kHandsVertexStride = 32;
-static constexpr UINT kHandsIndexBufferSize = s_handOnlyIndexCount * sizeof(uint16_t);
-static_assert(sizeof(s_handOnlyIndices) == kHandsIndexBufferSize);
+
+struct HandBufferSignature {
+    const char* character;
+    UINT vertexBufferSize;
+    UINT indexBufferSize;
+    float positionThreshold;
+};
+
+static constexpr HandBufferSignature kHandBufferSignatures[] = {
+    {"Lilith",   2805 * kHandsVertexStride, 11760 * sizeof(uint16_t), 74.0f},
+    {"Brick",    4264 * kHandsVertexStride, 20763 * sizeof(uint16_t), 74.0f},
+    {"Mordecai", 3318 * kHandsVertexStride, 16347 * sizeof(uint16_t), 74.0f},
+    {"Roland",   2561 * kHandsVertexStride, 13116 * sizeof(uint16_t), 74.0f},
+};
+
+static const HandBufferSignature* FindHandBufferSignature(
+    UINT vertexBufferSize, UINT vertexStride, UINT indexBufferSize) {
+    if (vertexStride != kHandsVertexStride) return nullptr;
+    for (const auto& signature : kHandBufferSignatures) {
+        if (signature.vertexBufferSize == vertexBufferSize &&
+            signature.indexBufferSize == indexBufferSize)
+            return &signature;
+    }
+    return nullptr;
+}
+
+static bool IsKnownHandsIndexBufferSize(UINT size) {
+    for (const auto& signature : kHandBufferSignatures) {
+        if (signature.indexBufferSize == size) return true;
+    }
+    return false;
+}
 
 ID3D11Device* GetGameDevice() { return s_gameDevice; }
 ID3D11DeviceContext* GetGameContext() { return s_gameContext; }
@@ -503,6 +533,11 @@ static void ResetHandViewmodelIdentity() {
     }
     s_targetComponent = 0;
     s_targetSkeletalMesh = 0;
+    if (s_handOnlyIndexBuffer) {
+        s_handOnlyIndexBuffer->Release();
+        s_handOnlyIndexBuffer = nullptr;
+    }
+    s_handOnlyBufferAttempted = false;
 }
 
 static void RestoreSourceIndexBuffer(ID3D11DeviceContext* context) {
@@ -512,13 +547,116 @@ static void RestoreSourceIndexBuffer(ID3D11DeviceContext* context) {
     ReleaseReplacedSourceIndexBuffer();
 }
 
+static bool ReadBuffer(ID3D11DeviceContext* context, ID3D11Buffer* source,
+                       std::vector<uint8_t>& bytes) {
+    if (!context || !source || !oCopyResource) return false;
+    ID3D11Device* device = nullptr;
+    context->GetDevice(&device);
+    if (!device) return false;
+
+    D3D11_BUFFER_DESC sourceDesc = {};
+    source->GetDesc(&sourceDesc);
+    D3D11_BUFFER_DESC stagingDesc = sourceDesc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    stagingDesc.StructureByteStride = 0;
+    ID3D11Buffer* staging = nullptr;
+    HRESULT result = device->CreateBuffer(&stagingDesc, nullptr, &staging);
+    device->Release();
+    if (FAILED(result) || !staging) return false;
+
+    oCopyResource(context, staging, source);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    result = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (SUCCEEDED(result) && mapped.pData) {
+        bytes.resize(sourceDesc.ByteWidth);
+        memcpy(bytes.data(), mapped.pData, sourceDesc.ByteWidth);
+        context->Unmap(staging, 0);
+    }
+    staging->Release();
+    return SUCCEEDED(result) && !bytes.empty();
+}
+
+static bool CreateHandOnlyIndexBuffer(ID3D11DeviceContext* context,
+                                      ID3D11Buffer* vertexBuffer,
+                                      ID3D11Buffer* indexBuffer,
+                                      const HandBufferSignature& signature) {
+    std::vector<uint8_t> vertexBytes;
+    std::vector<uint8_t> indexBytes;
+    if (!ReadBuffer(context, vertexBuffer, vertexBytes) ||
+        !ReadBuffer(context, indexBuffer, indexBytes)) {
+        Log("[VanillaHands] ERROR: viewmodel buffer readback failed");
+        return false;
+    }
+
+    const size_t vertexCount = vertexBytes.size() / kHandsVertexStride;
+    const size_t indexCount = indexBytes.size() / sizeof(uint16_t);
+    if (vertexCount == 0 || indexCount == 0 || indexCount % 3 != 0) return false;
+    std::vector<uint16_t> filtered(indexCount);
+    memcpy(filtered.data(), indexBytes.data(), indexBytes.size());
+    size_t keptTriangles = 0;
+    for (size_t start = 0; start < indexCount; start += 3) {
+        bool keep = true;
+        for (size_t corner = 0; corner < 3; ++corner) {
+            const uint16_t vertex = filtered[start + corner];
+            float x = 0.0f;
+            if (vertex >= vertexCount) {
+                keep = false;
+                break;
+            }
+            memcpy(&x, vertexBytes.data() + static_cast<size_t>(vertex) *
+                kHandsVertexStride, sizeof(x));
+            if (!std::isfinite(x) || std::fabs(x) < signature.positionThreshold) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) {
+            ++keptTriangles;
+        } else {
+            filtered[start + 1] = filtered[start];
+            filtered[start + 2] = filtered[start];
+        }
+    }
+    if (keptTriangles == 0 || keptTriangles == indexCount / 3) {
+        Log("[VanillaHands] ERROR: unsafe dynamic cut rejected: kept=%zu/%zu",
+            keptTriangles, indexCount / 3);
+        return false;
+    }
+
+    ID3D11Device* device = nullptr;
+    context->GetDevice(&device);
+    if (!device) return false;
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth = static_cast<UINT>(indexBytes.size());
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA data = {};
+    data.pSysMem = filtered.data();
+    ID3D11Buffer* replacement = nullptr;
+    const HRESULT result = device->CreateBuffer(&desc, &data, &replacement);
+    device->Release();
+    if (FAILED(result) || !replacement) {
+        Log("[VanillaHands] ERROR: dynamic index buffer creation failed: 0x%08X", result);
+        return false;
+    }
+    if (s_handOnlyIndexBuffer) s_handOnlyIndexBuffer->Release();
+    s_handOnlyIndexBuffer = replacement;
+    Log("[VanillaHands] %s cut ready: vertices=%zu kept=%zu/%zu threshold=%.1f",
+        signature.character, vertexCount, keptTriangles, indexCount / 3,
+        signature.positionThreshold);
+    return true;
+}
+
 static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* context,
                                                       ID3D11Buffer* indexBuffer,
                                                       DXGI_FORMAT format, UINT offset) {
     if (context == s_gameContext) ReleaseReplacedSourceIndexBuffer();
     if (s_insidePresent || context != s_gameContext ||
         !s_vanillaHandsFilterEnabled.load(std::memory_order_acquire) ||
-        !s_handOnlyIndexBuffer || !indexBuffer ||
+        !indexBuffer ||
         format != DXGI_FORMAT_R16_UINT || offset != 0) {
         oIASetIndexBuffer(context, indexBuffer, format, offset);
         return;
@@ -526,7 +664,7 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
 
     D3D11_BUFFER_DESC indexDesc = {};
     indexBuffer->GetDesc(&indexDesc);
-    if (indexDesc.ByteWidth != kHandsIndexBufferSize) {
+    if (!IsKnownHandsIndexBufferSize(indexDesc.ByteWidth)) {
         oIASetIndexBuffer(context, indexBuffer, format, offset);
         return;
     }
@@ -547,13 +685,22 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
     context->IAGetVertexBuffers(0, 1, &vertexBuffer, &vertexStride, &vertexOffset);
     D3D11_BUFFER_DESC vertexDesc = {};
     if (vertexBuffer) vertexBuffer->GetDesc(&vertexDesc);
-    const bool signatureMatches = vertexBuffer &&
-        vertexStride == kHandsVertexStride &&
-        vertexDesc.ByteWidth == kHandsVertexBufferSize;
+    const HandBufferSignature* signature = vertexBuffer
+        ? FindHandBufferSignature(vertexDesc.ByteWidth, vertexStride, indexDesc.ByteWidth)
+        : nullptr;
+    const bool signatureMatches = signature != nullptr;
     const bool identityMatches = !s_targetVertexBuffer ||
         (vertexBuffer == s_targetVertexBuffer && indexBuffer == s_targetIndexBuffer);
     if (signatureMatches && identityMatches) {
         if (!s_targetVertexBuffer) {
+            if (s_handOnlyBufferAttempted ||
+                !CreateHandOnlyIndexBuffer(context, vertexBuffer, indexBuffer, *signature)) {
+                s_handOnlyBufferAttempted = true;
+                vertexBuffer->Release();
+                oIASetIndexBuffer(context, indexBuffer, format, offset);
+                return;
+            }
+            s_handOnlyBufferAttempted = true;
             s_targetVertexBuffer = vertexBuffer;
             s_targetVertexBuffer->AddRef();
             s_targetIndexBuffer = indexBuffer;
@@ -567,9 +714,9 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
         s_replacedSourceIndexBuffer = indexBuffer;
         static std::atomic<bool> loggedSwap{false};
         if (!loggedSwap.exchange(true, std::memory_order_relaxed)) {
-            Log("[VanillaHands] Geometry cut active: VB=%u stride=%u IB=%u indices=%u",
-                vertexDesc.ByteWidth, vertexStride, indexDesc.ByteWidth,
-                s_handOnlyIndexCount);
+                Log("[VanillaHands] Geometry cut active: VB=%u stride=%u IB=%u indices=%u",
+                    vertexDesc.ByteWidth, vertexStride, indexDesc.ByteWidth,
+                    indexDesc.ByteWidth / static_cast<UINT>(sizeof(uint16_t)));
         }
         if (vertexBuffer) vertexBuffer->Release();
         oIASetIndexBuffer(context, s_handOnlyIndexBuffer, format, 0);
@@ -582,36 +729,14 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
 static void EnsureHandOnlyIndexBuffer(ID3D11Device* device) {
     if (!device ||
         !s_vanillaHandsFilterEnabled.load(std::memory_order_acquire)) return;
-    if (s_handOnlyIndexBuffer && s_handOnlyDevice == device) return;
+    if (s_handOnlyDevice == device) return;
     if (s_handOnlyDevice && s_handOnlyDevice != device) {
-        if (s_handOnlyIndexBuffer) {
-            s_handOnlyIndexBuffer->Release();
-            s_handOnlyIndexBuffer = nullptr;
-        }
+        ResetHandViewmodelIdentity();
         s_handOnlyDevice->Release();
         s_handOnlyDevice = nullptr;
-        ResetHandViewmodelIdentity();
-        s_handOnlyBufferAttempted = false;
-    }
-    if (s_handOnlyBufferAttempted) return;
-    s_handOnlyBufferAttempted = true;
-
-    D3D11_BUFFER_DESC desc = {};
-    desc.ByteWidth = kHandsIndexBufferSize;
-    desc.Usage = D3D11_USAGE_IMMUTABLE;
-    desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    D3D11_SUBRESOURCE_DATA data = {};
-    data.pSysMem = s_handOnlyIndices;
-    const HRESULT result = device->CreateBuffer(&desc, &data, &s_handOnlyIndexBuffer);
-    if (FAILED(result)) {
-        Log("[VanillaHands] ERROR: hand-only index buffer creation failed: 0x%08X",
-            result);
-        return;
     }
     s_handOnlyDevice = device;
     s_handOnlyDevice->AddRef();
-    Log("[VanillaHands] Hand-only index buffer ready: %u indices (%u bytes)",
-        s_handOnlyIndexCount, desc.ByteWidth);
 }
 
 // Present hook — main frame entry point

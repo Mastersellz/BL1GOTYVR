@@ -493,7 +493,7 @@ bool WeaponAimSystem::InstallScriptInvokeProbe(uintptr_t function,
 
     m_scriptInvokeTarget = target;
     m_scriptInvokeInstalled.store(true, std::memory_order_release);
-    Log("[WeaponAim] Read-only GetAdjustedAim script invoke probe installed");
+    Log("[WeaponAim] Guarded GetAdjustedAim script invoke hook installed");
     return true;
 }
 
