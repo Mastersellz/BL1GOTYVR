@@ -70,15 +70,17 @@ private:
     bool EnsureEyeTextures(ID3D11Device* device, ID3D11Texture2D* source,
                            bool sideBySideSource = false);
     bool CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* source, int eye,
-                           bool sideBySideSource = false, int sourceEye = -1,
-                           ID3D11Texture2D* hudOverlay = nullptr);
+                            bool sideBySideSource = false, int sourceEye = -1,
+                            ID3D11Texture2D* hudOverlay = nullptr,
+                            bool flatSource = false);
     bool EnsureSwapchainUploadTexture(ID3D11Device* device,
                                       const D3D11_TEXTURE2D_DESC& destinationDesc,
                                       int eye);
     bool EnsureBlitResources(ID3D11Device* device);
     bool BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* source,
-                     ID3D11Texture2D* destination, int eye,
-                     bool sideBySideSource = false, int sourceEye = -1);
+                      ID3D11Texture2D* destination, int eye,
+                      bool sideBySideSource = false, int sourceEye = -1,
+                      bool flatSource = false);
     bool EnsureDesktopDuplication(ID3D11Device* device, IDXGISwapChain* swapChain);
     ID3D11Texture2D* CaptureDesktopFrame(ID3D11Device* device,
                                          ID3D11DeviceContext* context,
@@ -89,6 +91,8 @@ private:
     void OnDesktopPresent(ID3D11Device* device, ID3D11DeviceContext* context,
                           IDXGISwapChain* swapChain);
     void ValidateDesktopStereoPair(ID3D11Device* device, ID3D11DeviceContext* context);
+    bool TrySubmitTheaterFrame(ID3D11Device* device, ID3D11DeviceContext* context,
+                               IDXGISwapChain* swapChain);
     bool ConsumeRenderedTicket(StereoRenderTicket& ticket);
     bool EnsureHudExtractionTexture(ID3D11Device* device, ID3D11Texture2D* source);
     bool ValidateHudPair(ID3D11Device* device, ID3D11DeviceContext* context,
@@ -115,6 +119,8 @@ private:
     bool m_gdiLatencyCorrection = true;
     std::atomic<float> m_renderAspect{1.0f};
     uint64_t m_frameCount = 0;
+    uint32_t m_missingTicketPresents = 0;
+    bool m_hasSubmittedStereoProjection = false;
     uint64_t m_lastNativeMultiviewGeneration = 0;
     bool m_submittingNativeEyes = false;
 

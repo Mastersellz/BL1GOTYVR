@@ -246,6 +246,8 @@ void OpenXRContext::Shutdown() {
     m_runtimeName[0] = '\0';
     m_isVdxr = false;
     m_integratedHud = false;
+    m_theaterAnchored = false;
+    m_theaterPose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
     Log("[OpenXR] Shutdown complete");
 }
 
@@ -954,6 +956,10 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
     bool hudLockHeld = false;
 
     if (submitProjectionLayer && m_viewsValid && ShouldRender()) {
+        if (m_theaterAnchored) {
+            m_theaterAnchored = false;
+            Log("[OpenXR] Theater mode ended; returning to stereo projection");
+        }
         for (int i = 0; i < 2; i++) {
             EyeData& eye = (i == 0) ? m_leftEye : m_rightEye;
             XrView submittedView = {};
@@ -1053,6 +1059,73 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
     m_hudPreparedPairSerial = 0;
     ReleaseSRWLockExclusive(&m_hudLock);
     return r == XR_SUCCESS;
+}
+
+bool OpenXRContext::EndFrameTheater(float sourceAspect, float distance,
+                                    float width) {
+    if (!m_frameActive) return false;
+
+    const float aspect = std::clamp(sourceAspect, 0.5f, 3.0f);
+    const float safeDistance = std::clamp(distance, 0.5f, 10.0f);
+    const float safeWidth = std::clamp(width, 0.5f, 10.0f);
+    if (!m_theaterAnchored) {
+        AcquireSRWLockShared(&m_poseLock);
+        const float x = m_headRotation[0];
+        const float y = m_headRotation[1];
+        const float z = m_headRotation[2];
+        const float w = m_headRotation[3];
+        const float yaw = atan2f(2.0f * (w * y + x * z),
+                                 1.0f - 2.0f * (y * y + z * z));
+        m_theaterPose.orientation = {
+            0.0f, sinf(yaw * 0.5f), 0.0f, cosf(yaw * 0.5f)};
+        m_theaterPose.position = {
+            m_headPosition[0] - sinf(yaw) * safeDistance,
+            m_headPosition[1],
+            m_headPosition[2] - cosf(yaw) * safeDistance};
+        ReleaseSRWLockShared(&m_poseLock);
+        m_theaterAnchored = true;
+        Log("[OpenXR] Theater mode started: distance=%.1fm width=%.1fm aspect=%.3f",
+            safeDistance, safeWidth, aspect);
+    }
+
+    XrCompositionLayerQuad quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    quad.space = m_stageSpace;
+    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quad.subImage.swapchain = m_leftEye.swapchain;
+    quad.subImage.imageRect.offset = {0, 0};
+    quad.subImage.imageRect.extent = {
+        static_cast<int32_t>(m_leftEye.submittedWidth),
+        static_cast<int32_t>(m_leftEye.submittedHeight)};
+    quad.subImage.imageArrayIndex = 0;
+    quad.pose = m_theaterPose;
+    quad.size = {safeWidth, safeWidth / aspect};
+
+    const XrCompositionLayerBaseHeader* layers[] = {
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad)};
+    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+    endInfo.displayTime = m_frameState.predictedDisplayTime;
+    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    endInfo.layerCount = ShouldRender() ? 1u : 0u;
+    endInfo.layers = ShouldRender() ? layers : nullptr;
+
+    const XrResult result = xrEndFrame(m_session, &endInfo);
+    if (XR_FAILED(result)) {
+        Log("[OpenXR] xrEndFrame(theater) FAILED: %d", static_cast<int>(result));
+    } else {
+        static uint64_t theaterFrames = 0;
+        ++theaterFrames;
+        if (theaterFrames <= 3 || theaterFrames % 300 == 0) {
+            Log("[OpenXR] Theater frame submitted (count=%llu)",
+                static_cast<unsigned long long>(theaterFrames));
+        }
+    }
+
+    m_frameActive = false;
+    AcquireSRWLockExclusive(&m_hudLock);
+    m_hudPrepared = false;
+    m_hudPreparedPairSerial = 0;
+    ReleaseSRWLockExclusive(&m_hudLock);
+    return XR_SUCCEEDED(result);
 }
 
 }} // namespace bl1gotyvr::xr

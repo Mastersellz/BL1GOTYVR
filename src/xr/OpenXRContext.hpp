@@ -42,6 +42,8 @@ public:
                    const XrView* exactRenderedViews = nullptr,
                    bool submitHudLayer = false,
                    uint64_t hudPairSerial = 0);
+    bool EndFrameTheater(float sourceAspect, float distance = 2.5f,
+                         float width = 2.8f);
     bool CanSubmitHud() const;
     bool WantsHudCapture() const;
     bool ShouldSeparateHud() const;
@@ -123,6 +125,8 @@ private:
     bool m_renderedViewValid[2] = {};
     bool m_useRenderedViewPoses = true;
     std::atomic<bool> m_viewsValid{false};
+    bool m_theaterAnchored = false;
+    XrPosef m_theaterPose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 
     // Eyes
     EyeData m_leftEye;

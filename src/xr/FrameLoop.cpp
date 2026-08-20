@@ -32,6 +32,8 @@ void FrameLoop::Initialize() {
     OpenXRContext::Instance().SetUseRenderedViewPoses(true);
     m_desktopDuplicationUnavailable = false;
     m_frameCount = 0;
+    m_missingTicketPresents = 0;
+    m_hasSubmittedStereoProjection = false;
     m_desktopCaptureMask = 0;
     m_desktopPairSerial = 0;
     m_poseSeeded = false;
@@ -355,7 +357,8 @@ SamplerState sourceSampler : register(s0);
 
 bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* source,
                             ID3D11Texture2D* destination, int eye,
-                            bool sideBySideSource, int sourceEye) {
+                            bool sideBySideSource, int sourceEye,
+                            bool flatSource) {
     ID3D11Device* device = nullptr;
     context->GetDevice(&device);
     if (!device || !EnsureBlitResources(device)) {
@@ -465,7 +468,7 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     const auto& vrSettings = config::Get();
     const int sampledEye = sourceEye >= 0 ? sourceEye : eye;
     uint32_t principalWidth = 0, principalHeight = 0;
-    const bool principalExtentValid = !sideBySideSource &&
+    const bool principalExtentValid = !flatSource && !sideBySideSource &&
         camera::GetPrincipalRenderExtent(principalWidth, principalHeight) &&
         principalWidth <= sourceDesc.Width && principalHeight <= sourceDesc.Height;
     if (principalExtentValid) {
@@ -478,8 +481,8 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
             ? static_cast<float>(principalWidth) / principalHeight
             : static_cast<float>(sourceDesc.Width) / sourceDesc.Height);
     const float sourceAspect = textureAspect;
-    const bool projectionCorrectionEnabled = m_submissionViewsValid
-        ? m_submissionProjectionCorrection : m_projectionCorrection;
+    const bool projectionCorrectionEnabled = !flatSource && (m_submissionViewsValid
+        ? m_submissionProjectionCorrection : m_projectionCorrection);
     bool projectionCrop = false;
     if (projectionCorrectionEnabled) {
         auto& openXR = OpenXRContext::Instance();
@@ -492,7 +495,7 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     if (sideBySideSource) {
         uvScaleX *= 0.5f;
         uvOffsetX = (sampledEye == 0 ? 0.0f : 0.5f) + uvOffsetX * 0.5f;
-    } else if (!m_submittingNativeEyes && !projectionCrop &&
+    } else if (!flatSource && !m_submittingNativeEyes && !projectionCrop &&
                vrSettings.convergence_m > 0.0f && eye >= 0 && eye < 2) {
         const float magnitude = (std::min)(0.20f, vrSettings.convergence_m * 0.01f);
         convergenceShift = eye == 0 ? -magnitude : magnitude;
@@ -519,7 +522,7 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
         }
     }
     float dotU = 0.5f, dotV = 0.5f, dotEnabled = 0.0f;
-    if (m_submissionRightAimValid && m_submissionViewsValid &&
+    if (!flatSource && m_submissionRightAimValid && m_submissionViewsValid &&
         input::InputHook::Instance().IsWeaponPoseActive() &&
         sampledEye >= 0 && sampledEye < 2) {
         auto rotate = [](const float quaternion[4], const float vector[3], float output[3]) {
@@ -837,7 +840,8 @@ ID3D11Texture2D* FrameLoop::CaptureGdiFrame(ID3D11Device* device,
 
 bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* source, int eye,
                                   bool sideBySideSource, int sourceEye,
-                                  ID3D11Texture2D* hudOverlay) {
+                                  ID3D11Texture2D* hudOverlay,
+                                  bool flatSource) {
     auto& xr = OpenXRContext::Instance();
     EyeData& eyeData = (eye == 0) ? xr.GetLeftEye() : xr.GetRightEye();
 
@@ -879,7 +883,8 @@ bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* 
     D3D11_TEXTURE2D_DESC uploadDesc = {};
     if (uploadTexture) uploadTexture->GetDesc(&uploadDesc);
     if (copied) {
-        if (!BlitTexture(context, source, uploadTexture, eye, sideBySideSource, sourceEye)) {
+        if (!BlitTexture(context, source, uploadTexture, eye, sideBySideSource,
+                         sourceEye, flatSource)) {
             static bool loggedBlitFailure = false;
             if (!loggedBlitFailure) {
                 Log("[FrameLoop] ERROR: Failed to blit %ux%u fmt=%u bind=0x%X -> "
@@ -1409,6 +1414,49 @@ bool FrameLoop::CompositeHudIntoProjection(ID3D11DeviceContext* context,
     return composed;
 }
 
+bool FrameLoop::TrySubmitTheaterFrame(ID3D11Device* device,
+                                      ID3D11DeviceContext* context,
+                                      IDXGISwapChain* swapChain) {
+    auto& xr = OpenXRContext::Instance();
+    if (!device || !context || !swapChain || !xr.IsInitialized() || !m_poseSeeded)
+        return false;
+
+    StartWaitWorker();
+    bool waitReady = m_waitReadyEvent &&
+        WaitForSingleObject(m_waitReadyEvent, 250) == WAIT_OBJECT_0;
+    if (!waitReady) return false;
+
+    bool submitted = false;
+    if (!xr.BeginFrame()) {
+        if (m_waitRequestEvent) SetEvent(m_waitRequestEvent);
+        return false;
+    }
+    if (!xr.ShouldRender() || !xr.LocateViews()) {
+        xr.EndFrame(false);
+        if (m_waitRequestEvent) SetEvent(m_waitRequestEvent);
+        return false;
+    }
+
+    ID3D11Texture2D* backbuffer = d3d11::AcquireCurrentBackbuffer(swapChain);
+    if (backbuffer) {
+        D3D11_TEXTURE2D_DESC desc = {};
+        backbuffer->GetDesc(&desc);
+        if (desc.Width && desc.Height && desc.SampleDesc.Count == 1) {
+            const bool copied = CopyTextureToEye(
+                context, backbuffer, 0, false, -1, nullptr, true);
+            if (copied) {
+                context->Flush();
+                submitted = xr.EndFrameTheater(
+                    static_cast<float>(desc.Width) / desc.Height);
+            }
+        }
+        backbuffer->Release();
+    }
+    if (xr.IsFrameActive()) xr.EndFrame(false);
+    if (m_waitRequestEvent) SetEvent(m_waitRequestEvent);
+    return submitted;
+}
+
 bool FrameLoop::ConsumeRenderedTicket(StereoRenderTicket& ticket) {
     ticket = {};
     AcquireSRWLockExclusive(&m_stereoPairLock);
@@ -1845,6 +1893,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         input::InputHook::Instance().UpdateState(xr.GetPredictedDisplayTime());
     StereoRenderTicket renderedTicket = {};
     const bool hasRenderedTicket = ConsumeRenderedTicket(renderedTicket);
+    if (hasRenderedTicket) m_missingTicketPresents = 0;
 
     if (hasRenderedTicket && !camera::ConsumeRenderPoseAcknowledgement(
             renderedTicket.pairSerial, renderedTicket.eye)) {
@@ -1862,12 +1911,23 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     // leaves the last complete pair with the compositor instead of submitting
     // a zero-layer frame that flashes the environment or black.
     if (!hasRenderedTicket) {
+        ++m_missingTicketPresents;
         xr.PollSessionEvents();
         if (!m_poseSeeded && xr.WaitForFrame() && xr.BeginFrame()) {
             input::InputHook::Instance().UpdateState(xr.GetPredictedDisplayTime());
             m_poseSeeded = xr.ShouldRender() && xr.LocateViews();
             xr.EndFrame(false);
             StartWaitWorker();
+        }
+        constexpr uint32_t kTheaterEntryDelay = 30;
+        if (m_poseSeeded && m_hasSubmittedStereoProjection &&
+            m_missingTicketPresents >= kTheaterEntryDelay) {
+            const bool submitted = TrySubmitTheaterFrame(device, context, swapChain);
+            if (submitted && (m_missingTicketPresents == kTheaterEntryDelay ||
+                              m_missingTicketPresents % 300 == 0)) {
+                Log("[FrameLoop] Loading/cinematic theater submitted "
+                    "(missing tickets=%u)", m_missingTicketPresents);
+            }
         }
         ++m_frameCount;
         g_currentEye = -1;
@@ -2335,6 +2395,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
             static_cast<unsigned long long>(renderedTicket.pairSerial), m_frameCount);
         loggedFirstSubmission = true;
     }
+    if (submitted && completePair) m_hasSubmittedStereoProjection = true;
     if (!submitted && completePair) {
         Log("[FrameLoop] Stereo pair submission failed: serial=%llu left=%d right=%d",
             static_cast<unsigned long long>(renderedTicket.pairSerial), leftOk, rightOk);
