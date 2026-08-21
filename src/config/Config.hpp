@@ -72,7 +72,7 @@ float hud_horizontal_offset = 0.0f;
 
     /* Player visibility */
     bool hide_player_body_and_arms = false;
-    bool vanilla_hands_filter = false;
+    bool vanilla_hands_filter = true;
 
     /* Debug */
     bool debug_force_no_hud_layer = false;  /* Skip HUD layer submission for VDXR testing */

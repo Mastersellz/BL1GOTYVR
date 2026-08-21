@@ -75,6 +75,8 @@ void InputHook::Install() {
         "X use/reload, Y cycle, LB skill, RB grenade, L3 sprint, R3 melee, Menu Start");
     Log("[Input] Y chord: tap=Y, hold 400ms=Back/ECHO, hold+left stick=D-pad");
     Log("[Input] B chord: tap=B, hold 800ms=toggle motion controls");
+    Log("[Input] Aim calibration: Ctrl+Numpad 8/2 pitch, 4/6 yaw, 5 reset; "
+        "release Ctrl to save per weapon");
 }
 
 static bool IsGameForeground(HWND hwnd) {

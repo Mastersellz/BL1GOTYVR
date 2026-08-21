@@ -571,29 +571,10 @@ void __fastcall WeaponAimSystem::HookedScriptInvoke(void* object, void* frame,
     };
     float origin[3] = {};
     const bool originReadable = locals && ReadDirect(locals, origin, sizeof(origin));
-    bool finiteTargetUsed = false;
-    if (desiredValid && originReadable &&
-        system.m_aimTargetValid.load(std::memory_order_acquire)) {
-        const float target[3] = {
-            system.m_aimTargetX.load(std::memory_order_relaxed),
-            system.m_aimTargetY.load(std::memory_order_relaxed),
-            system.m_aimTargetZ.load(std::memory_order_relaxed)
-        };
-        const float direction[3] = {
-            target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]
-        };
-        const float horizontal = sqrtf(direction[0] * direction[0] +
-                                       direction[1] * direction[1]);
-        if (std::isfinite(horizontal) && horizontal > 1.0e-5f &&
-            std::isfinite(direction[2])) {
-            desired[0] = static_cast<int32_t>(lroundf(
-                atan2f(direction[2], horizontal) * kRadiansToUnis));
-            desired[1] = static_cast<int32_t>(lroundf(
-                atan2f(direction[1], direction[0]) * kRadiansToUnis));
-            desired[2] = 0;
-            finiteTargetUsed = true;
-        }
-    }
+    // The compositor dot represents this angular direction at infinity. Use
+    // the same direction for GetAdjustedAim so surface depth cannot introduce
+    // controller-to-camera parallax between the marker and the shot trace.
+    const bool finiteTargetUsed = false;
     bool overrideEnabled = false;
     bool resultReadable = false;
     bool written = false;

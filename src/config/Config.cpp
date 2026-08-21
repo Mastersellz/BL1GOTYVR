@@ -145,7 +145,8 @@ void Load(const char* path) {
     s_settings.hide_player_body_and_arms = GetPrivateProfileIntA(
         "Visibility", "HidePlayerBodyAndArms", 0, path) != 0;
     s_settings.vanilla_hands_filter = GetPrivateProfileIntA(
-        "Visibility", "VanillaHandsFilter", 0, path) != 0;
+        "Visibility", "VanillaHandsFilter",
+        s_settings.vanilla_hands_filter ? 1 : 0, path) != 0;
 
     Log("[Config] Loaded %s: %dx%d scale=%.2f FOV=%.1f IPD=%.1fmm "
         "convergenceShift=%.2f%% aim=(%.2f,%.2f)",

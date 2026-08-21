@@ -547,19 +547,8 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
             -eyeView.pose.orientation.x, -eyeView.pose.orientation.y,
             -eyeView.pose.orientation.z, eyeView.pose.orientation.w
         };
-        constexpr float kAimDistanceMeters = 20.0f;
-        const float trackingTarget[3] = {
-            m_submissionRightAimPosition[0] + trackingForward[0] * kAimDistanceMeters,
-            m_submissionRightAimPosition[1] + trackingForward[1] * kAimDistanceMeters,
-            m_submissionRightAimPosition[2] + trackingForward[2] * kAimDistanceMeters
-        };
-        const float eyeToTarget[3] = {
-            trackingTarget[0] - eyeView.pose.position.x,
-            trackingTarget[1] - eyeView.pose.position.y,
-            trackingTarget[2] - eyeView.pose.position.z
-        };
         float eyeLocal[3] = {};
-        rotate(inverseEye, eyeToTarget, eyeLocal);
+        rotate(inverseEye, trackingForward, eyeLocal);
         if (eyeLocal[2] < -0.001f) {
             const float tangentX = eyeLocal[0] / -eyeLocal[2];
             const float tangentY = eyeLocal[1] / -eyeLocal[2];
@@ -567,13 +556,12 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
             const float tanRight = tanf(eyeView.fov.angleRight);
             const float tanDown = tanf(eyeView.fov.angleDown);
             const float tanUp = tanf(eyeView.fov.angleUp);
-            // The marker is composited after source-texture projection crop,
-            // directly in OpenXR swapchain coordinates. Applying the crop a
-            // second time moves it down and right.
+            // Horizontal crop follows the asymmetric eye FOV. Vertical crop
+            // deliberately centers the symmetric UE3 source projection, so
+            // the marker must use that same centered span to match world hits.
             dotU = (tangentX - tanLeft) / (tanRight - tanLeft);
-            dotV = (tanUp - tangentY) / (tanUp - tanDown);
-            dotU += vrSettings.dot_horizontal_offset;
-            dotV -= vrSettings.dot_vertical_offset;
+            const float verticalHalfSpan = (tanUp - tanDown) * 0.5f;
+            dotV = (verticalHalfSpan - tangentY) / (verticalHalfSpan * 2.0f);
             dotEnabled = dotU >= 0.0f && dotU <= 1.0f &&
                           dotV >= 0.0f && dotV <= 1.0f ? 1.0f : 0.0f;
             static uint32_t rayProjectionLogs = 0;
@@ -988,9 +976,8 @@ bool FrameLoop::AcquireRenderTicket(StereoRenderTicket& ticket) {
                sizeof(m_activePair.headRotation));
         m_activePair.views[0] = currentViews[0];
         m_activePair.views[1] = currentViews[1];
-        // OpenXR aim/pose defines the runtime's authoritative controller ray.
-        m_activePair.aimPitchDegrees = 0.0f;
-        m_activePair.aimYawDegrees = 0.0f;
+        m_activePair.aimPitchDegrees = config::Get().aim_pitch_degrees;
+        m_activePair.aimYawDegrees = config::Get().aim_yaw_degrees;
         m_activePair.rightAimValid = controllers[1].aimValid;
         if (m_activePair.rightAimValid) {
             memcpy(m_activePair.rightAimPosition, controllers[1].aimPosition,

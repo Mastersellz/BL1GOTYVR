@@ -591,10 +591,12 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                 RelativeQuaternion(s_aimBasisRotation,
                     renderTicket.rightAimRotation, relativeAim);
                 float localForward[3] = {};
-                input::BuildCalibratedLocalForward(0.0f, 0.0f, localForward);
+                input::BuildCalibratedLocalForward(
+                    renderTicket.aimPitchDegrees, renderTicket.aimYawDegrees,
+                    localForward);
                 constexpr float kDegreesToRadians = 0.01745329251994329577f;
-                const float trimPitch = 0.0f;
-                const float trimYaw = 0.0f;
+                const float trimPitch = renderTicket.aimPitchDegrees * kDegreesToRadians;
+                const float trimYaw = renderTicket.aimYawDegrees * kDegreesToRadians;
                 const float localUp[3] = {
                     -sinf(trimYaw) * sinf(trimPitch),
                     cosf(trimPitch),
