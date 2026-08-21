@@ -99,6 +99,48 @@ void Load(const char* path) {
         ReadFloat("Weapon", "AimPitch", s_settings.aim_pitch_degrees, path), -45.0f, 45.0f);
     s_settings.aim_yaw_degrees = std::clamp(
         ReadFloat("Weapon", "AimYaw", s_settings.aim_yaw_degrees, path), -45.0f, 45.0f);
+    s_settings.weapon_offset_forward = std::clamp(
+        ReadFloat("Weapon", "OffsetForward", s_settings.weapon_offset_forward, path), -100.0f, 100.0f);
+    s_settings.weapon_offset_right = std::clamp(
+        ReadFloat("Weapon", "OffsetRight", s_settings.weapon_offset_right, path), -100.0f, 100.0f);
+    s_settings.weapon_offset_up = std::clamp(
+        ReadFloat("Weapon", "OffsetUp", s_settings.weapon_offset_up, path), -100.0f, 100.0f);
+    s_settings.weapon_rotation_pitch = std::clamp(
+        ReadFloat("Weapon", "RotationPitch", s_settings.weapon_rotation_pitch, path), -180.0f, 180.0f);
+    s_settings.weapon_rotation_yaw = std::clamp(
+        ReadFloat("Weapon", "RotationYaw", s_settings.weapon_rotation_yaw, path), -180.0f, 180.0f);
+    s_settings.weapon_rotation_roll = std::clamp(
+        ReadFloat("Weapon", "RotationRoll", s_settings.weapon_rotation_roll, path), -180.0f, 180.0f);
+
+    s_settings.left_hand_offset_forward = std::clamp(
+        ReadFloat("Hands", "LeftForward", s_settings.left_hand_offset_forward, path), -100.0f, 100.0f);
+    s_settings.left_hand_offset_right = std::clamp(
+        ReadFloat("Hands", "LeftRight", s_settings.left_hand_offset_right, path), -100.0f, 100.0f);
+    s_settings.left_hand_offset_up = std::clamp(
+        ReadFloat("Hands", "LeftUp", s_settings.left_hand_offset_up, path), -100.0f, 100.0f);
+    s_settings.left_hand_rotation_pitch = std::clamp(
+        ReadFloat("Hands", "LeftPitch", s_settings.left_hand_rotation_pitch, path), -180.0f, 180.0f);
+    s_settings.left_hand_rotation_yaw = std::clamp(
+        ReadFloat("Hands", "LeftYaw", s_settings.left_hand_rotation_yaw, path), -180.0f, 180.0f);
+    s_settings.left_hand_rotation_roll = std::clamp(
+        ReadFloat("Hands", "LeftRoll", s_settings.left_hand_rotation_roll, path), -180.0f, 180.0f);
+    s_settings.right_hand_offset_forward = std::clamp(
+        ReadFloat("Hands", "RightForward", s_settings.right_hand_offset_forward, path), -100.0f, 100.0f);
+    s_settings.right_hand_offset_right = std::clamp(
+        ReadFloat("Hands", "RightRight", s_settings.right_hand_offset_right, path), -100.0f, 100.0f);
+    s_settings.right_hand_offset_up = std::clamp(
+        ReadFloat("Hands", "RightUp", s_settings.right_hand_offset_up, path), -100.0f, 100.0f);
+    s_settings.right_hand_rotation_pitch = std::clamp(
+        ReadFloat("Hands", "RightPitch", s_settings.right_hand_rotation_pitch, path), -180.0f, 180.0f);
+    s_settings.right_hand_rotation_yaw = std::clamp(
+        ReadFloat("Hands", "RightYaw", s_settings.right_hand_rotation_yaw, path), -180.0f, 180.0f);
+    s_settings.right_hand_rotation_roll = std::clamp(
+        ReadFloat("Hands", "RightRoll", s_settings.right_hand_rotation_roll, path), -180.0f, 180.0f);
+
+    s_settings.dot_horizontal_offset = std::clamp(
+        ReadFloat("Dot", "HorizontalOffset", s_settings.dot_horizontal_offset, path), -0.25f, 0.25f);
+    s_settings.dot_vertical_offset = std::clamp(
+        ReadFloat("Dot", "VerticalOffset", s_settings.dot_vertical_offset, path), -0.25f, 0.25f);
 
     s_settings.hide_player_body_and_arms = GetPrivateProfileIntA(
         "Visibility", "HidePlayerBodyAndArms", 0, path) != 0;
@@ -180,6 +222,26 @@ void Save(const char* path) {
     WriteFloat("Weapon", "PositionScale", s_settings.weapon_position_scale, path);
     WriteFloat("Weapon", "AimPitch", s_settings.aim_pitch_degrees, path);
     WriteFloat("Weapon", "AimYaw", s_settings.aim_yaw_degrees, path);
+    WriteFloat("Weapon", "OffsetForward", s_settings.weapon_offset_forward, path);
+    WriteFloat("Weapon", "OffsetRight", s_settings.weapon_offset_right, path);
+    WriteFloat("Weapon", "OffsetUp", s_settings.weapon_offset_up, path);
+    WriteFloat("Weapon", "RotationPitch", s_settings.weapon_rotation_pitch, path);
+    WriteFloat("Weapon", "RotationYaw", s_settings.weapon_rotation_yaw, path);
+    WriteFloat("Weapon", "RotationRoll", s_settings.weapon_rotation_roll, path);
+    WriteFloat("Hands", "LeftForward", s_settings.left_hand_offset_forward, path);
+    WriteFloat("Hands", "LeftRight", s_settings.left_hand_offset_right, path);
+    WriteFloat("Hands", "LeftUp", s_settings.left_hand_offset_up, path);
+    WriteFloat("Hands", "LeftPitch", s_settings.left_hand_rotation_pitch, path);
+    WriteFloat("Hands", "LeftYaw", s_settings.left_hand_rotation_yaw, path);
+    WriteFloat("Hands", "LeftRoll", s_settings.left_hand_rotation_roll, path);
+    WriteFloat("Hands", "RightForward", s_settings.right_hand_offset_forward, path);
+    WriteFloat("Hands", "RightRight", s_settings.right_hand_offset_right, path);
+    WriteFloat("Hands", "RightUp", s_settings.right_hand_offset_up, path);
+    WriteFloat("Hands", "RightPitch", s_settings.right_hand_rotation_pitch, path);
+    WriteFloat("Hands", "RightYaw", s_settings.right_hand_rotation_yaw, path);
+    WriteFloat("Hands", "RightRoll", s_settings.right_hand_rotation_roll, path);
+    WriteFloat("Dot", "HorizontalOffset", s_settings.dot_horizontal_offset, path);
+    WriteFloat("Dot", "VerticalOffset", s_settings.dot_vertical_offset, path);
     WritePrivateProfileStringA("Visibility", "HidePlayerBodyAndArms",
         s_settings.hide_player_body_and_arms ? "1" : "0", path);
     WritePrivateProfileStringA("Visibility", "VanillaHandsFilter",

@@ -145,6 +145,7 @@ private:
     XrView m_submissionViews[2] = {};
     bool m_submissionViewsValid = false;
     bool m_submissionRightAimValid = false;
+    float m_submissionRightAimPosition[3] = {};
     float m_submissionRightAimRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     float m_submissionAimPitchDegrees = 0.0f;
     float m_submissionAimYawDegrees = 0.0f;

@@ -7,6 +7,7 @@
 #include "../camera/CameraHook.hpp"
 #include "../config/Config.hpp"
 #include "../player/ArmIKSystem.hpp"
+#include "../ui/Overlay.hpp"
 #include <windows.h>
 #include <cmath>
 #include <cstring>
@@ -51,8 +52,17 @@ void InputHook::Install() {
     m_weaponAimProfileCursor = 0;
     m_activeWeaponAimProfile = -1;
     m_weaponMountValid = false;
+    m_mountIdentityGeneration = 0;
     memset(m_weaponMountCache, 0, sizeof(m_weaponMountCache));
     m_weaponMountCacheCursor = 0;
+    m_pendingWeaponIdentityGeneration = 0;
+    m_pendingWeaponPawn = 0;
+    m_pendingWeapon = 0;
+    m_pendingWeaponComponent = 0;
+    m_weaponIdentityStableSinceMs = 0;
+    m_motionControlsEnabled.store(true, std::memory_order_release);
+    m_motionReenableAtMs = 0;
+    m_dotVisibleAtMs.store(0, std::memory_order_release);
     m_xinputActive = XInputBridge::Instance().Initialize();
 
     m_installed = true;
@@ -64,6 +74,7 @@ void InputHook::Install() {
     Log("[Input] Map: sticks analog, RT fire, LT ADS, A jump, B crouch, "
         "X use/reload, Y cycle, LB skill, RB grenade, L3 sprint, R3 melee, Menu Start");
     Log("[Input] Y chord: tap=Y, hold 400ms=Back/ECHO, hold+left stick=D-pad");
+    Log("[Input] B chord: tap=B, hold 800ms=toggle motion controls");
 }
 
 static bool IsGameForeground(HWND hwnd) {
@@ -131,8 +142,10 @@ void InputHook::ReleaseAllInput() {
     m_leftTriggerDown = m_rightTriggerDown = false;
     m_leftGripDown = m_rightGripDown = false;
     m_yWasDown = m_yChordUsed = false;
+    m_bWasDown = m_bHoldUsed = false;
     m_recenterChordLatched = false;
     m_yPressMs = m_yTapPulseUntilMs = 0;
+    m_bPressMs = m_bTapPulseUntilMs = 0;
     m_snapTurnAccum = 0;
     if (m_outputLive) {
         Log("[Input] Output neutralized (focus, tracking, or action sync unavailable)");
@@ -214,6 +227,7 @@ void InputHook::UpdateState(XrTime displayTime) {
             right.thumbstickX, right.thumbstickY);
     if (!left.valid || !right.valid) { ReleaseAllInput(); return; }
     if (!foreground) { ReleaseAllInput(); return; }
+    if (ui::IsVisible()) { ReleaseAllInput(); return; }
     if (!m_outputLive) {
         Log("[Input] Tracked controller output resumed via %s",
             m_xinputActive ? "XInput" : "keyboard/mouse fallback");
@@ -232,6 +246,15 @@ void InputHook::UpdateState(XrTime displayTime) {
     WeaponAimSystem::Instance().SetFireActive(m_rightTriggerDown);
 
     const uint64_t now = GetTickCount64();
+    if (m_motionReenableAtMs && now >= m_motionReenableAtMs) {
+        m_motionReenableAtMs = 0;
+        player::ArmIKSystem::Instance().RequestNativeCalibrationReset();
+        player::ArmIKSystem::Instance().SetEnabled(true);
+        m_nativeWeaponCalibrationResetRequested.store(true, std::memory_order_release);
+        m_weaponCalibrationResetRequested.store(true, std::memory_order_release);
+        m_motionControlsEnabled.store(true, std::memory_order_release);
+        Log("[Input] Motion controls re-enabled after native-pose settle");
+    }
     const bool yDown = left.buttonY;
     if (yDown && !m_yWasDown) {
         m_yPressMs = now;
@@ -262,6 +285,42 @@ void InputHook::UpdateState(XrTime displayTime) {
     m_yWasDown = yDown;
     const bool yTapPulse = !yDown && now < m_yTapPulseUntilMs;
 
+    const bool bDown = right.buttonB;
+    if (bDown && !m_bWasDown) {
+        m_bPressMs = now;
+        m_bHoldUsed = false;
+        m_bTapPulseUntilMs = 0;
+    }
+    const uint64_t bHeldMs = bDown && now >= m_bPressMs ? now - m_bPressMs : 0;
+    if (bDown && !m_bHoldUsed && bHeldMs >= 800) {
+        m_bHoldUsed = true;
+        if (m_motionControlsEnabled.exchange(false, std::memory_order_acq_rel)) {
+            m_motionReenableAtMs = 0;
+            m_dotVisibleAtMs.store(0, std::memory_order_release);
+            player::ArmIKSystem::Instance().SetEnabled(false);
+            AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
+            m_renderWeaponStampActive = false;
+            m_renderWeaponComponent = 0;
+            m_renderWeaponMatrixOffset = 0;
+            ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
+            m_weaponPoseActive.store(false, std::memory_order_release);
+            WeaponAimSystem::Instance().InvalidateDirection();
+            Log("[Input] Motion controls disabled by hold-B");
+        } else if (!m_motionReenableAtMs) {
+            m_motionReenableAtMs = now + 700;
+            Log("[Input] Motion controls will re-enable after 700 ms native-pose settle");
+        } else {
+            m_motionReenableAtMs = 0;
+            Log("[Input] Motion-control re-enable cancelled by hold-B");
+        }
+    }
+    if (!bDown && m_bWasDown && !m_bHoldUsed &&
+        now >= m_bPressMs && now - m_bPressMs < 800) {
+        m_bTapPulseUntilMs = now + 100;
+    }
+    m_bWasDown = bDown;
+    const bool bTapPulse = !bDown && now < m_bTapPulseUntilMs;
+
     const bool bothSticksClicked = left.thumbstickClick && right.thumbstickClick;
     if (bothSticksClicked && !m_recenterChordLatched) {
         m_recenterChordLatched = true;
@@ -276,7 +335,7 @@ void InputHook::UpdateState(XrTime displayTime) {
 
     WORD buttons = chordDirection;
     if (right.buttonA) buttons |= XINPUT_GAMEPAD_A;
-    if (right.buttonB) buttons |= XINPUT_GAMEPAD_B;
+    if (bTapPulse) buttons |= XINPUT_GAMEPAD_B;
     if (left.buttonX) buttons |= XINPUT_GAMEPAD_X;
     if (yTapPulse) buttons |= XINPUT_GAMEPAD_Y;
     if (m_leftGripDown) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
@@ -317,7 +376,7 @@ void InputHook::UpdateState(XrTime displayTime) {
         setMouse(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
             m_leftTriggerDown, m_prevButtonA);
         setKey(VK_SPACE, right.buttonA, m_prevJump);
-        setKey('C', right.buttonB, m_prevCrouch);
+        setKey('C', bTapPulse, m_prevCrouch);
         setKey('E', left.buttonX, m_prevUse);
         setKey('R', left.buttonX, m_prevReload);
         setKey('F', m_leftGripDown, m_prevGrip);
@@ -477,6 +536,26 @@ void InputHook::RequestMotionCalibrationReset() {
     Log("[WeaponPose] Preserved pre-motion weapon mount requested");
 }
 
+bool InputHook::IsAimDotVisible() const {
+    const uint64_t visibleAt = m_dotVisibleAtMs.load(std::memory_order_acquire);
+    return visibleAt != 0 && GetTickCount64() >= visibleAt &&
+        m_motionControlsEnabled.load(std::memory_order_acquire) &&
+        m_weaponPoseActive.load(std::memory_order_acquire);
+}
+
+bool InputHook::GetWeaponBarrelLocalDirection(float direction[3]) {
+    if (!direction) return false;
+    bool valid = false;
+    AcquireSRWLockShared(&m_weaponPoseWriteLock);
+    if (m_weaponBarrelDirectionValid && m_renderWeaponStampActive) {
+        memcpy(direction, m_weaponBarrelLocalDirection,
+               sizeof(m_weaponBarrelLocalDirection));
+        valid = true;
+    }
+    ReleaseSRWLockShared(&m_weaponPoseWriteLock);
+    return valid;
+}
+
 static bool BuildFrameMatrix(const float position[3], const float forwardInput[3],
                              const float upInput[3], float output[16]) {
     float forward[3] = {forwardInput[0], forwardInput[1], forwardInput[2]};
@@ -578,8 +657,8 @@ void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
     if (m_activeWeaponAimProfile >= 0 &&
         m_activeWeaponAimProfile < kWeaponAimProfileCapacity) {
         const auto& active = m_weaponAimProfiles[m_activeWeaponAimProfile];
-        const bool sameProfile = active.valid && active.pawn == pawn &&
-            active.weapon == weapon;
+        const bool sameProfile = active.valid && active.stableKey == stableKey &&
+            active.component == component;
         if (sameProfile) return;
     }
     if (m_aimTuningDirty) {
@@ -589,8 +668,10 @@ void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
 
     WeaponAimProfile* selected = nullptr;
     for (auto& profile : m_weaponAimProfiles) {
-        const bool matches = profile.valid && profile.pawn == pawn &&
-            profile.weapon == weapon;
+        const bool matches = profile.valid &&
+            ((stableKey != 0 && profile.stableKey == stableKey) ||
+             (stableKey == 0 && profile.pawn == pawn &&
+              profile.weapon == weapon && profile.component == component));
         if (matches) {
             selected = &profile;
             break;
@@ -642,18 +723,24 @@ void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
 
 void InputHook::ApplyRightHand(int eye) {
     (void)eye;
-    AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
-    m_renderWeaponStampActive = false;
-    m_renderWeaponComponent = 0;
-    m_renderWeaponMatrixOffset = 0;
-    ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
     m_componentCount = 0;
-    m_weaponPoseActive.store(false, std::memory_order_release);
+    if (!m_motionControlsEnabled.load(std::memory_order_acquire)) {
+        m_weaponPoseActive.store(false, std::memory_order_release);
+        return;
+    }
     if (m_weaponCalibrationResetRequested.exchange(false, std::memory_order_acq_rel)) {
         m_weaponMountValid = false;
         m_mountWeapon = 0;
         m_mountComponent = 0;
+        m_mountIdentityGeneration = 0;
+        m_weaponBarrelDirectionValid = false;
         memset(m_weaponMountMatrix, 0, sizeof(m_weaponMountMatrix));
+        if (m_nativeWeaponCalibrationResetRequested.exchange(
+                false, std::memory_order_acq_rel)) {
+            memset(m_weaponMountCache, 0, sizeof(m_weaponMountCache));
+            m_weaponMountCacheCursor = 0;
+            Log("[WeaponPose] Native weapon mount cache cleared for recapture");
+        }
         m_lastDrivenWeapon = 0;
         m_lastDrivenComponent = 0;
         Log("[WeaponPose] Pre-motion weapon mount restore requested");
@@ -702,6 +789,46 @@ void InputHook::ApplyRightHand(int eye) {
         return;
     }
     m_nextWeaponComponentScanMs = 0;
+    const uint64_t now = GetTickCount64();
+    const bool identityChanged = m_pendingWeaponPawn != inventory.pawn ||
+        m_pendingWeapon != inventory.weapon ||
+        m_pendingWeaponComponent != active->component;
+    if (identityChanged) {
+        const bool equippedWeaponChanged = m_pendingWeapon != 0 &&
+            (m_pendingWeapon != inventory.weapon ||
+             m_pendingWeaponComponent != active->component);
+        m_pendingWeaponIdentityGeneration = identity.generation;
+        m_pendingWeaponPawn = inventory.pawn;
+        m_pendingWeapon = inventory.weapon;
+        m_pendingWeaponComponent = active->component;
+        m_weaponIdentityStableSinceMs = now;
+        m_weaponMountValid = false;
+        m_mountIdentityGeneration = 0;
+        if (equippedWeaponChanged &&
+            m_motionControlsEnabled.exchange(false, std::memory_order_acq_rel)) {
+            m_motionReenableAtMs = now + 700;
+            m_dotVisibleAtMs.store(0, std::memory_order_release);
+            player::ArmIKSystem::Instance().SetEnabled(false);
+            m_nativeWeaponCalibrationResetRequested.store(true, std::memory_order_release);
+            m_weaponCalibrationResetRequested.store(true, std::memory_order_release);
+            AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
+            m_renderWeaponStampActive = false;
+            m_renderWeaponComponent = 0;
+            m_renderWeaponMatrixOffset = 0;
+            ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
+            m_weaponPoseActive.store(false, std::memory_order_release);
+            WeaponAimSystem::Instance().InvalidateDirection();
+            Log("[WeaponPose] Weapon changed; automatic 700 ms native calibration started");
+        }
+        Log("[WeaponPose] Waiting for stable native mount: generation=%llu "
+            "weapon=%p component=%p",
+            static_cast<unsigned long long>(identity.generation),
+            reinterpret_cast<void*>(inventory.weapon),
+            reinterpret_cast<void*>(active->component));
+        return;
+    }
+    constexpr uint64_t kNativeMountSettleMs = 700;
+    if (now - m_weaponIdentityStableSinceMs < kNativeMountSettleMs) return;
     ActivateWeaponAimProfile(inventory.pawn, inventory.weapon, active->outerName,
                              active->meshName, active->component);
 
@@ -726,6 +853,10 @@ void InputHook::ApplyRightHand(int eye) {
     if (!std::isfinite(original[15]) || fabsf(original[15] - 1.0f) > 0.05f ||
         scaleX < 1.0e-4f || scaleY < 1.0e-4f || scaleZ < 1.0e-4f) return;
 
+    float controllerFrame[16] = {};
+    if (!BuildFrameMatrix(m_canonicalWeaponPosition, m_canonicalWeaponForward,
+            m_canonicalWeaponUp, controllerFrame)) return;
+
     if (!m_weaponMountValid || m_mountWeapon != inventory.weapon ||
         m_mountComponent != active->component) {
         const WeaponMountCacheEntry* cachedMount = nullptr;
@@ -740,6 +871,8 @@ void InputHook::ApplyRightHand(int eye) {
         if (cachedMount) {
             memcpy(m_weaponMountMatrix, cachedMount->matrix,
                    sizeof(m_weaponMountMatrix));
+            m_weaponBarrelAxis = cachedMount->barrelAxis;
+            m_weaponBarrelSign = cachedMount->barrelSign;
             Log("[WeaponPose] Authored mount restored: weapon=%p component=%p "
                 "offset=(%.1f,%.1f,%.1f)",
                 reinterpret_cast<void*>(inventory.weapon),
@@ -753,7 +886,27 @@ void InputHook::ApplyRightHand(int eye) {
             if (!BuildFrameMatrix(m_nativeCameraPosition, m_nativeCameraForward,
                     m_nativeCameraUp, cameraFrame)) return;
             InvertRigidFrame(cameraFrame, inverseCameraFrame);
+            // Map the native weapon-to-crosshair relationship onto OpenXR's
+            // standardized aim ray.
             MultiplyMatrix(original, inverseCameraFrame, m_weaponMountMatrix);
+
+            m_weaponBarrelAxis = 0;
+            m_weaponBarrelSign = 1.0f;
+            float bestAlignment = -1.0f;
+            for (int axis = 0; axis < 3; ++axis) {
+                const float* candidate = original + axis * 4;
+                const float length = sqrtf(candidate[0] * candidate[0] +
+                    candidate[1] * candidate[1] + candidate[2] * candidate[2]);
+                if (!std::isfinite(length) || length < 1.0e-5f) continue;
+                const float alignment =
+                    (candidate[0] * m_nativeCameraForward[0] +
+                     candidate[1] * m_nativeCameraForward[1] +
+                     candidate[2] * m_nativeCameraForward[2]) / length;
+                if (fabsf(alignment) <= bestAlignment) continue;
+                bestAlignment = fabsf(alignment);
+                m_weaponBarrelAxis = axis;
+                m_weaponBarrelSign = alignment < 0.0f ? -1.0f : 1.0f;
+            }
 
             WeaponMountCacheEntry* destination = nullptr;
             for (auto& entry : m_weaponMountCache) {
@@ -767,11 +920,14 @@ void InputHook::ApplyRightHand(int eye) {
                 m_weaponMountCacheCursor =
                     (m_weaponMountCacheCursor + 1) % kWeaponMountCacheCapacity;
             }
+            destination->identityGeneration = identity.generation;
             destination->pawn = inventory.pawn;
             destination->weapon = inventory.weapon;
             destination->component = active->component;
             memcpy(destination->matrix, m_weaponMountMatrix,
                    sizeof(destination->matrix));
+            destination->barrelAxis = m_weaponBarrelAxis;
+            destination->barrelSign = m_weaponBarrelSign;
             destination->valid = true;
             Log("[WeaponPose] Authored mount captured: weapon=%p component=%p "
                 "offset=(%.1f,%.1f,%.1f)",
@@ -782,13 +938,31 @@ void InputHook::ApplyRightHand(int eye) {
         }
         m_mountWeapon = inventory.weapon;
         m_mountComponent = active->component;
+        m_mountIdentityGeneration = identity.generation;
         m_weaponMountValid = true;
     }
-    float controllerFrame[16] = {};
-    if (!BuildFrameMatrix(m_canonicalWeaponPosition, m_canonicalWeaponForward,
-            m_canonicalWeaponUp, controllerFrame)) return;
     float driven[16] = {};
     MultiplyMatrix(m_weaponMountMatrix, controllerFrame, driven);
+    float barrelWorld[3] = {
+        driven[m_weaponBarrelAxis * 4] * m_weaponBarrelSign,
+        driven[m_weaponBarrelAxis * 4 + 1] * m_weaponBarrelSign,
+        driven[m_weaponBarrelAxis * 4 + 2] * m_weaponBarrelSign
+    };
+    const float barrelLength = sqrtf(barrelWorld[0] * barrelWorld[0] +
+        barrelWorld[1] * barrelWorld[1] + barrelWorld[2] * barrelWorld[2]);
+    if (!std::isfinite(barrelLength) || barrelLength < 1.0e-5f) return;
+    for (float& value : barrelWorld) value /= barrelLength;
+    float barrelLocal[3] = {
+        barrelWorld[0] * controllerFrame[0] +
+            barrelWorld[1] * controllerFrame[1] +
+            barrelWorld[2] * controllerFrame[2],
+        barrelWorld[0] * controllerFrame[4] +
+            barrelWorld[1] * controllerFrame[5] +
+            barrelWorld[2] * controllerFrame[6],
+        barrelWorld[0] * controllerFrame[8] +
+            barrelWorld[1] * controllerFrame[9] +
+            barrelWorld[2] * controllerFrame[10]
+    };
     SIZE_T bytesWritten = 0;
     if (!WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(matrixAddress),
             driven, sizeof(driven), &bytesWritten) || bytesWritten != sizeof(driven)) return;
@@ -797,18 +971,31 @@ void InputHook::ApplyRightHand(int eye) {
     m_renderWeaponMatrixOffset = active->localToWorldOffset;
     memcpy(m_renderWeaponMatrix, driven, sizeof(m_renderWeaponMatrix));
     m_renderWeaponStampActive = true;
+    m_renderWeaponStampUpdatedMs = GetTickCount64();
+    memcpy(m_weaponBarrelLocalDirection, barrelLocal,
+           sizeof(m_weaponBarrelLocalDirection));
+    m_weaponBarrelDirectionValid = true;
     ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
     weapon.valid = true;
     m_componentCount = 1;
     m_weaponPoseActive.store(true, std::memory_order_release);
+    uint64_t expectedDotTime = 0;
+    const uint64_t dotVisibleAt = GetTickCount64() + 3000;
+    if (m_dotVisibleAtMs.compare_exchange_strong(expectedDotTime, dotVisibleAt,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        Log("[WeaponPose] Aim dot scheduled 3 seconds after motion activation");
+    }
     if (m_lastDrivenWeapon != inventory.weapon ||
         m_lastDrivenComponent != active->component) {
         Log("[WeaponPose] Shared pose active: weapon=%p component=%p updates=%llu "
-            "matrix=+0x%X scale=(%.3f,%.3f,%.3f)",
+            "matrix=+0x%X scale=(%.3f,%.3f,%.3f) barrel=%c%c "
+            "local=(%.3f,%.3f,%.3f)",
             reinterpret_cast<void*>(inventory.weapon),
             reinterpret_cast<void*>(active->component),
             static_cast<unsigned long long>(active->updateCount),
-            active->localToWorldOffset, scaleX, scaleY, scaleZ);
+            active->localToWorldOffset, scaleX, scaleY, scaleZ,
+            m_weaponBarrelSign < 0.0f ? '-' : '+', "XYZ"[m_weaponBarrelAxis],
+            barrelLocal[0], barrelLocal[1], barrelLocal[2]);
         m_lastDrivenWeapon = inventory.weapon;
         m_lastDrivenComponent = active->component;
     }
@@ -820,10 +1007,12 @@ void InputHook::ApplyLeftHand(int eye) {
 }
 
 bool InputHook::ReapplyWeaponPose(void* component) {
-    if (!component) return false;
+    if (!component || !m_motionControlsEnabled.load(std::memory_order_acquire))
+        return false;
     bool written = false;
     AcquireSRWLockShared(&m_weaponPoseWriteLock);
     if (m_renderWeaponStampActive &&
+        GetTickCount64() - m_renderWeaponStampUpdatedMs <= 250 &&
         m_renderWeaponComponent == reinterpret_cast<uintptr_t>(component) &&
         m_renderWeaponMatrixOffset > 0) {
         SIZE_T bytesWritten = 0;
@@ -845,19 +1034,34 @@ bool InputHook::ReapplyWeaponPose(void* component) {
     return written;
 }
 
+bool InputHook::ReapplyWeaponPose() {
+    if (!m_motionControlsEnabled.load(std::memory_order_acquire)) return false;
+    bool written = false;
+    AcquireSRWLockShared(&m_weaponPoseWriteLock);
+    if (m_renderWeaponStampActive && m_renderWeaponComponent >= 0x10000 &&
+        m_renderWeaponMatrixOffset > 0 &&
+        GetTickCount64() - m_renderWeaponStampUpdatedMs <= 250) {
+        SIZE_T bytesWritten = 0;
+        written = WriteProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<void*>(m_renderWeaponComponent +
+                                    m_renderWeaponMatrixOffset),
+            m_renderWeaponMatrix, sizeof(m_renderWeaponMatrix), &bytesWritten) &&
+            bytesWritten == sizeof(m_renderWeaponMatrix);
+    }
+    ReleaseSRWLockShared(&m_weaponPoseWriteLock);
+    return written;
+}
+
 void InputHook::Restore() {
     AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
     for (int i = 0; i < m_componentCount; ++i) {
         WeaponComponent& w = m_components[i];
-        if (!w.valid || !w.address || !w.matrixOffset) continue;
-        uintptr_t addr = w.address + w.matrixOffset;
-        WriteProcessMemory(GetCurrentProcess(), (void*)addr, w.savedMatrix, sizeof(float)*16, NULL);
+        // Keep the driven matrix resident. UpdateSkelPose may run after
+        // ViewportDraw on another thread; restoring native state here lets
+        // that thread alternate native and VR transforms while locomoting.
         w.valid = false;
     }
     m_componentCount = 0;
-    m_renderWeaponStampActive = false;
-    m_renderWeaponComponent = 0;
-    m_renderWeaponMatrixOffset = 0;
     ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
 }
 

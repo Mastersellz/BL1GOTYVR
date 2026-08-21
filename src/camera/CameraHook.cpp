@@ -445,6 +445,7 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
     const int eye = simulatedPose ? frameLoop.GetRenderEye() : renderTicket.eye;
     float originalLocation[3] = {};
     int32_t originalRotation[3] = {};
+    int32_t interactionRotation[3] = {};
     float appliedLocation[3] = {};
     int32_t appliedRotation[3] = {};
     float roomOffsetView[3] = {};
@@ -462,6 +463,7 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
             auto* fov = reinterpret_cast<float*>(camera.cameraFov);
             memcpy(originalLocation, location, sizeof(originalLocation));
             memcpy(originalRotation, rotation, sizeof(originalRotation));
+            memcpy(interactionRotation, originalRotation, sizeof(interactionRotation));
             originalFov = *fov;
             cameraStateSaved = true;
 
@@ -521,6 +523,22 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                 -s_poseReferenceRotation[2], s_poseReferenceRotation[3]
             };
             RelativeQuaternion(s_poseReferenceRotation, headRotation, relative);
+            float relativeHeadForwardXr[3] = {};
+            const float xrHeadForward[3] = {0.0f, 0.0f, -1.0f};
+            quat_rotate(relative[0], relative[1], relative[2], relative[3],
+                        xrHeadForward, relativeHeadForwardXr);
+            const float relativeHeadForwardUe[3] = {
+                -relativeHeadForwardXr[2], relativeHeadForwardXr[0],
+                relativeHeadForwardXr[1]
+            };
+            const float headHorizontal = sqrtf(
+                relativeHeadForwardUe[0] * relativeHeadForwardUe[0] +
+                relativeHeadForwardUe[1] * relativeHeadForwardUe[1]);
+            constexpr float kRadiansToUnis = 65536.0f / 6.2831853071795864769f;
+            const float headPitch = atan2f(relativeHeadForwardUe[2], headHorizontal);
+            interactionRotation[0] = s_gamePitchReference.load(
+                std::memory_order_relaxed) +
+                static_cast<int32_t>(lroundf(headPitch * kRadiansToUnis));
 
             float renderedEyePosition[3] = {};
             if (simulatedPose) {
@@ -558,7 +576,8 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                         armCameraLocation, gamePitch, gameYaw, s_poseReferencePosition,
                         s_poseReferenceRotation);
             }
-            if (renderTicket.rightAimValid) {
+            if (renderTicket.rightAimValid &&
+                input::InputHook::Instance().IsMotionControlsEnabled()) {
                 if (!s_aimBasisValid) {
                     memcpy(s_aimBasisRotation, s_poseReferenceRotation,
                            sizeof(s_aimBasisRotation));
@@ -572,12 +591,10 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                 RelativeQuaternion(s_aimBasisRotation,
                     renderTicket.rightAimRotation, relativeAim);
                 float localForward[3] = {};
-                input::BuildCalibratedLocalForward(
-                    renderTicket.aimPitchDegrees, renderTicket.aimYawDegrees,
-                    localForward);
+                input::BuildCalibratedLocalForward(0.0f, 0.0f, localForward);
                 constexpr float kDegreesToRadians = 0.01745329251994329577f;
-                const float trimPitch = renderTicket.aimPitchDegrees * kDegreesToRadians;
-                const float trimYaw = renderTicket.aimYawDegrees * kDegreesToRadians;
+                const float trimPitch = 0.0f;
+                const float trimYaw = 0.0f;
                 const float localUp[3] = {
                     -sinf(trimYaw) * sinf(trimPitch),
                     cosf(trimPitch),
@@ -647,18 +664,94 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                     pitchSine * weaponViewOffset[0] +
                         pitchCosine * weaponViewOffset[2]
                 };
+                const float worldRight[3] = {
+                    worldUp[1] * worldForward[2] - worldUp[2] * worldForward[1],
+                    worldUp[2] * worldForward[0] - worldUp[0] * worldForward[2],
+                    worldUp[0] * worldForward[1] - worldUp[1] * worldForward[0]
+                };
+                const float rayPositionScale =
+                    100.0f * config::Get().positional_scale;
+                const float rayViewOffset[3] = {
+                    -referenceLocalWeapon[2] * rayPositionScale,
+                    referenceLocalWeapon[0] * rayPositionScale,
+                    referenceLocalWeapon[1] * rayPositionScale
+                };
+                const float pitchedRayOffset[3] = {
+                    pitchCosine * rayViewOffset[0] - pitchSine * rayViewOffset[2],
+                    rayViewOffset[1],
+                    pitchSine * rayViewOffset[0] + pitchCosine * rayViewOffset[2]
+                };
+                const auto& settings = config::Get();
+                const float modelPitch = settings.weapon_rotation_pitch * kDegreesToRadians;
+                const float modelYaw = settings.weapon_rotation_yaw * kDegreesToRadians;
+                const float modelRoll = settings.weapon_rotation_roll * kDegreesToRadians;
+                const float modelPitchSine = sinf(modelPitch);
+                const float modelPitchCosine = cosf(modelPitch);
+                const float modelYawSine = sinf(modelYaw);
+                const float modelYawCosine = cosf(modelYaw);
+                const float modelRollSine = sinf(modelRoll);
+                const float modelRollCosine = cosf(modelRoll);
+                const float modelForwardLocal[3] = {
+                    modelPitchCosine * modelYawCosine,
+                    modelPitchCosine * modelYawSine,
+                    modelPitchSine
+                };
+                const float modelRightUnrolled[3] = {
+                    -modelYawSine, modelYawCosine, 0.0f
+                };
+                const float modelUpUnrolled[3] = {
+                    -modelPitchSine * modelYawCosine,
+                    -modelPitchSine * modelYawSine,
+                    modelPitchCosine
+                };
+                const float modelUpLocal[3] = {
+                    modelUpUnrolled[0] * modelRollCosine -
+                        modelRightUnrolled[0] * modelRollSine,
+                    modelUpUnrolled[1] * modelRollCosine -
+                        modelRightUnrolled[1] * modelRollSine,
+                    modelUpUnrolled[2] * modelRollCosine -
+                        modelRightUnrolled[2] * modelRollSine
+                };
+                float weaponForward[3] = {};
+                float weaponUp[3] = {};
+                for (int axis = 0; axis < 3; ++axis) {
+                    weaponForward[axis] =
+                        modelForwardLocal[0] * worldForward[axis] +
+                        modelForwardLocal[1] * worldRight[axis] +
+                        modelForwardLocal[2] * worldUp[axis];
+                    weaponUp[axis] =
+                        modelUpLocal[0] * worldForward[axis] +
+                        modelUpLocal[1] * worldRight[axis] +
+                        modelUpLocal[2] * worldUp[axis];
+                }
                 const float worldWeaponPosition[3] = {
                     armCameraLocation[0] + yawCosine * pitchedWeaponOffset[0] -
-                        yawSine * pitchedWeaponOffset[1],
+                        yawSine * pitchedWeaponOffset[1] +
+                        worldForward[0] * settings.weapon_offset_forward +
+                        worldRight[0] * settings.weapon_offset_right +
+                        worldUp[0] * settings.weapon_offset_up,
                     armCameraLocation[1] + yawSine * pitchedWeaponOffset[0] +
-                        yawCosine * pitchedWeaponOffset[1],
-                    armCameraLocation[2] + pitchedWeaponOffset[2]
+                        yawCosine * pitchedWeaponOffset[1] +
+                        worldForward[1] * settings.weapon_offset_forward +
+                        worldRight[1] * settings.weapon_offset_right +
+                        worldUp[1] * settings.weapon_offset_up,
+                    armCameraLocation[2] + pitchedWeaponOffset[2] +
+                        worldForward[2] * settings.weapon_offset_forward +
+                        worldRight[2] * settings.weapon_offset_right +
+                        worldUp[2] * settings.weapon_offset_up
+                };
+                const float worldAimOrigin[3] = {
+                    armCameraLocation[0] + yawCosine * pitchedRayOffset[0] -
+                        yawSine * pitchedRayOffset[1],
+                    armCameraLocation[1] + yawSine * pitchedRayOffset[0] +
+                        yawCosine * pitchedRayOffset[1],
+                    armCameraLocation[2] + pitchedRayOffset[2]
                 };
                 input::InputHook::Instance().SetCanonicalWeaponPose(
-                    worldWeaponPosition, worldForward, worldUp,
+                    worldWeaponPosition, weaponForward, weaponUp,
                     armCameraLocation, nativeCameraForward, nativeCameraUp);
                 input::WeaponAimSystem::Instance().UpdateDirection(
-                    armCameraLocation, worldForward);
+                    worldAimOrigin, worldForward);
             } else {
                 input::InputHook::Instance().ClearCanonicalWeaponPose();
                 input::WeaponAimSystem::Instance().InvalidateDirection();
@@ -729,9 +822,8 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
     input::InputHook::Instance().ApplyRightHand(eye);
     input::InputHook::Instance().ApplyLeftHand(eye);
     s_originalViewportDraw(viewportClient, viewport, canvas);
-    // Publish new controller targets only after both AFR eyes consumed the
-    // previous palette. UpdateSkelPose then prepares one coherent palette for
-    // the next pair instead of advancing only the right eye.
+    // Publish only after both AFR eyes consumed the same prepared palette.
+    // The next pair replays this palette identically for left and right.
     if (simulatedPose || eye == 1) {
         player::ArmIKSystem::Instance().SetRenderContext(
             simulatedPose ? count : renderTicket.pairSerial,
@@ -757,7 +849,7 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
             memcpy(reinterpret_cast<void*>(camera.cameraCacheLocation),
                    originalLocation, sizeof(originalLocation));
             memcpy(reinterpret_cast<void*>(camera.cameraCacheRotation),
-                   originalRotation, sizeof(originalRotation));
+                   interactionRotation, sizeof(interactionRotation));
             *reinterpret_cast<float*>(camera.cameraFov) = originalFov;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
@@ -1342,6 +1434,10 @@ static void* __fastcall HookedRenderCommandConstructor(void* destination, void* 
         }
     }
 
+    if (principalSource) {
+        input::InputHook::Instance().ReapplyWeaponPose();
+        player::ArmIKSystem::Instance().ReapplyRenderPalette();
+    }
     void* result = s_originalRenderCommandConstructor(
         destination, constructorSource, argument3, argument4);
     if (principalSource) {

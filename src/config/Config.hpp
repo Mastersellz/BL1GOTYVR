@@ -45,6 +45,30 @@ float hud_horizontal_offset = 0.0f;
     float weapon_position_scale = 0.5f;
     float aim_pitch_degrees = 0.0f;
     float aim_yaw_degrees = 0.0f;
+    float weapon_offset_forward = 0.0f;
+    float weapon_offset_right = 0.0f;
+    float weapon_offset_up = 0.0f;
+    float weapon_rotation_pitch = 0.0f;
+    float weapon_rotation_yaw = 0.0f;
+    float weapon_rotation_roll = 0.0f;
+
+    /* Hand IK offsets in camera-local Unreal units */
+    float left_hand_offset_forward = 0.0f;
+    float left_hand_offset_right = 0.0f;
+    float left_hand_offset_up = 0.0f;
+    float left_hand_rotation_pitch = 0.0f;
+    float left_hand_rotation_yaw = 0.0f;
+    float left_hand_rotation_roll = 0.0f;
+    float right_hand_offset_forward = 0.0f;
+    float right_hand_offset_right = 0.0f;
+    float right_hand_offset_up = 0.0f;
+    float right_hand_rotation_pitch = 0.0f;
+    float right_hand_rotation_yaw = 0.0f;
+    float right_hand_rotation_roll = 0.0f;
+
+    /* Aim dot offsets in normalized eye UV */
+    float dot_horizontal_offset = 0.0f;
+    float dot_vertical_offset = 0.0f;
 
     /* Player visibility */
     bool hide_player_body_and_arms = false;

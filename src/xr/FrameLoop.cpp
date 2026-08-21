@@ -523,7 +523,7 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     }
     float dotU = 0.5f, dotV = 0.5f, dotEnabled = 0.0f;
     if (!flatSource && m_submissionRightAimValid && m_submissionViewsValid &&
-        input::InputHook::Instance().IsWeaponPoseActive() &&
+        input::InputHook::Instance().IsAimDotVisible() &&
         sampledEye >= 0 && sampledEye < 2) {
         auto rotate = [](const float quaternion[4], const float vector[3], float output[3]) {
             const float qx = quaternion[0], qy = quaternion[1];
@@ -540,27 +540,52 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
             m_submissionAimPitchDegrees, m_submissionAimYawDegrees, aimForward);
         float trackingForward[3] = {};
         rotate(m_submissionRightAimRotation, aimForward, trackingForward);
-        const XrView& eyeView = m_submissionViews[sampledEye];
+        // The dot is drawn into the destination eye. sourceEye may refer to a
+        // crossed/reversed capture texture and must not select the eye pose.
+        const XrView& eyeView = m_submissionViews[eye];
         const float inverseEye[4] = {
             -eyeView.pose.orientation.x, -eyeView.pose.orientation.y,
             -eyeView.pose.orientation.z, eyeView.pose.orientation.w
         };
-        // GetAdjustedAim supplies an angular direction. Project that direction
-        // at infinity so controller-to-eye parallax cannot move the marker away
-        // from the game's camera-origin shot trace.
+        constexpr float kAimDistanceMeters = 20.0f;
+        const float trackingTarget[3] = {
+            m_submissionRightAimPosition[0] + trackingForward[0] * kAimDistanceMeters,
+            m_submissionRightAimPosition[1] + trackingForward[1] * kAimDistanceMeters,
+            m_submissionRightAimPosition[2] + trackingForward[2] * kAimDistanceMeters
+        };
+        const float eyeToTarget[3] = {
+            trackingTarget[0] - eyeView.pose.position.x,
+            trackingTarget[1] - eyeView.pose.position.y,
+            trackingTarget[2] - eyeView.pose.position.z
+        };
         float eyeLocal[3] = {};
-        rotate(inverseEye, trackingForward, eyeLocal);
+        rotate(inverseEye, eyeToTarget, eyeLocal);
         if (eyeLocal[2] < -0.001f) {
             const float tangentX = eyeLocal[0] / -eyeLocal[2];
             const float tangentY = eyeLocal[1] / -eyeLocal[2];
             const float tanLeft = tanf(eyeView.fov.angleLeft);
             const float tanRight = tanf(eyeView.fov.angleRight);
-            const float verticalHalfSpan = (tanf(eyeView.fov.angleUp) -
-                tanf(eyeView.fov.angleDown)) * 0.5f;
+            const float tanDown = tanf(eyeView.fov.angleDown);
+            const float tanUp = tanf(eyeView.fov.angleUp);
+            // The marker is composited after source-texture projection crop,
+            // directly in OpenXR swapchain coordinates. Applying the crop a
+            // second time moves it down and right.
             dotU = (tangentX - tanLeft) / (tanRight - tanLeft);
-            dotV = (verticalHalfSpan - tangentY) / (verticalHalfSpan * 2.0f);
+            dotV = (tanUp - tangentY) / (tanUp - tanDown);
+            dotU += vrSettings.dot_horizontal_offset;
+            dotV -= vrSettings.dot_vertical_offset;
             dotEnabled = dotU >= 0.0f && dotU <= 1.0f &&
-                         dotV >= 0.0f && dotV <= 1.0f ? 1.0f : 0.0f;
+                          dotV >= 0.0f && dotV <= 1.0f ? 1.0f : 0.0f;
+            static uint32_t rayProjectionLogs = 0;
+            if (eye == 0 && (++rayProjectionLogs % 300) == 1) {
+                Log("[AimRay] Quest aim q=(%.3f,%.3f,%.3f,%.3f) "
+                    "trackingDir=(%.3f,%.3f,%.3f) eyeDir=(%.3f,%.3f,%.3f) "
+                    "dot=(%.3f,%.3f)",
+                    m_submissionRightAimRotation[0], m_submissionRightAimRotation[1],
+                    m_submissionRightAimRotation[2], m_submissionRightAimRotation[3],
+                    trackingForward[0], trackingForward[1], trackingForward[2],
+                    eyeLocal[0], eyeLocal[1], eyeLocal[2], dotU, dotV);
+            }
         }
     }
     const bool selectedSwapchainIsSrgb =
@@ -963,8 +988,9 @@ bool FrameLoop::AcquireRenderTicket(StereoRenderTicket& ticket) {
                sizeof(m_activePair.headRotation));
         m_activePair.views[0] = currentViews[0];
         m_activePair.views[1] = currentViews[1];
-        m_activePair.aimPitchDegrees = config::Get().aim_pitch_degrees;
-        m_activePair.aimYawDegrees = config::Get().aim_yaw_degrees;
+        // OpenXR aim/pose defines the runtime's authoritative controller ray.
+        m_activePair.aimPitchDegrees = 0.0f;
+        m_activePair.aimYawDegrees = 0.0f;
         m_activePair.rightAimValid = controllers[1].aimValid;
         if (m_activePair.rightAimValid) {
             memcpy(m_activePair.rightAimPosition, controllers[1].aimPosition,
@@ -2306,6 +2332,8 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         m_submissionViewsValid = true;
         m_submissionRightAimValid = renderedTicket.rightAimValid;
         if (m_submissionRightAimValid) {
+            memcpy(m_submissionRightAimPosition, renderedTicket.rightAimPosition,
+                   sizeof(m_submissionRightAimPosition));
             memcpy(m_submissionRightAimRotation, renderedTicket.rightAimRotation,
                    sizeof(m_submissionRightAimRotation));
         }

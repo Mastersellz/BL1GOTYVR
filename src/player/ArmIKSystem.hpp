@@ -87,11 +87,13 @@ public:
     void RequestRescan();
     void RequestInventoryScan();
     void RequestCalibrationReset();
+    void RequestNativeCalibrationReset();
     uint64_t UpdateTargets(const float cameraLocation[3], float gamePitchRadians,
                            float gameYawRadians,
                            const float trackingReferencePosition[3],
                            const float trackingReferenceRotation[4]);
     void SetRenderContext(uint64_t renderGeneration, uint64_t targetGeneration);
+    bool ReapplyRenderPalette();
     bool ApplyPostAnimation(void* component);
     void Restore();
     ArmRigStatus GetStatus() const;
@@ -126,6 +128,7 @@ private:
     std::atomic<bool> m_visibilityEnabled{false};
     std::atomic<bool> m_simulationEnabled{false};
     std::atomic<bool> m_calibrationResetRequested{false};
+    std::atomic<bool> m_nativeCalibrationResetRequested{false};
     std::atomic<bool> m_discoveryRequested{false};
     std::atomic<uint64_t> m_inventoryRequestGeneration{0};
     std::atomic<uint64_t> m_inventoryCompletedGeneration{0};

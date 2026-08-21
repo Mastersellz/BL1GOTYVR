@@ -18,10 +18,13 @@ struct WeaponComponent {
 };
 
 struct WeaponMountCacheEntry {
+    uint64_t identityGeneration = 0;
     uintptr_t pawn = 0;
     uintptr_t weapon = 0;
     uintptr_t component = 0;
     float matrix[16] = {};
+    int barrelAxis = 0;
+    float barrelSign = 1.0f;
     bool valid = false;
 };
 
@@ -55,12 +58,18 @@ public:
                                 const float cameraUp[3]);
     void ClearCanonicalWeaponPose();
     void RequestMotionCalibrationReset();
+    bool IsMotionControlsEnabled() const {
+        return m_motionControlsEnabled.load(std::memory_order_acquire);
+    }
     bool IsWeaponPoseActive() const {
         return m_weaponPoseActive.load(std::memory_order_acquire);
     }
+    bool IsAimDotVisible() const;
+    bool GetWeaponBarrelLocalDirection(float direction[3]);
     void ApplyRightHand(int eye);
     void ApplyLeftHand(int eye);
     bool ReapplyWeaponPose(void* component);
+    bool ReapplyWeaponPose();
     void Restore();
 
 private:
@@ -100,8 +109,13 @@ private:
     bool m_yWasDown = false;
     bool m_yChordUsed = false;
     bool m_recenterChordLatched = false;
+    bool m_bWasDown = false;
+    bool m_bHoldUsed = false;
     uint64_t m_yPressMs = 0;
     uint64_t m_yTapPulseUntilMs = 0;
+    uint64_t m_bPressMs = 0;
+    uint64_t m_bTapPulseUntilMs = 0;
+    uint64_t m_motionReenableAtMs = 0;
 
     /* Turn system */
     float m_snapTurnAccum = 0;
@@ -124,21 +138,35 @@ private:
     float m_weaponMountMatrix[16] = {};
     uintptr_t m_mountWeapon = 0;
     uintptr_t m_mountComponent = 0;
+    uint64_t m_mountIdentityGeneration = 0;
     bool m_weaponMountValid = false;
+    int m_weaponBarrelAxis = 0;
+    float m_weaponBarrelSign = 1.0f;
     static constexpr int kWeaponMountCacheCapacity = 16;
     WeaponMountCacheEntry m_weaponMountCache[kWeaponMountCacheCapacity] = {};
     int m_weaponMountCacheCursor = 0;
     uintptr_t m_lastDrivenWeapon = 0;
     uintptr_t m_lastDrivenComponent = 0;
     uint64_t m_lastWeaponRefreshGeneration = 0;
+    uint64_t m_pendingWeaponIdentityGeneration = 0;
+    uintptr_t m_pendingWeaponPawn = 0;
+    uintptr_t m_pendingWeapon = 0;
+    uintptr_t m_pendingWeaponComponent = 0;
+    uint64_t m_weaponIdentityStableSinceMs = 0;
     uint64_t m_nextWeaponComponentScanMs = 0;
     SRWLOCK m_weaponPoseWriteLock = SRWLOCK_INIT;
     uintptr_t m_renderWeaponComponent = 0;
     int m_renderWeaponMatrixOffset = 0;
     float m_renderWeaponMatrix[16] = {};
     bool m_renderWeaponStampActive = false;
+    uint64_t m_renderWeaponStampUpdatedMs = 0;
+    float m_weaponBarrelLocalDirection[3] = {1.0f, 0.0f, 0.0f};
+    bool m_weaponBarrelDirectionValid = false;
     std::atomic<uint64_t> m_postAnimationWeaponWrites{0};
     std::atomic<bool> m_weaponCalibrationResetRequested{false};
+    std::atomic<bool> m_nativeWeaponCalibrationResetRequested{false};
+    std::atomic<bool> m_motionControlsEnabled{true};
+    std::atomic<uint64_t> m_dotVisibleAtMs{0};
 
     /* Ballistic calibration */
     uint32_t m_aimTuningKeysDown = 0;

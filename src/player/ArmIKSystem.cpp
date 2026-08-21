@@ -577,6 +577,18 @@ Quat XrControllerToWorld(const float rotation[4], const Quat& inverseReference,
     return QuatLookAt(ueForward, ueUp);
 }
 
+Quat HandRotationAdjustment(float pitchDegrees, float yawDegrees,
+                            float rollDegrees) {
+    constexpr float kDegreesToRadians = 0.01745329251994329577f;
+    const Quat pitch = QuatFromAxisAngle(
+        {0.0f, 1.0f, 0.0f}, pitchDegrees * kDegreesToRadians);
+    const Quat yaw = QuatFromAxisAngle(
+        {0.0f, 0.0f, 1.0f}, yawDegrees * kDegreesToRadians);
+    const Quat roll = QuatFromAxisAngle(
+        {1.0f, 0.0f, 0.0f}, rollDegrees * kDegreesToRadians);
+    return QuatMultiply(QuatMultiply(yaw, pitch), roll).normalized();
+}
+
 } // namespace
 
 struct ArmIKSystem::Rig {
@@ -649,6 +661,7 @@ void ArmIKSystem::StartDiscovery() {
     m_stop = false;
     m_shuttingDown = false;
     m_calibrationResetRequested = false;
+    m_nativeCalibrationResetRequested = false;
     m_visibilityEnabled.store(
         config::Get().hide_player_body_and_arms, std::memory_order_release);
     m_inventoryRequestGeneration.fetch_add(1, std::memory_order_acq_rel);
@@ -818,6 +831,11 @@ void ArmIKSystem::RequestCalibrationReset() {
     Log("[ArmIK] Pre-motion hand pose restore requested");
 }
 
+void ArmIKSystem::RequestNativeCalibrationReset() {
+    m_nativeCalibrationResetRequested.store(true, std::memory_order_release);
+    Log("[ArmIK] Native hand calibration recapture requested");
+}
+
 void ArmIKSystem::RequestRescan() {
     AcquireSRWLockExclusive(&m_scanResetLock);
     m_scanEpoch.fetch_add(1, std::memory_order_acq_rel);
@@ -849,11 +867,8 @@ void ArmIKSystem::RequestInventoryScan() {
     m_scanEpoch.fetch_add(1, std::memory_order_acq_rel);
     m_inventoryRequestGeneration.fetch_add(1, std::memory_order_acq_rel);
     m_observedComponentsTruncated.store(0, std::memory_order_release);
-    AcquireSRWLockExclusive(&m_inventoryLock);
-    const uint64_t nextInventoryGeneration = m_inventory.generation + 1;
-    m_inventory = {};
-    m_inventory.generation = nextInventoryGeneration;
-    ReleaseSRWLockExclusive(&m_inventoryLock);
+    // Keep the last validated snapshot live until the replacement scan commits.
+    // Clearing it here creates alternating native/VR frames during async scans.
     m_scanEpoch.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&m_scanResetLock);
     Log("[VisibilityInventory] Component scan requested; writes=%s",
@@ -1483,6 +1498,14 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
         best.wristCalibrationValid[1] = m_rig->wristCalibrationValid[1];
         best.viewmodelTrackingOrigin = m_rig->viewmodelTrackingOrigin;
         best.viewmodelTrackingOriginValid = m_rig->viewmodelTrackingOriginValid;
+        memcpy(best.backup, m_rig->backup, sizeof(best.backup));
+        memcpy(best.backupBone, m_rig->backupBone, sizeof(best.backupBone));
+        best.backupValid = m_rig->backupValid;
+        best.solvedGeneration = m_rig->solvedGeneration;
+        best.cachedPoseGeneration = m_rig->cachedPoseGeneration;
+        memcpy(best.cachedPose, m_rig->cachedPose, sizeof(best.cachedPose));
+        memcpy(best.cachedPoseBone, m_rig->cachedPoseBone,
+               sizeof(best.cachedPoseBone));
         memcpy(best.cachedLocalToWorld, m_rig->cachedLocalToWorld,
                sizeof(best.cachedLocalToWorld));
         best.cachedLocalToWorldValid = m_rig->cachedLocalToWorldValid;
@@ -1491,8 +1514,8 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
     }
     best.lastPoseHash = poseHash;
     best.lastObservedUpdate = observedUpdate;
-    best.valid = best.validationObservations >= 3 &&
-        (best.validationChanges >= 1 || best.validationUpdates >= 2);
+    best.valid = best.validationObservations >= 8 &&
+        (best.validationChanges >= 4 || best.validationUpdates >= 6);
     *m_rig = best;
     ReleaseSRWLockExclusive(&m_rigLock);
     Log("[ArmIK] Rig candidate: validated=%d observations=%u changes=%u updates=%u "
@@ -1979,13 +2002,34 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
             const Vec3 localXr = RotateByQuat(inverseReference, trackingDelta);
             const float worldScale = 100.0f * config::Get().positional_scale;
             const Vec3 worldOffset = RotateYaw(XrToUe(localXr), gameYawRadians) * worldScale;
-            snapshot.position[hand] = {cameraLocation[0] + worldOffset.x,
-                cameraLocation[1] + worldOffset.y, cameraLocation[2] + worldOffset.z};
+            const auto& settings = config::Get();
+            const Vec3 localAdjustment = hand == 0
+                ? Vec3{settings.left_hand_offset_forward,
+                       settings.left_hand_offset_right,
+                       settings.left_hand_offset_up}
+                : Vec3{settings.right_hand_offset_forward,
+                       settings.right_hand_offset_right,
+                       settings.right_hand_offset_up};
+            const Vec3 worldAdjustment = RotatePitchYaw(
+                localAdjustment, gamePitchRadians, gameYawRadians);
+            snapshot.position[hand] = {
+                cameraLocation[0] + worldOffset.x + worldAdjustment.x,
+                cameraLocation[1] + worldOffset.y + worldAdjustment.y,
+                cameraLocation[2] + worldOffset.z + worldAdjustment.z};
             const float* handRotation = hand == 1 && controllers[hand].aimValid
                 ? controllers[hand].aimRotation : controllers[hand].rotation;
-            snapshot.rotation[hand] = XrControllerToWorld(
+            const Quat controllerRotation = XrControllerToWorld(
                 handRotation, inverseReference,
                 gamePitchRadians, gameYawRadians);
+            const Quat rotationAdjustment = hand == 0
+                ? HandRotationAdjustment(settings.left_hand_rotation_pitch,
+                                         settings.left_hand_rotation_yaw,
+                                         settings.left_hand_rotation_roll)
+                : HandRotationAdjustment(settings.right_hand_rotation_pitch,
+                                         settings.right_hand_rotation_yaw,
+                                         settings.right_hand_rotation_roll);
+            snapshot.rotation[hand] = QuatMultiply(
+                controllerRotation, rotationAdjustment).normalized();
             snapshot.valid[hand] = true;
         }
     }
@@ -2002,6 +2046,23 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
 
 void ArmIKSystem::SetRenderContext(uint64_t renderGeneration,
                                    uint64_t targetGeneration) {
+    if (m_nativeCalibrationResetRequested.exchange(false, std::memory_order_acq_rel)) {
+        AcquireSRWLockExclusive(&m_rigLock);
+        if (m_rig) {
+            m_rig->wristCalibration[0] = {};
+            m_rig->wristCalibration[1] = {};
+            m_rig->wristCalibrationValid[0] = false;
+            m_rig->wristCalibrationValid[1] = false;
+            m_rig->viewmodelTrackingOrigin = {};
+            m_rig->viewmodelTrackingOriginValid = false;
+            m_rig->solvedGeneration = 0;
+            m_rig->cachedPoseGeneration = 0;
+            memset(m_rig->cachedPoseBone, 0, sizeof(m_rig->cachedPoseBone));
+            m_rig->cachedLocalToWorldValid = false;
+        }
+        ReleaseSRWLockExclusive(&m_rigLock);
+        Log("[ArmIK] Native hand calibration invalidated after settle delay");
+    }
     if (m_calibrationResetRequested.exchange(false, std::memory_order_acq_rel)) {
         AcquireSRWLockExclusive(&m_rigLock);
         if (m_rig) {
@@ -2015,6 +2076,13 @@ void ArmIKSystem::SetRenderContext(uint64_t renderGeneration,
     }
     m_renderTargetGeneration.store(targetGeneration, std::memory_order_release);
     m_renderGeneration.store(renderGeneration, std::memory_order_release);
+}
+
+bool ArmIKSystem::ReapplyRenderPalette() {
+    const uint64_t renderGeneration = m_renderGeneration.load(std::memory_order_acquire);
+    const uint64_t targetGeneration = m_renderTargetGeneration.load(std::memory_order_acquire);
+    return renderGeneration != 0 && targetGeneration != 0 &&
+        Apply(renderGeneration, targetGeneration, false);
 }
 
 bool ArmIKSystem::ApplyPostAnimation(void* component) {
@@ -2142,8 +2210,10 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
             const Quat componentWorld = MatrixRotation(localToWorld);
             targetRotation = QuatMultiply(componentWorld.conjugate(),
                 targets.rotation[hand]).normalized();
-            calibrationReferenceRotation = QuatMultiply(componentWorld.conjugate(),
-                targets.cameraRotation).normalized();
+            calibrationReferenceRotation = hand == 1
+                ? QuatMultiply(componentWorld.conjugate(),
+                    targets.cameraRotation).normalized()
+                : targetRotation;
         }
         const Vec3 oldShoulder = original[shoulder].position;
         const Vec3 oldElbow = original[elbow].position;
@@ -2244,6 +2314,8 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
         }
         Quat wristCalibration = rig.wristCalibration[hand];
         if (!rig.wristCalibrationValid[hand]) {
+            // The weapon hand inherits the native camera-to-wrist basis and
+            // follows OpenXR aim/pose. The off-hand follows grip/pose.
             wristCalibration = QuatMultiply(calibrationReferenceRotation.conjugate(),
                 original[wrist].rotation).normalized();
             rig.wristCalibration[hand] = wristCalibration;

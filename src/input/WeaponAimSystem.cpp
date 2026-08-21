@@ -571,10 +571,29 @@ void __fastcall WeaponAimSystem::HookedScriptInvoke(void* object, void* frame,
     };
     float origin[3] = {};
     const bool originReadable = locals && ReadDirect(locals, origin, sizeof(origin));
-    // The projection dot represents this angular direction at infinity. Write
-    // the same direction so calibration moves the marker and projectile path
-    // together instead of converging bullets to a separate 20 m target.
-    const bool finiteTargetUsed = false;
+    bool finiteTargetUsed = false;
+    if (desiredValid && originReadable &&
+        system.m_aimTargetValid.load(std::memory_order_acquire)) {
+        const float target[3] = {
+            system.m_aimTargetX.load(std::memory_order_relaxed),
+            system.m_aimTargetY.load(std::memory_order_relaxed),
+            system.m_aimTargetZ.load(std::memory_order_relaxed)
+        };
+        const float direction[3] = {
+            target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]
+        };
+        const float horizontal = sqrtf(direction[0] * direction[0] +
+                                       direction[1] * direction[1]);
+        if (std::isfinite(horizontal) && horizontal > 1.0e-5f &&
+            std::isfinite(direction[2])) {
+            desired[0] = static_cast<int32_t>(lroundf(
+                atan2f(direction[2], horizontal) * kRadiansToUnis));
+            desired[1] = static_cast<int32_t>(lroundf(
+                atan2f(direction[1], direction[0]) * kRadiansToUnis));
+            desired[2] = 0;
+            finiteTargetUsed = true;
+        }
+    }
     bool overrideEnabled = false;
     bool resultReadable = false;
     bool written = false;
@@ -748,6 +767,13 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
     }
 
     AcquireSRWLockExclusive(&m_identityLock);
+    const bool identityChanged =
+        m_pawnIdentityValid.load(std::memory_order_acquire) != pawnValid ||
+        m_weaponIdentityValid.load(std::memory_order_acquire) != weaponValid ||
+        m_localController.load(std::memory_order_acquire) !=
+            (pawnValid ? controllerAddress : 0) ||
+        m_localPawn.load(std::memory_order_acquire) != (pawnValid ? pawn : 0) ||
+        m_localWeapon.load(std::memory_order_acquire) != (weaponValid ? weapon : 0);
     m_getAdjustedAimName.store(aimNameToken, std::memory_order_release);
     m_getAdjustedAimFunction.store(getAdjustedAim, std::memory_order_release);
     m_getAdjustedAimOwnerClass.store(aimOwner, std::memory_order_release);
@@ -760,8 +786,9 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
     m_controllerPropertyOffset = pawnValid ? controllerOffset : -1;
     m_weaponPropertyOffset = weaponOffsetsValid ? weaponOffset : -1;
     m_ownerPropertyOffset = weaponOffsetsValid ? ownerOffset : -1;
-    const uint64_t identityGeneration = m_identityGeneration.fetch_add(
-        1, std::memory_order_acq_rel) + 1;
+    const uint64_t identityGeneration = identityChanged
+        ? m_identityGeneration.fetch_add(1, std::memory_order_acq_rel) + 1
+        : m_identityGeneration.load(std::memory_order_acquire);
     ReleaseSRWLockExclusive(&m_identityLock);
 
     Log("[WeaponAim] GetAdjustedAim UFunction=%p owner=%p(%s) ownerDistance=%d "

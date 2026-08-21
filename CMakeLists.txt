@@ -38,6 +38,28 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(MinHook)
 
+# Dear ImGui for the in-game F10 tuning overlay.
+FetchContent_Declare(
+    ImGui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.91.8
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(ImGui)
+add_library(bl1gotyvr_imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp)
+target_include_directories(bl1gotyvr_imgui PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends)
+target_compile_definitions(bl1gotyvr_imgui PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+target_link_libraries(bl1gotyvr_imgui PRIVATE d3d11 imm32)
+
 # Main VR mod DLL
 add_library(BL1GOTYVR SHARED
     src/core/VRMod.cpp
@@ -59,11 +81,13 @@ add_library(BL1GOTYVR SHARED
     src/player/TwoBoneIK.cpp
     src/player/ArmIKSystem.cpp
     src/render/HudBlitter.cpp
+    src/ui/Overlay.cpp
     src/config/Config.cpp
     src/hook/MinHookWrapper.cpp)
 
 target_include_directories(BL1GOTYVR PRIVATE src include)
-target_link_libraries(BL1GOTYVR PRIVATE minhook openxr_loader d3d11 dxgi dxguid d3dcompiler gdi32)
+target_link_libraries(BL1GOTYVR PRIVATE minhook openxr_loader bl1gotyvr_imgui
+    d3d11 dxgi dxguid d3dcompiler gdi32 imm32)
 target_compile_definitions(BL1GOTYVR PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 # Automatic loader placed beside BorderlandsGOTY.exe. It forwards DXGI to

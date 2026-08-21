@@ -7,6 +7,7 @@
 #include "../xr/FrameLoop.hpp"
 #include "../config/Config.hpp"
 #include "../player/ArmIKSystem.hpp"
+#include "../ui/Overlay.hpp"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -876,6 +877,9 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
         }
         f6WasDown = f6Down;
         xr::FrameLoop::Instance().UpdateDesktopControls();
+
+        // Draw before capture so the F10 tuning panel is visible in-headset.
+        ui::OnPresent(sc);
 
         // Run frame loop (OpenXR submission)
         if (xr::OpenXRContext::Instance().IsInitialized() ||

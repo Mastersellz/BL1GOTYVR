@@ -213,4 +213,14 @@ std::uint32_t TargetResolution() {
     return s_targetResolution.load();
 }
 
+bool GetPhysicalMonitorRect(HWND window, RECT& rect) {
+    if (!window || !s_getMonitorInfoW) return false;
+    const HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = {};
+    info.cbSize = sizeof(info);
+    if (!monitor || !s_getMonitorInfoW(monitor, &info)) return false;
+    rect = info.rcMonitor;
+    return rect.right > rect.left && rect.bottom > rect.top;
+}
+
 } // namespace bl1gotyvr::display
