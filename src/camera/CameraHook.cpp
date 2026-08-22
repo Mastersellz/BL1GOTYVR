@@ -647,7 +647,7 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
             float vehicleSeat[3] = {};
             int32_t vehicleRotation[3] = {};
             bool vehicleAnchorActive = false;
-            if (simulatedPose || eye == 0) {
+            if (simulatedPose || IsVehicleCameraActive()) {
                 vehicleAnchorActive = GetVehicleSeatWorld(vehicleSeat, vehicleRotation);
                 if (vehicleAnchorActive)
                     PublishVehiclePose(vehicleSeat, vehicleRotation);
@@ -669,6 +669,21 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                     renderTicket.baseFov = config::Get().fov_degrees;
                 } else if (!renderTicket.baseCameraValid) {
                     __leave;
+                } else if (vehicleAnchorActive) {
+                    // Keep HMD tracking frozen for stereo, but follow the vehicle's
+                    // current physics transform so the second AFR eye does not lag.
+                    const float dx = vehicleSeat[0] - renderTicket.baseLocation[0];
+                    const float dy = vehicleSeat[1] - renderTicket.baseLocation[1];
+                    const float dz = vehicleSeat[2] - renderTicket.baseLocation[2];
+                    static std::atomic<uint64_t> compensationLogs{0};
+                    const uint64_t compensationCount = compensationLogs.fetch_add(
+                        1, std::memory_order_relaxed) + 1;
+                    if (compensationCount <= 3 || compensationCount % 1200 == 0) {
+                        Log("[VehicleCamera] AFR eye-1 chassis compensation: "
+                            "delta=(%.2f,%.2f,%.2f) UU", dx, dy, dz);
+                    }
+                    memcpy(renderTicket.baseLocation, vehicleSeat,
+                           sizeof(renderTicket.baseLocation));
                 }
                 memcpy(location, renderTicket.baseLocation, sizeof(renderTicket.baseLocation));
                 memcpy(rotation, renderTicket.baseRotation, sizeof(renderTicket.baseRotation));
