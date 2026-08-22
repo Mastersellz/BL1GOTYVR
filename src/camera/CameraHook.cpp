@@ -14,12 +14,17 @@
 #include <Psapi.h>
 #include <atomic>
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 
 #pragma comment(lib, "psapi.lib")
 
 namespace bl1gotyvr { namespace camera {
+
+static void ProbeLocalVehicle(const input::PlayerIdentitySnapshot& identity);
+static bool GetVehicleSeatWorld(float output[3], int32_t rotation[3]);
+static void UpdateVehicleLifecycleFast(const CameraInfo& camera);
 
 static std::atomic<bool> s_cameraFound{false};
 static std::atomic<bool> s_stereoReady{false};
@@ -40,6 +45,159 @@ static CameraInfo GetCameraSnapshot() {
     camera = s_camera;
     ReleaseSRWLockShared(&s_cameraLock);
     return camera;
+}
+
+struct CameraTArray64 {
+    uintptr_t data = 0;
+    int32_t count = 0;
+    int32_t capacity = 0;
+};
+
+static bool CameraRead(uintptr_t address, void* output, size_t size) {
+    SIZE_T bytesRead = 0;
+    return address >= 0x10000 && output && size &&
+        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
+                          output, size, &bytesRead) && bytesRead == size;
+}
+
+static bool CameraReadName(const UE3Globals& globals, int32_t index,
+                           char* output, size_t capacity) {
+    if (!globals.gNamesValid || globals.gNameStringOffset < 0 || index < 0 ||
+        !output || capacity < 2) return false;
+    CameraTArray64 names = {};
+    if (!CameraRead(globals.gNamesAddress, &names, sizeof(names)) ||
+        index >= names.count || names.count > names.capacity || !names.data) return false;
+    uintptr_t entry = 0;
+    if (!CameraRead(names.data + static_cast<uintptr_t>(index) * sizeof(uintptr_t),
+                    &entry, sizeof(entry)) || !entry) return false;
+    for (size_t offset = 0; offset + 1 < capacity; ++offset) {
+        if (!CameraRead(entry + globals.gNameStringOffset + offset,
+                        output + offset, 1)) return false;
+        if (output[offset] == '\0') return offset > 0;
+    }
+    output[capacity - 1] = '\0';
+    return false;
+}
+
+static bool CameraReadObjectName(const UE3Globals& globals, uintptr_t object,
+                                 char* output, size_t capacity) {
+    int32_t index = -1;
+    return globals.gObjectNameOffset >= 0 && object >= 0x10000 &&
+        CameraRead(object + globals.gObjectNameOffset, &index, sizeof(index)) &&
+        CameraReadName(globals, index, output, capacity);
+}
+
+static bool CameraReadClassName(const UE3Globals& globals, uintptr_t object,
+                                char* output, size_t capacity) {
+    uintptr_t classObject = 0;
+    return globals.gObjectClassOffset >= 0 && object >= 0x10000 &&
+        CameraRead(object + globals.gObjectClassOffset, &classObject,
+                   sizeof(classObject)) && classObject >= 0x10000 &&
+        CameraReadObjectName(globals, classObject, output, capacity);
+}
+
+static int CameraClassDistance(uintptr_t derivedClass, uintptr_t targetClass) {
+    uintptr_t current = derivedClass;
+    for (int depth = 0; depth < 64 && current >= 0x10000; ++depth) {
+        if (current == targetClass) return depth;
+        uintptr_t superClass = 0;
+        if (!CameraRead(current + 0x78, &superClass, sizeof(superClass)) ||
+            superClass == current) break;
+        current = superClass;
+    }
+    return -1;
+}
+
+static bool FindCameraPropertyOffset(const UE3Globals& globals, uintptr_t objectClass,
+                                     const char* propertyName, int32_t& output) {
+    CameraTArray64 objects = {};
+    if (!propertyName || objectClass < 0x10000 ||
+        !CameraRead(globals.gObjectsAddress, &objects, sizeof(objects)) ||
+        !objects.data || objects.count <= 0 || objects.count > objects.capacity) return false;
+    int bestDistance = 65;
+    int32_t bestOffset = -1;
+    for (int32_t index = 0; index < objects.count; ++index) {
+        uintptr_t object = 0;
+        char name[128] = {};
+        if (!CameraRead(objects.data + static_cast<uintptr_t>(index) * sizeof(uintptr_t),
+                        &object, sizeof(object)) || object < 0x10000 ||
+            !CameraReadObjectName(globals, object, name, sizeof(name)) ||
+            strcmp(name, propertyName) != 0) continue;
+        uintptr_t ownerClass = 0;
+        if (globals.gObjectNameOffset < 8 ||
+            !CameraRead(object + globals.gObjectNameOffset - 8, &ownerClass,
+                        sizeof(ownerClass))) continue;
+        const int distance = CameraClassDistance(objectClass, ownerClass);
+        int32_t propertyOffset = -1;
+        if (distance < 0 || distance >= bestDistance ||
+            !CameraRead(object + 0x84, &propertyOffset, sizeof(propertyOffset)) ||
+            propertyOffset <= 0 || propertyOffset > 0x10000) continue;
+        bestDistance = distance;
+        bestOffset = propertyOffset;
+    }
+    output = bestOffset;
+    return bestOffset > 0;
+}
+
+static std::atomic<uintptr_t> s_vehiclePawn{0};
+static std::atomic<uintptr_t> s_vehicleComponent{0};
+static std::atomic<int> s_vehicleSeatBone{-1};
+static std::atomic<int> s_vehicleAnchorKind{0};
+static std::atomic<int32_t> s_vehicleLocationOffset{-1};
+static std::atomic<bool> s_vehicleAnchorReady{false};
+static std::atomic<bool> s_vehicleBoneProbeComplete{false};
+static std::atomic<bool> s_vehicleArmIkWasEnabled{false};
+static std::atomic<uint64_t> s_vehicleExitRecoveryUntilMs{0};
+static std::atomic<bool> s_vehicleEnterPending{false};
+static std::atomic<bool> s_vehicleExitPending{false};
+static SRWLOCK s_vehiclePoseLock = SRWLOCK_INIT;
+static bool s_vehiclePoseValid = false;
+static float s_vehiclePoseLocation[3] = {};
+static int32_t s_vehiclePoseRotation[3] = {};
+static bool s_vehicleAnchorLocalValid = false;
+static float s_vehicleAnchorLocal[3] = {};
+
+static void ClearVehiclePose() {
+    AcquireSRWLockExclusive(&s_vehiclePoseLock);
+    s_vehiclePoseValid = false;
+    s_vehicleAnchorLocalValid = false;
+    ReleaseSRWLockExclusive(&s_vehiclePoseLock);
+}
+
+static void PublishVehicleAnchorLocal(const float local[3]) {
+    AcquireSRWLockExclusive(&s_vehiclePoseLock);
+    memcpy(s_vehicleAnchorLocal, local, sizeof(s_vehicleAnchorLocal));
+    s_vehicleAnchorLocalValid = true;
+    ReleaseSRWLockExclusive(&s_vehiclePoseLock);
+}
+
+static bool ReadVehicleAnchorLocal(float local[3]) {
+    bool valid = false;
+    AcquireSRWLockShared(&s_vehiclePoseLock);
+    valid = s_vehicleAnchorLocalValid;
+    if (valid) memcpy(local, s_vehicleAnchorLocal, sizeof(s_vehicleAnchorLocal));
+    ReleaseSRWLockShared(&s_vehiclePoseLock);
+    return valid;
+}
+
+static void PublishVehiclePose(const float location[3], const int32_t rotation[3]) {
+    AcquireSRWLockExclusive(&s_vehiclePoseLock);
+    memcpy(s_vehiclePoseLocation, location, sizeof(s_vehiclePoseLocation));
+    memcpy(s_vehiclePoseRotation, rotation, sizeof(s_vehiclePoseRotation));
+    s_vehiclePoseValid = true;
+    ReleaseSRWLockExclusive(&s_vehiclePoseLock);
+}
+
+static bool ReadVehiclePose(float location[3], int32_t rotation[3]) {
+    bool valid = false;
+    AcquireSRWLockShared(&s_vehiclePoseLock);
+    valid = s_vehiclePoseValid;
+    if (valid) {
+        memcpy(location, s_vehiclePoseLocation, sizeof(s_vehiclePoseLocation));
+        memcpy(rotation, s_vehiclePoseRotation, sizeof(s_vehiclePoseRotation));
+    }
+    ReleaseSRWLockShared(&s_vehiclePoseLock);
+    return valid;
 }
 
 static bool ControllerHasLivePawn(uintptr_t controller) {
@@ -81,6 +239,7 @@ static float s_aimBasisRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 struct PendingViewPose {
     bool active = false;
     bool xrViewsValid = false;
+    bool vehicleAnchor = false;
     int eye = 0;
     float originalLocation[3] = {};
     float headLocation[3] = {};
@@ -356,6 +515,15 @@ static void xr_to_ue(const float v[3], float out[3]) {
 }
 
 bool IsCameraFound() { return s_cameraFound && s_viewportDrawTarget != 0; }
+bool IsVehicleCameraActive() {
+    return s_vehiclePawn.load(std::memory_order_acquire) != 0;
+}
+
+static void ClearCommandPoses() {
+    AcquireSRWLockExclusive(&s_commandPoseLock);
+    for (auto& entry : s_commandPoses) entry = {};
+    ReleaseSRWLockExclusive(&s_commandPoseLock);
+}
 bool IsNativeMultiviewActive() { return s_nativeMultiviewActive.load(); }
 bool ConsumeCompletedNativeMultiviewFrame(CompletedNativeMultiviewFrame& frame) {
     bool available = false;
@@ -429,6 +597,8 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
     auto& frameLoop = xr::FrameLoop::Instance();
     auto& openXR = xr::OpenXRContext::Instance();
     const bool simulatedPose = frameLoop.IsDesktopTestMode();
+    if (simulatedPose || frameLoop.GetRenderEye() == 0)
+        UpdateVehicleLifecycleFast(camera);
     if (!camera.found || (!simulatedPose &&
         (!openXR.IsInitialized() || !s_stereoReady.load(std::memory_order_acquire)))) {
         s_originalViewportDraw(viewportClient, viewport, canvas);
@@ -474,10 +644,25 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
             }
             rotation[0] = s_gamePitchReference.load(std::memory_order_relaxed);
 
+            float vehicleSeat[3] = {};
+            int32_t vehicleRotation[3] = {};
+            bool vehicleAnchorActive = false;
+            if (simulatedPose || eye == 0) {
+                vehicleAnchorActive = GetVehicleSeatWorld(vehicleSeat, vehicleRotation);
+                if (vehicleAnchorActive)
+                    PublishVehiclePose(vehicleSeat, vehicleRotation);
+                else if (IsVehicleCameraActive())
+                    vehicleAnchorActive = ReadVehiclePose(vehicleSeat, vehicleRotation);
+            }
+            if (vehicleAnchorActive) {
+                memcpy(location, vehicleSeat, sizeof(vehicleSeat));
+            }
+
             if (!simulatedPose) {
                 if (eye == 0) {
                     renderTicket.baseCameraValid = true;
-                    memcpy(renderTicket.baseLocation, originalLocation,
+                    memcpy(renderTicket.baseLocation,
+                           vehicleAnchorActive ? vehicleSeat : originalLocation,
                            sizeof(renderTicket.baseLocation));
                     memcpy(renderTicket.baseRotation, rotation,
                            sizeof(renderTicket.baseRotation));
@@ -787,6 +972,8 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
         pendingPose = {};
         pendingPose.active = true;
         pendingPose.xrViewsValid = realPoseValid;
+        pendingPose.vehicleAnchor =
+            s_vehiclePawn.load(std::memory_order_acquire) != 0;
         pendingPose.eye = eye;
         pendingPose.pairSerial = renderTicket.pairSerial;
         memcpy(pendingPose.originalLocation, originalLocation,
@@ -1112,11 +1299,23 @@ static bool ApplyPoseToView(uintptr_t viewAddress, const PendingViewPose& pose) 
 
         float fullView[16] = {};
         memcpy(fullView, baseTranslatedView, sizeof(fullView));
+        const float* anchorOrigin = pose.vehicleAnchor
+            ? pose.headLocation : backup.origin;
         const float newOrigin[3] = {
-            backup.origin[0] + worldOffset[0],
-            backup.origin[1] + worldOffset[1],
-            backup.origin[2] + worldOffset[2]
+            anchorOrigin[0] + worldOffset[0],
+            anchorOrigin[1] + worldOffset[1],
+            anchorOrigin[2] + worldOffset[2]
         };
+        if (pose.vehicleAnchor) {
+            static std::atomic<uint64_t> vehicleViewLogs{0};
+            const uint64_t logCount = vehicleViewLogs.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (logCount <= 3 || logCount % 1200 == 0) {
+                Log("[VehicleCamera] Final FSceneView origin: game=(%.1f,%.1f,%.1f) "
+                    "driver=(%.1f,%.1f,%.1f)", backup.origin[0], backup.origin[1],
+                    backup.origin[2], newOrigin[0], newOrigin[1], newOrigin[2]);
+            }
+        }
         fullView[12] = -(newOrigin[0] * fullView[0] + newOrigin[1] * fullView[4] +
                          newOrigin[2] * fullView[8]);
         fullView[13] = -(newOrigin[0] * fullView[1] + newOrigin[1] * fullView[5] +
@@ -1612,7 +1811,8 @@ static DWORD WINAPI ScannerThread(LPVOID) {
             const DWORD moduleSize = modInfo.SizeOfImage;
             input::WeaponAimSystem::Instance().Discover(
                 &s_globals, s_camera.controllerAddress, moduleBase, moduleSize);
-            player::ArmIKSystem::Instance().RequestInventoryScan();
+            if (!s_vehiclePawn.load(std::memory_order_acquire))
+                player::ArmIKSystem::Instance().RequestInventoryScan();
             const bool commandHookInstalled = InstallRenderCommandProbes(moduleBase);
             const bool renderSceneHookInstalled = InstallRenderSceneProbe(moduleBase);
             s_stereoReady.store(
@@ -1657,9 +1857,24 @@ static DWORD WINAPI ScannerThread(LPVOID) {
     }
 
     Log("[Camera] Scanner initialization complete");
-    uint64_t nextIdentityRefreshMs = GetTickCount64() + 2000;
+    uint64_t nextIdentityRefreshMs = GetTickCount64() + 500;
     while (success && s_camera.found) {
         Sleep(250);
+        if (s_vehicleEnterPending.exchange(false, std::memory_order_acq_rel) &&
+            IsVehicleCameraActive()) {
+            const bool armIkEnabled = player::ArmIKSystem::Instance().IsEnabled();
+            s_vehicleArmIkWasEnabled.store(armIkEnabled, std::memory_order_release);
+            if (armIkEnabled) player::ArmIKSystem::Instance().SetEnabled(false);
+        }
+        if (s_vehicleExitPending.exchange(false, std::memory_order_acq_rel)) {
+            const bool restoreArmIk = s_vehicleArmIkWasEnabled.exchange(
+                false, std::memory_order_acq_rel);
+            if (restoreArmIk && input::InputHook::Instance().IsMotionControlsEnabled()) {
+                player::ArmIKSystem::Instance().SetEnabled(true);
+                player::ArmIKSystem::Instance().RequestNativeCalibrationReset();
+                input::InputHook::Instance().RequestMotionCalibrationReset();
+            }
+        }
         if (s_visibilityInventoryRefreshRequested.exchange(
                 false, std::memory_order_acq_rel)) {
             const CameraInfo current = GetCameraSnapshot();
@@ -1667,7 +1882,8 @@ static DWORD WINAPI ScannerThread(LPVOID) {
                 input::WeaponAimSystem::Instance().Discover(
                     &s_globals, current.controllerAddress,
                     reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll), modInfo.SizeOfImage);
-                player::ArmIKSystem::Instance().RequestInventoryScan();
+                if (!s_vehiclePawn.load(std::memory_order_acquire))
+                    player::ArmIKSystem::Instance().RequestInventoryScan();
             } else {
                 Log("[VisibilityInventory] Identity refresh skipped: no live controller");
             }
@@ -1678,13 +1894,18 @@ static DWORD WINAPI ScannerThread(LPVOID) {
         const CameraInfo currentCamera = GetCameraSnapshot();
         const input::PlayerIdentitySnapshot currentIdentity =
             input::WeaponAimSystem::Instance().GetPlayerIdentity();
+        if (currentIdentity.weaponValid)
+            s_vehicleExitRecoveryUntilMs.store(0, std::memory_order_release);
+        const bool vehicleExitRecovery = !currentIdentity.weaponValid &&
+            nowMs < s_vehicleExitRecoveryUntilMs.load(std::memory_order_acquire);
         const bool identityRefreshDue =
             (!ControllerHasLivePawn(currentCamera.controllerAddress) ||
              !currentIdentity.pawnValid ||
+             vehicleExitRecovery ||
              currentIdentity.controller != currentCamera.controllerAddress) &&
             nowMs >= nextIdentityRefreshMs;
         if (!cameraRefreshRequested && !identityRefreshDue) continue;
-        nextIdentityRefreshMs = nowMs + 2000;
+        nextIdentityRefreshMs = nowMs + 500;
 
         CameraInfo refreshed = {};
         if (!RefreshCameraCache(s_globals, &refreshed)) {
@@ -1694,12 +1915,13 @@ static DWORD WINAPI ScannerThread(LPVOID) {
 
         const CameraInfo previous = GetCameraSnapshot();
         if (previous.controllerAddress == refreshed.controllerAddress) {
-            if (!currentIdentity.pawnValid ||
+            if (!currentIdentity.pawnValid || vehicleExitRecovery ||
                 currentIdentity.controller != refreshed.controllerAddress) {
                 input::WeaponAimSystem::Instance().Discover(
                     &s_globals, refreshed.controllerAddress,
                     reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll), modInfo.SizeOfImage);
-                player::ArmIKSystem::Instance().RequestInventoryScan();
+                if (!s_vehiclePawn.load(std::memory_order_acquire))
+                    player::ArmIKSystem::Instance().RequestInventoryScan();
                 Log("[Camera] Runtime identity refreshed on existing controller=%p",
                     reinterpret_cast<void*>(refreshed.controllerAddress));
             }
@@ -1721,12 +1943,456 @@ s_recenterRequested.store(true, std::memory_order_release);
         input::WeaponAimSystem::Instance().Discover(
             &s_globals, refreshed.controllerAddress,
             reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll), modInfo.SizeOfImage);
-        player::ArmIKSystem::Instance().RequestRescan();
+        if (!s_vehiclePawn.load(std::memory_order_acquire))
+            player::ArmIKSystem::Instance().RequestRescan();
         Log("[Camera] Runtime camera refreshed: controller=%p -> %p; 6DoF recentered",
             reinterpret_cast<void*>(previous.controllerAddress),
             reinterpret_cast<void*>(refreshed.controllerAddress));
     }
     return 0;
+}
+
+static void UpdateVehicleLifecycleFast(const CameraInfo& camera) {
+    if (!camera.found || camera.controllerAddress < 0x10000) return;
+    uintptr_t livePawn = 0;
+    if (!CameraRead(camera.controllerAddress + 0x260, &livePawn, sizeof(livePawn)) ||
+        livePawn < 0x10000) return;
+
+    const uintptr_t activeVehicle = s_vehiclePawn.load(std::memory_order_acquire);
+    if (livePawn == activeVehicle) return;
+    const UE3Globals globals = GetUE3GlobalsSnapshot();
+    char pawnClass[128] = {};
+    if (!CameraReadClassName(globals, livePawn, pawnClass, sizeof(pawnClass))) return;
+
+    if (strstr(pawnClass, "WillowPlayerPawn") != nullptr) {
+        if (!activeVehicle) return;
+        uintptr_t vehicleController = 0;
+        if (CameraRead(activeVehicle + 0x26C, &vehicleController,
+                       sizeof(vehicleController)) &&
+            vehicleController == camera.controllerAddress)
+            return;
+        s_vehiclePawn.store(0, std::memory_order_release);
+        s_vehicleAnchorReady.store(false, std::memory_order_release);
+        s_vehicleComponent.store(0, std::memory_order_release);
+        s_vehicleSeatBone.store(-1, std::memory_order_release);
+        s_vehicleAnchorKind.store(0, std::memory_order_release);
+        s_vehicleBoneProbeComplete.store(false, std::memory_order_release);
+        ClearVehiclePose();
+        s_recenterRequested.store(true, std::memory_order_release);
+        s_gamePitchReferenceValid.store(false, std::memory_order_release);
+        s_vehicleExitRecoveryUntilMs.store(
+            GetTickCount64() + 10000, std::memory_order_release);
+        s_vehicleExitPending.store(true, std::memory_order_release);
+        AcquireSRWLockExclusive(&s_pendingViewPoseLock);
+        s_pendingViewPoses[0] = {};
+        s_pendingViewPoses[1] = {};
+        ReleaseSRWLockExclusive(&s_pendingViewPoseLock);
+        ClearCommandPoses();
+        xr::FrameLoop::Instance().AbortStereoPair();
+        Log("[VehicleCamera] Fast exit: live pawn=%p(%s)",
+            reinterpret_cast<void*>(livePawn), pawnClass);
+        return;
+    }
+    if (activeVehicle || strstr(pawnClass, "WillowVehicle_WheeledVehicle") == nullptr)
+        return;
+
+    uintptr_t component = 0;
+    if (!player::ArmIKSystem::Instance().FindObservedVehicleComponent(
+            livePawn, component)) return;
+    CameraTArray64 componentPose = {};
+    float seatMatrix[16] = {};
+    float componentMatrix[16] = {};
+    constexpr int kSteeringBone = 24;
+    if (!CameraRead(component + 0x330, &componentPose, sizeof(componentPose)) ||
+        !componentPose.data || componentPose.count != 26 ||
+        componentPose.capacity < componentPose.count ||
+        !CameraRead(componentPose.data + kSteeringBone * 0x40,
+                    seatMatrix, sizeof(seatMatrix)) ||
+        !CameraRead(component + 0xA0, componentMatrix, sizeof(componentMatrix)) ||
+        !std::isfinite(seatMatrix[12]) ||
+        fabsf(seatMatrix[15] - 1.0f) > 0.1f ||
+        fabsf(componentMatrix[15] - 1.0f) > 0.1f) return;
+
+    const float localAnchor[3] = {seatMatrix[12], seatMatrix[13], seatMatrix[14]};
+    ClearVehiclePose();
+    PublishVehicleAnchorLocal(localAnchor);
+    s_vehicleComponent.store(component, std::memory_order_release);
+    s_vehicleSeatBone.store(kSteeringBone, std::memory_order_release);
+    s_vehicleAnchorKind.store(1, std::memory_order_release);
+    s_vehicleBoneProbeComplete.store(true, std::memory_order_release);
+    s_vehicleAnchorReady.store(true, std::memory_order_release);
+    s_vehiclePawn.store(livePawn, std::memory_order_release);
+    s_recenterRequested.store(true, std::memory_order_release);
+    s_gamePitchReferenceValid.store(false, std::memory_order_release);
+    s_vehicleEnterPending.store(true, std::memory_order_release);
+    Log("[VehicleCamera] Fast entry: vehicle=%p component=%p steeringLocal=(%.1f,%.1f,%.1f)",
+        reinterpret_cast<void*>(livePawn), reinterpret_cast<void*>(component),
+        localAnchor[0], localAnchor[1], localAnchor[2]);
+}
+
+static bool GetVehicleSeatWorld(float output[3], int32_t rotation[3]) {
+    if (!output || !rotation ||
+        !s_vehicleAnchorReady.load(std::memory_order_acquire)) return false;
+    const uintptr_t pawn = s_vehiclePawn.load(std::memory_order_acquire);
+    const uintptr_t component = s_vehicleComponent.load(std::memory_order_acquire);
+    const int seatBone = s_vehicleSeatBone.load(std::memory_order_acquire);
+    const int anchorKind = s_vehicleAnchorKind.load(std::memory_order_acquire);
+    if (component < 0x10000 || seatBone < 0) {
+        float componentMatrix[16] = {};
+        if (component >= 0x10000 &&
+            CameraRead(component + 0xA0, componentMatrix, sizeof(componentMatrix)) &&
+            std::isfinite(componentMatrix[12]) &&
+            std::isfinite(componentMatrix[13]) &&
+            std::isfinite(componentMatrix[14]) &&
+            fabsf(componentMatrix[15] - 1.0f) < 0.1f) {
+            output[0] = componentMatrix[12];
+            output[1] = componentMatrix[13];
+            output[2] = componentMatrix[14] + 100.0f;
+            constexpr float kRadiansToUnis = 65536.0f / 6.2831853071795864769f;
+            const float horizontal = sqrtf(componentMatrix[0] * componentMatrix[0] +
+                                             componentMatrix[1] * componentMatrix[1]);
+            rotation[0] = static_cast<int32_t>(lroundf(
+                atan2f(componentMatrix[2], horizontal) * kRadiansToUnis));
+            rotation[1] = static_cast<int32_t>(lroundf(
+                atan2f(componentMatrix[1], componentMatrix[0]) * kRadiansToUnis));
+            rotation[2] = 0;
+            return true;
+        }
+        const int32_t locationOffset = s_vehicleLocationOffset.load(std::memory_order_acquire);
+        float location[3] = {};
+        if (pawn < 0x10000 || locationOffset <= 0 ||
+            !CameraRead(pawn + static_cast<uintptr_t>(locationOffset),
+                        location, sizeof(location)) ||
+            !std::isfinite(location[0]) || !std::isfinite(location[1]) ||
+            !std::isfinite(location[2])) return false;
+        output[0] = location[0];
+        output[1] = location[1];
+        output[2] = location[2] + 100.0f;
+        rotation[0] = s_gamePitchReference.load(std::memory_order_relaxed);
+        rotation[1] = 0;
+        rotation[2] = 0;
+        static std::atomic<uint64_t> fallbackLogs{0};
+        const uint64_t logCount = fallbackLogs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (logCount <= 3 || logCount % 1200 == 0) {
+            Log("[VehicleCamera] Vehicle-origin anchor: pawn=%p offset=0x%X "
+                "world=(%.1f,%.1f,%.1f)", reinterpret_cast<void*>(pawn),
+                locationOffset, output[0], output[1], output[2]);
+        }
+        return true;
+    }
+
+    float localToWorld[16] = {};
+    float seatPosition[3] = {};
+    if (!ReadVehicleAnchorLocal(seatPosition)) {
+        CameraTArray64 componentPose = {};
+        float seatLocal[16] = {};
+        if (!CameraRead(component + 0x330, &componentPose, sizeof(componentPose)) ||
+            !componentPose.data || componentPose.count <= seatBone ||
+            componentPose.count > componentPose.capacity || componentPose.count > 512 ||
+            !CameraRead(componentPose.data + static_cast<uintptr_t>(seatBone) * 0x40,
+                        seatLocal, sizeof(seatLocal)) ||
+            !std::isfinite(seatLocal[12]) || !std::isfinite(seatLocal[13]) ||
+            !std::isfinite(seatLocal[14]) || fabsf(seatLocal[15] - 1.0f) > 0.1f)
+            return false;
+        seatPosition[0] = seatLocal[12];
+        seatPosition[1] = seatLocal[13];
+        seatPosition[2] = seatLocal[14];
+        PublishVehicleAnchorLocal(seatPosition);
+    }
+    if (!CameraRead(component + 0xA0, localToWorld, sizeof(localToWorld))) return false;
+    if (!std::isfinite(localToWorld[12]) ||
+        !std::isfinite(localToWorld[13]) || !std::isfinite(localToWorld[14]) ||
+        fabsf(localToWorld[15] - 1.0f) > 0.1f) return false;
+
+    float world[3] = {
+        localToWorld[0] * seatPosition[0] + localToWorld[4] * seatPosition[1] +
+            localToWorld[8] * seatPosition[2] + localToWorld[12],
+        localToWorld[1] * seatPosition[0] + localToWorld[5] * seatPosition[1] +
+            localToWorld[9] * seatPosition[2] + localToWorld[13],
+        localToWorld[2] * seatPosition[0] + localToWorld[6] * seatPosition[1] +
+            localToWorld[10] * seatPosition[2] + localToWorld[14]};
+    float forward[3] = {localToWorld[0], localToWorld[1], localToWorld[2]};
+    float up[3] = {localToWorld[8], localToWorld[9], localToWorld[10]};
+    const float forwardLength = sqrtf(forward[0] * forward[0] + forward[1] * forward[1] +
+                                      forward[2] * forward[2]);
+    const float upLength = sqrtf(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+    if (!std::isfinite(forwardLength) || !std::isfinite(upLength) ||
+        forwardLength < 0.01f || upLength < 0.01f) return false;
+    for (int axis = 0; axis < 3; ++axis) {
+        forward[axis] /= forwardLength;
+        up[axis] /= upLength;
+        const float forwardOffset = anchorKind == 1 ? -40.0f : 10.0f;
+        const float upOffset = anchorKind == 1 ? 45.0f : 65.0f;
+        world[axis] += forward[axis] * forwardOffset + up[axis] * upOffset;
+    }
+    const float dx = world[0] - localToWorld[12];
+    const float dy = world[1] - localToWorld[13];
+    const float dz = world[2] - localToWorld[14];
+    const float anchorDistance = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (!std::isfinite(anchorDistance) || anchorDistance > 800.0f) return false;
+    memcpy(output, world, sizeof(world));
+    constexpr float kRadiansToUnis = 65536.0f / 6.2831853071795864769f;
+    const float horizontal = sqrtf(localToWorld[0] * localToWorld[0] +
+                                   localToWorld[1] * localToWorld[1]);
+    rotation[0] = static_cast<int32_t>(lroundf(
+        atan2f(localToWorld[2], horizontal) * kRadiansToUnis));
+    rotation[1] = static_cast<int32_t>(lroundf(
+        atan2f(localToWorld[1], localToWorld[0]) * kRadiansToUnis));
+    rotation[2] = 0;
+
+    static std::atomic<uint64_t> anchorLogs{0};
+    const uint64_t logCount = anchorLogs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (logCount <= 3 || logCount % 1200 == 0) {
+        Log("[VehicleCamera] Driver anchor: bone=%d world=(%.1f,%.1f,%.1f) "
+            "vehicle=(%.1f,%.1f,%.1f)", seatBone, world[0], world[1], world[2],
+            localToWorld[12], localToWorld[13], localToWorld[14]);
+    }
+    return true;
+}
+
+static void ProbeLocalVehicle(const input::PlayerIdentitySnapshot& identity) {
+    const UE3Globals globals = GetUE3GlobalsSnapshot();
+    if (!globals.gNamesValid || !globals.gObjectsValid ||
+        !identity.pawnValid || identity.pawn < 0x10000) return;
+
+    char pawnName[128] = {};
+    char pawnClassName[128] = {};
+    if (!CameraReadObjectName(globals, identity.pawn, pawnName, sizeof(pawnName)) ||
+        !CameraReadClassName(globals, identity.pawn, pawnClassName,
+                             sizeof(pawnClassName))) return;
+    const bool isVehicle = strstr(pawnName, "Vehicle") || strstr(pawnName, "vehicle") ||
+        strstr(pawnClassName, "Vehicle") || strstr(pawnClassName, "vehicle");
+    if (!isVehicle) {
+        const bool isVehicleWeaponPawn = strstr(pawnName, "WeaponPawn") ||
+            strstr(pawnClassName, "WeaponPawn");
+        if (isVehicleWeaponPawn) {
+            if (s_vehiclePawn.load(std::memory_order_acquire)) return;
+            const uintptr_t roots[] = {identity.pawn, identity.weapon};
+            for (uintptr_t root : roots) {
+                if (root < 0x10000) continue;
+                for (int offset = 0x80; offset <= 0x3000; offset += 8) {
+                    uintptr_t candidate = 0;
+                    char candidateClass[128] = {};
+                    if (!CameraRead(root + offset, &candidate, sizeof(candidate)) ||
+                        candidate < 0x10000 || candidate == root ||
+                        !CameraReadClassName(globals, candidate, candidateClass,
+                                             sizeof(candidateClass)) ||
+                        strstr(candidateClass, "WillowVehicle_WheeledVehicle") == nullptr)
+                        continue;
+                    char candidateName[128] = {};
+                    CameraReadObjectName(globals, candidate, candidateName,
+                                         sizeof(candidateName));
+                    Log("[VehicleCamera] WeaponPawn vehicle link: root=%p +0x%X -> "
+                        "%p(%s/%s)", reinterpret_cast<void*>(root), offset,
+                        reinterpret_cast<void*>(candidate), candidateName, candidateClass);
+                    input::PlayerIdentitySnapshot vehicleIdentity = identity;
+                    vehicleIdentity.pawn = candidate;
+                    ProbeLocalVehicle(vehicleIdentity);
+                    return;
+                }
+            }
+            const player::ComponentInventoryStatus inventory =
+                player::ArmIKSystem::Instance().GetComponentInventory();
+            const CameraInfo camera = GetCameraSnapshot();
+            uintptr_t nearestVehicle = 0;
+            float nearestDistance = FLT_MAX;
+            for (size_t index = 0; index < inventory.count; ++index) {
+                const player::ComponentInventoryEntry& entry = inventory.entries[index];
+                if (entry.component < 0x10000 || entry.outer < 0x10000 ||
+                    strstr(entry.outerName, "WillowVehicle") == nullptr ||
+                    entry.localToWorldOffset <= 0) continue;
+                char candidateClass[128] = {};
+                float matrix[16] = {};
+                float cameraLocation[3] = {};
+                if (!CameraReadClassName(globals, entry.outer, candidateClass,
+                                         sizeof(candidateClass)) ||
+                    strstr(candidateClass, "WillowVehicle_WheeledVehicle") == nullptr ||
+                    !CameraRead(entry.component + entry.localToWorldOffset,
+                                matrix, sizeof(matrix)) ||
+                    !CameraRead(camera.cameraCacheLocation, cameraLocation,
+                                sizeof(cameraLocation))) continue;
+                const float dx = matrix[12] - cameraLocation[0];
+                const float dy = matrix[13] - cameraLocation[1];
+                const float dz = matrix[14] - cameraLocation[2];
+                const float distance = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (!std::isfinite(distance) || distance >= nearestDistance) continue;
+                nearestDistance = distance;
+                nearestVehicle = entry.outer;
+            }
+            if (nearestVehicle) {
+                Log("[VehicleCamera] WeaponPawn inventory fallback: vehicle=%p "
+                    "cameraDistance=%.1f", reinterpret_cast<void*>(nearestVehicle),
+                    nearestDistance);
+                input::PlayerIdentitySnapshot vehicleIdentity = identity;
+                vehicleIdentity.pawn = nearestVehicle;
+                ProbeLocalVehicle(vehicleIdentity);
+                return;
+            }
+            static std::atomic<uint64_t> weaponPawnProbeFailures{0};
+            const uint64_t failures = weaponPawnProbeFailures.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (failures <= 3 || failures % 20 == 0)
+                Log("[VehicleCamera] WeaponPawn has no direct vehicle link (%llu)",
+                    static_cast<unsigned long long>(failures));
+            return;
+        }
+        if (s_vehiclePawn.exchange(0, std::memory_order_acq_rel)) {
+            s_vehicleAnchorReady.store(false, std::memory_order_release);
+            ClearVehiclePose();
+            s_vehicleComponent.store(0, std::memory_order_release);
+            s_vehicleSeatBone.store(-1, std::memory_order_release);
+            s_vehicleAnchorKind.store(0, std::memory_order_release);
+            s_vehicleLocationOffset.store(-1, std::memory_order_release);
+            s_vehicleBoneProbeComplete.store(false, std::memory_order_release);
+            s_recenterRequested.store(true, std::memory_order_release);
+            s_gamePitchReferenceValid.store(false, std::memory_order_release);
+            s_vehicleExitRecoveryUntilMs.store(
+                GetTickCount64() + 10000, std::memory_order_release);
+            const bool restoreArmIk = s_vehicleArmIkWasEnabled.exchange(
+                false, std::memory_order_acq_rel);
+            if (restoreArmIk && input::InputHook::Instance().IsMotionControlsEnabled()) {
+                player::ArmIKSystem::Instance().SetEnabled(true);
+                player::ArmIKSystem::Instance().RequestNativeCalibrationReset();
+                input::InputHook::Instance().RequestMotionCalibrationReset();
+            }
+            Log("[VehicleCamera] First-person vehicle mode exited");
+        }
+        return;
+    }
+    if (s_vehiclePawn.load(std::memory_order_acquire) == identity.pawn &&
+        s_vehicleBoneProbeComplete.load(std::memory_order_acquire)) return;
+    if (s_vehiclePawn.exchange(identity.pawn, std::memory_order_acq_rel) != identity.pawn) {
+        s_vehicleAnchorReady.store(false, std::memory_order_release);
+        ClearVehiclePose();
+        s_vehicleComponent.store(0, std::memory_order_release);
+        s_vehicleSeatBone.store(-1, std::memory_order_release);
+        s_vehicleAnchorKind.store(0, std::memory_order_release);
+        s_vehicleLocationOffset.store(-1, std::memory_order_release);
+        s_vehicleBoneProbeComplete.store(false, std::memory_order_release);
+        s_recenterRequested.store(true, std::memory_order_release);
+        s_gamePitchReferenceValid.store(false, std::memory_order_release);
+        const bool armIkEnabled = player::ArmIKSystem::Instance().IsEnabled();
+        s_vehicleArmIkWasEnabled.store(armIkEnabled, std::memory_order_release);
+        if (armIkEnabled) player::ArmIKSystem::Instance().SetEnabled(false);
+        const player::ComponentInventoryStatus inventory =
+            player::ArmIKSystem::Instance().GetComponentInventory();
+        for (size_t index = 0; index < inventory.count; ++index) {
+            const player::ComponentInventoryEntry& entry = inventory.entries[index];
+            if (entry.outer != identity.pawn || entry.component < 0x10000 ||
+                entry.boneCount != 26) continue;
+            float componentMatrix[16] = {};
+            const int matrixOffset = entry.localToWorldOffset > 0
+                ? entry.localToWorldOffset : 0xA0;
+            if (!CameraRead(entry.component + matrixOffset, componentMatrix,
+                            sizeof(componentMatrix)) ||
+                !std::isfinite(componentMatrix[12]) ||
+                fabsf(componentMatrix[15] - 1.0f) > 0.1f) continue;
+            s_vehicleComponent.store(entry.component, std::memory_order_release);
+            s_vehicleAnchorReady.store(true, std::memory_order_release);
+            Log("[VehicleCamera] Immediate vehicle mesh from inventory: component=%p",
+                reinterpret_cast<void*>(entry.component));
+            break;
+        }
+        Log("[VehicleCamera] Local vehicle detected: pawn=%p object=%s class=%s",
+            reinterpret_cast<void*>(identity.pawn), pawnName, pawnClassName);
+    }
+
+    for (int pointerOffset = 0x80; pointerOffset <= 0x3000; pointerOffset += 8) {
+        uintptr_t component = 0;
+        char componentClass[128] = {};
+        if (!CameraRead(identity.pawn + pointerOffset, &component, sizeof(component)) ||
+            component < 0x10000 ||
+            !CameraReadClassName(globals, component, componentClass,
+                                 sizeof(componentClass)) ||
+            strstr(componentClass, "SkeletalMeshComponent") == nullptr) continue;
+        uintptr_t outer = 0;
+        if (globals.gObjectNameOffset < 8 ||
+            !CameraRead(component + globals.gObjectNameOffset - 8, &outer, sizeof(outer)) ||
+            outer != identity.pawn) continue;
+        float componentMatrix[16] = {};
+        if (CameraRead(component + 0xA0, componentMatrix, sizeof(componentMatrix)) &&
+            std::isfinite(componentMatrix[12]) &&
+            std::isfinite(componentMatrix[13]) &&
+            std::isfinite(componentMatrix[14]) &&
+            fabsf(componentMatrix[15] - 1.0f) < 0.1f) {
+            s_vehicleComponent.store(component, std::memory_order_release);
+            s_vehicleAnchorReady.store(true, std::memory_order_release);
+        }
+
+        for (int meshOffset = 0x80; meshOffset <= 0x700; meshOffset += 4) {
+            uintptr_t mesh = 0;
+            char meshClass[128] = {};
+            if (!CameraRead(component + meshOffset, &mesh, sizeof(mesh)) ||
+                mesh < 0x10000 ||
+                !CameraReadClassName(globals, mesh, meshClass, sizeof(meshClass)) ||
+                strstr(meshClass, "SkeletalMesh") == nullptr ||
+                strstr(meshClass, "Component") != nullptr) continue;
+
+            for (int skeletonOffset = 0x40; skeletonOffset <= 0x800;
+                 skeletonOffset += 4) {
+                CameraTArray64 skeleton = {};
+                if (!CameraRead(mesh + skeletonOffset, &skeleton, sizeof(skeleton)) ||
+                    !skeleton.data || skeleton.count <= 0 || skeleton.count > 256 ||
+                    skeleton.count > skeleton.capacity || skeleton.count != 26) continue;
+                for (const int stride : {0x50, 0x58, 0x40, 0x60, 0x68}) {
+                    int steeringBone = -1;
+                    int backSeatBone = -1;
+                    bool namesValid = true;
+                    for (int bone = 0; bone < skeleton.count; ++bone) {
+                        int32_t nameIndex = -1;
+                        char boneName[64] = {};
+                        if (!CameraRead(skeleton.data +
+                                static_cast<uintptr_t>(bone) * stride,
+                                &nameIndex, sizeof(nameIndex)) ||
+                            !CameraReadName(globals, nameIndex, boneName,
+                                            sizeof(boneName))) {
+                            namesValid = false;
+                            break;
+                        }
+                        if (_stricmp(boneName, "b_wheel_steering") == 0)
+                            steeringBone = bone;
+                        else if (_stricmp(boneName, "b_back_seat") == 0)
+                            backSeatBone = bone;
+                    }
+                    if (!namesValid) continue;
+                    const int bone = steeringBone >= 0 ? steeringBone : backSeatBone;
+                    const int anchorKind = steeringBone >= 0 ? 1 : 2;
+                    if (bone < 0) continue;
+                    CameraTArray64 componentPose = {};
+                    float seatMatrix[16] = {};
+                    if (!CameraRead(component + 0x330, &componentPose,
+                                    sizeof(componentPose)) ||
+                        !componentPose.data || componentPose.count <= bone ||
+                        componentPose.count > componentPose.capacity ||
+                        !CameraRead(componentPose.data +
+                                static_cast<uintptr_t>(bone) * 0x40,
+                                seatMatrix, sizeof(seatMatrix)) ||
+                        !std::isfinite(seatMatrix[12]) ||
+                        fabsf(seatMatrix[15] - 1.0f) > 0.1f) continue;
+                    s_vehicleComponent.store(component, std::memory_order_release);
+                    s_vehicleSeatBone.store(bone, std::memory_order_release);
+                    s_vehicleAnchorKind.store(anchorKind, std::memory_order_release);
+                    s_vehicleAnchorReady.store(true, std::memory_order_release);
+                    s_vehicleBoneProbeComplete.store(true, std::memory_order_release);
+                    Log("[VehicleCamera] Driver anchor resolved: component=%p mesh=%p "
+                        "bone=%d kind=%s skeleton=+0x%X stride=0x%X poseStride=0x40",
+                        reinterpret_cast<void*>(component),
+                        reinterpret_cast<void*>(mesh), bone,
+                        anchorKind == 1 ? "steering" : "back-seat",
+                        skeletonOffset, stride);
+                    return;
+                }
+            }
+        }
+    }
+
+    static std::atomic<uint64_t> probeFailures{0};
+    const uint64_t failures = probeFailures.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (failures <= 3 || failures % 20 == 0) {
+        Log("[VehicleCamera] seat bones unavailable; using vehicle origin (%llu)",
+            static_cast<unsigned long long>(failures));
+    }
+    s_vehicleBoneProbeComplete.store(true, std::memory_order_release);
 }
 
 void StartScanner() {

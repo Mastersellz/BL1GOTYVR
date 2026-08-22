@@ -27,6 +27,9 @@ public:
         m_aimTargetValid.store(false, std::memory_order_release);
     }
     void SetFireActive(bool active) { m_fireActive.store(active, std::memory_order_release); }
+    void SetVehicleSecondaryFireActive(bool active) {
+        m_vehicleSecondaryFireActive.store(active, std::memory_order_release);
+    }
     bool IsFireActive() const { return m_fireActive.load(std::memory_order_acquire); }
     void SetBallisticOverrideEnabled(bool enabled);
     bool IsBallisticOverrideEnabled() const {
@@ -92,6 +95,7 @@ private:
     std::atomic<uint64_t> m_overrideCount{0};
     std::atomic<uintptr_t> m_pawnAimRotationAddr{0};
     std::atomic<bool> m_fireActive{false};
+    std::atomic<bool> m_vehicleSecondaryFireActive{false};
     std::atomic<uint64_t> m_nativeAimCalls{0};
     std::atomic<uint64_t> m_processEventAimCalls{0};
     std::atomic<uint64_t> m_scriptInvokeAimCalls{0};

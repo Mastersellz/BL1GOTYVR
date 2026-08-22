@@ -96,7 +96,7 @@ private:
     unsigned int m_logCounter = 0;
 
     /* Previous input state */
-    int m_prevTrigger = 0, m_prevButtonA = 0;
+    int m_prevTrigger = 0, m_prevButtonA = 0, m_prevVehicleAltFire = 0;
     int m_prevGrip = 0, m_prevW = 0, m_prevA = 0, m_prevS = 0, m_prevD = 0;
     int m_prevSprint = 0, m_prevJump = 0, m_prevMelee = 0;
     int m_prevCrouch = 0, m_prevUse = 0, m_prevReload = 0;

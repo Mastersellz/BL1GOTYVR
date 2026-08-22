@@ -535,8 +535,9 @@ void __fastcall WeaponAimSystem::HookedScriptInvoke(void* object, void* frame,
         function != 0 &&
         function == system.m_getAdjustedAimFunction.load(std::memory_order_acquire) &&
         system.m_weaponIdentityValid.load(std::memory_order_acquire) &&
-        reinterpret_cast<uintptr_t>(object) ==
-            system.m_localWeapon.load(std::memory_order_acquire);
+        (reinterpret_cast<uintptr_t>(object) ==
+            system.m_localWeapon.load(std::memory_order_acquire) ||
+         system.m_vehicleSecondaryFireActive.load(std::memory_order_acquire));
     const uint64_t identityGeneration = system.m_identityGeneration.load(
         std::memory_order_acquire);
     if (isLocalAdjustedAim) {
@@ -551,8 +552,9 @@ void __fastcall WeaponAimSystem::HookedScriptInvoke(void* object, void* frame,
         identityGeneration == system.m_identityGeneration.load(std::memory_order_acquire) &&
         function == system.m_getAdjustedAimFunction.load(std::memory_order_acquire) &&
         system.m_weaponIdentityValid.load(std::memory_order_acquire) &&
-        reinterpret_cast<uintptr_t>(object) ==
-            system.m_localWeapon.load(std::memory_order_acquire);
+        (reinterpret_cast<uintptr_t>(object) ==
+            system.m_localWeapon.load(std::memory_order_acquire) ||
+         system.m_vehicleSecondaryFireActive.load(std::memory_order_acquire));
     if (!identityStillValid) return;
     const uint64_t count = system.m_scriptInvokeAimCalls.fetch_add(
         1, std::memory_order_relaxed) + 1;
@@ -807,8 +809,9 @@ int32_t __fastcall WeaponAimSystem::HookedProcessEvent(
         functionName != 0 &&
         functionName == system.m_getAdjustedAimName.load(std::memory_order_acquire) &&
         system.m_weaponIdentityValid.load(std::memory_order_acquire) &&
-        reinterpret_cast<uintptr_t>(object) ==
-            system.m_localWeapon.load(std::memory_order_acquire);
+        (reinterpret_cast<uintptr_t>(object) ==
+            system.m_localWeapon.load(std::memory_order_acquire) ||
+         system.m_vehicleSecondaryFireActive.load(std::memory_order_acquire));
 
     const int32_t status = system.m_originalProcessEvent ?
         system.m_originalProcessEvent(object, functionName, params, result) : 0;
@@ -969,6 +972,7 @@ void WeaponAimSystem::Shutdown() {
     m_aimValid.store(false, std::memory_order_release);
     m_aimUpdatedMs.store(0, std::memory_order_release);
     m_fireActive.store(false, std::memory_order_release);
+    m_vehicleSecondaryFireActive.store(false, std::memory_order_release);
     SetBallisticOverrideEnabled(false);
     if (m_nativeAimTarget) {
         MH_DisableHook(reinterpret_cast<void*>(m_nativeAimTarget));

@@ -121,6 +121,7 @@ void InputHook::ReleaseKey(int vk) {
 
 void InputHook::ReleaseAllInput() {
     WeaponAimSystem::Instance().SetFireActive(false);
+    WeaponAimSystem::Instance().SetVehicleSecondaryFireActive(false);
     XInputBridge::Instance().ReleaseVrState();
     INPUT inputs[24] = {};
     int count = 0;
@@ -152,12 +153,13 @@ void InputHook::ReleaseAllInput() {
     m_prevDpadUp = m_prevDpadDown = m_prevDpadLeft = m_prevDpadRight = 0;
     m_prevWeaponCycle = 0;
 
-    INPUT mouse[2] = {};
+    INPUT mouse[3] = {};
     int mcount = 0;
     if (m_prevTrigger) { mouse[mcount].type=INPUT_MOUSE; mouse[mcount++].mi.dwFlags=MOUSEEVENTF_LEFTUP; }
     if (m_prevButtonA) { mouse[mcount].type=INPUT_MOUSE; mouse[mcount++].mi.dwFlags=MOUSEEVENTF_RIGHTUP; }
+    if (m_prevVehicleAltFire) { mouse[mcount].type=INPUT_MOUSE; mouse[mcount++].mi.dwFlags=MOUSEEVENTF_RIGHTUP; }
     if (mcount) SendInput(mcount, mouse, sizeof(INPUT));
-    m_prevTrigger = m_prevButtonA = 0;
+    m_prevTrigger = m_prevButtonA = m_prevVehicleAltFire = 0;
     m_leftTriggerDown = m_rightTriggerDown = false;
     m_leftGripDown = m_rightGripDown = false;
     m_yWasDown = m_yChordUsed = false;
@@ -385,7 +387,11 @@ void InputHook::UpdateState(XrTime displayTime) {
     m_leftTriggerDown = ApplyHysteresis(left.trigger, m_leftTriggerDown);
     m_leftGripDown = ApplyHysteresis(left.grip, m_leftGripDown);
     m_rightGripDown = ApplyHysteresis(right.grip, m_rightGripDown);
-    WeaponAimSystem::Instance().SetFireActive(m_rightTriggerDown);
+    const bool vehicleMode = camera::IsVehicleCameraActive();
+    const bool vehicleSecondaryFire = vehicleMode && m_rightGripDown;
+    WeaponAimSystem::Instance().SetVehicleSecondaryFireActive(vehicleSecondaryFire);
+    WeaponAimSystem::Instance().SetFireActive(
+        m_rightTriggerDown || vehicleSecondaryFire);
 
     const uint64_t now = GetTickCount64();
     uint64_t expectedDotTime = 0;
@@ -489,7 +495,7 @@ void InputHook::UpdateState(XrTime displayTime) {
     if (left.buttonX) buttons |= XINPUT_GAMEPAD_X;
     if (yTapPulse) buttons |= XINPUT_GAMEPAD_Y;
     if (m_leftGripDown) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
-    if (m_rightGripDown) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+    if (m_rightGripDown && !vehicleMode) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
     if (left.thumbstickClick && !suppressStickClicks) buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
     if ((right.thumbstickClick || physicalMeleePulse) && !suppressStickClicks)
         buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
@@ -510,6 +516,11 @@ void InputHook::UpdateState(XrTime displayTime) {
         state.buttons = buttons;
         state.active = true;
         XInputBridge::Instance().Publish(state);
+        if (vehicleSecondaryFire && !m_prevVehicleAltFire)
+            mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+        else if (!vehicleSecondaryFire && m_prevVehicleAltFire)
+            mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+        m_prevVehicleAltFire = vehicleSecondaryFire ? 1 : 0;
     } else {
         auto setKey = [&](int key, bool down, int& previous) {
             if (down && !previous) PressKey(key);
@@ -525,13 +536,13 @@ void InputHook::UpdateState(XrTime displayTime) {
         setMouse(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
             m_rightTriggerDown, m_prevTrigger);
         setMouse(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-            m_leftTriggerDown, m_prevButtonA);
+            m_leftTriggerDown || vehicleSecondaryFire, m_prevButtonA);
         setKey(VK_SPACE, right.buttonA, m_prevJump);
         setKey('C', bTapPulse, m_prevCrouch);
         setKey('E', left.buttonX, m_prevUse);
         setKey('R', left.buttonX, m_prevReload);
         setKey('F', m_leftGripDown, m_prevGrip);
-        setKey('G', m_rightGripDown, m_prevGrenade);
+        setKey('G', m_rightGripDown && !vehicleMode, m_prevGrenade);
         setKey(VK_LSHIFT, left.thumbstickClick && !suppressStickClicks, m_prevSprint);
         setKey('V', (right.thumbstickClick || physicalMeleePulse) &&
             !suppressStickClicks, m_prevMelee);

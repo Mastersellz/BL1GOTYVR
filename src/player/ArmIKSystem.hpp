@@ -98,6 +98,7 @@ public:
     void Restore();
     ArmRigStatus GetStatus() const;
     ComponentInventoryStatus GetComponentInventory() const;
+    bool FindObservedVehicleComponent(uintptr_t vehicle, uintptr_t& component) const;
 
 private:
     ArmIKSystem() = default;
@@ -113,6 +114,7 @@ private:
     void CheckVisibilityWatchdog();
     bool InstallPoseHook();
     void ObserveComponent(void* component);
+    void ObserveVehicleComponent(uintptr_t vehicle, uintptr_t component);
     bool Apply(uint64_t renderGeneration, uint64_t targetGeneration,
                bool restoreAfterRender);
 
@@ -149,6 +151,10 @@ private:
     std::array<std::atomic<uintptr_t>, 256> m_observedComponents{};
     std::array<std::atomic<uint64_t>, 256> m_observedComponentUpdates{};
     std::atomic<uint32_t> m_observedComponentsTruncated{0};
+    static constexpr size_t kObservedVehicleCapacity = 16;
+    std::array<std::atomic<uintptr_t>, kObservedVehicleCapacity> m_observedVehicles{};
+    std::array<std::atomic<uintptr_t>, kObservedVehicleCapacity>
+        m_observedVehicleComponents{};
     mutable SRWLOCK m_scanResetLock = SRWLOCK_INIT;
     mutable SRWLOCK m_cameraCacheLock = SRWLOCK_INIT;
     bool m_hasGoodCameraLocation = false;

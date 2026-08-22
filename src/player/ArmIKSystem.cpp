@@ -875,6 +875,38 @@ void ArmIKSystem::RequestInventoryScan() {
         m_visibilityEnabled.load(std::memory_order_acquire) ? "enabled" : "disabled");
 }
 
+void ArmIKSystem::ObserveVehicleComponent(uintptr_t vehicle, uintptr_t component) {
+    if (vehicle < 0x10000 || component < 0x10000) return;
+    for (size_t index = 0; index < kObservedVehicleCapacity; ++index) {
+        if (m_observedVehicles[index].load(std::memory_order_acquire) == vehicle) {
+            m_observedVehicleComponents[index].store(component, std::memory_order_release);
+            return;
+        }
+    }
+    for (size_t index = 0; index < kObservedVehicleCapacity; ++index) {
+        uintptr_t expected = 0;
+        if (m_observedVehicles[index].compare_exchange_strong(
+                expected, vehicle, std::memory_order_acq_rel)) {
+            m_observedVehicleComponents[index].store(component, std::memory_order_release);
+            return;
+        }
+    }
+    const size_t replacement = (vehicle >> 4) % kObservedVehicleCapacity;
+    m_observedVehicleComponents[replacement].store(component, std::memory_order_release);
+    m_observedVehicles[replacement].store(vehicle, std::memory_order_release);
+}
+
+bool ArmIKSystem::FindObservedVehicleComponent(uintptr_t vehicle,
+                                                uintptr_t& component) const {
+    component = 0;
+    for (size_t index = 0; index < kObservedVehicleCapacity; ++index) {
+        if (m_observedVehicles[index].load(std::memory_order_acquire) != vehicle) continue;
+        component = m_observedVehicleComponents[index].load(std::memory_order_acquire);
+        return component >= 0x10000;
+    }
+    return false;
+}
+
 DWORD WINAPI ArmIKSystem::DiscoveryThreadProc(void* context) {
     static_cast<ArmIKSystem*>(context)->DiscoveryLoop();
     return 0;
@@ -1019,6 +1051,9 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
             componentPose.average < localPose.average * 1.2f ||
             componentPose.average - localPose.average < 5.0f) continue;
         ++posePairs;
+        if (outer >= 0x10000 && componentPose.array.count == 26 &&
+            strstr(outerName, "WillowVehicle") != nullptr)
+            ObserveVehicleComponent(outer, component);
         const bool genericSkeletalActor = Lower(outerName).find("skeletalmeshactor") !=
             std::string::npos;
         if (!objectIsViewmodel && !outerIsViewmodel && !genericSkeletalActor) {
