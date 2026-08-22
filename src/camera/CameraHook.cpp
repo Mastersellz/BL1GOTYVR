@@ -576,8 +576,7 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                         armCameraLocation, gamePitch, gameYaw, s_poseReferencePosition,
                         s_poseReferenceRotation);
             }
-            if (renderTicket.rightAimValid &&
-                input::InputHook::Instance().IsMotionControlsEnabled()) {
+            if (renderTicket.rightAimValid) {
                 if (!s_aimBasisValid) {
                     memcpy(s_aimBasisRotation, s_poseReferenceRotation,
                            sizeof(s_aimBasisRotation));
@@ -749,9 +748,13 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                         yawCosine * pitchedRayOffset[1],
                     armCameraLocation[2] + pitchedRayOffset[2]
                 };
-                input::InputHook::Instance().SetCanonicalWeaponPose(
-                    worldWeaponPosition, weaponForward, weaponUp,
-                    armCameraLocation, nativeCameraForward, nativeCameraUp);
+                if (input::InputHook::Instance().IsMotionControlsEnabled()) {
+                    input::InputHook::Instance().SetCanonicalWeaponPose(
+                        worldWeaponPosition, weaponForward, weaponUp,
+                        armCameraLocation, nativeCameraForward, nativeCameraUp);
+                } else {
+                    input::InputHook::Instance().ClearCanonicalWeaponPose();
+                }
                 input::WeaponAimSystem::Instance().UpdateDirection(
                     worldAimOrigin, worldForward);
             } else {

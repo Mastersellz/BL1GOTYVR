@@ -8,6 +8,7 @@
 #include "../config/Config.hpp"
 #include "../player/ArmIKSystem.hpp"
 #include "../ui/Overlay.hpp"
+#include "../xr/OpenXRContext.hpp"
 #include <windows.h>
 #include <cmath>
 #include <cstring>
@@ -24,6 +25,22 @@ InputHook& InputHook::Instance() {
 static bool ApplyHysteresis(float value, bool wasDown) {
     if (wasDown) return value > 0.45f;
     return value >= 0.55f;
+}
+
+static void RotateMeleeVector(const float quaternion[4], const float vector[3],
+                              float output[3]) {
+    const float tx = 2.0f * (quaternion[1] * vector[2] -
+        quaternion[2] * vector[1]);
+    const float ty = 2.0f * (quaternion[2] * vector[0] -
+        quaternion[0] * vector[2]);
+    const float tz = 2.0f * (quaternion[0] * vector[1] -
+        quaternion[1] * vector[0]);
+    output[0] = vector[0] + quaternion[3] * tx +
+        (quaternion[1] * tz - quaternion[2] * ty);
+    output[1] = vector[1] + quaternion[3] * ty +
+        (quaternion[2] * tx - quaternion[0] * tz);
+    output[2] = vector[2] + quaternion[3] * tz +
+        (quaternion[0] * ty - quaternion[1] * tx);
 }
 
 void InputHook::Install() {
@@ -149,10 +166,133 @@ void InputHook::ReleaseAllInput() {
     m_yPressMs = m_yTapPulseUntilMs = 0;
     m_bPressMs = m_bTapPulseUntilMs = 0;
     m_snapTurnAccum = 0;
+    ResetPhysicalMelee();
     if (m_outputLive) {
         Log("[Input] Output neutralized (focus, tracking, or action sync unavailable)");
         m_outputLive = false;
     }
+}
+
+void InputHook::ResetPhysicalMelee() {
+    memset(m_meleePreviousTip, 0, sizeof(m_meleePreviousTip));
+    m_meleeFilteredSpeed = 0.0f;
+    m_meleeTravel = 0.0f;
+    m_meleePreviousSampleMs = 0;
+    m_meleeBelowThresholdSinceMs = 0;
+    m_physicalMeleePulseUntilMs = 0;
+    m_physicalMeleeCooldownUntilMs = 0;
+    m_meleeTipValid = false;
+    m_physicalMeleeReady = true;
+}
+
+bool InputHook::UpdatePhysicalMelee(const ControllerState& left, uint64_t nowMs) {
+    if (!left.aimValid ||
+        !m_motionControlsEnabled.load(std::memory_order_acquire)) {
+        ResetPhysicalMelee();
+        return false;
+    }
+
+    float headPosition[3] = {};
+    float headRotation[4] = {};
+    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    if (!xr::OpenXRContext::Instance().GetPoseSnapshot(
+            headPosition, headRotation, views)) {
+        ResetPhysicalMelee();
+        return false;
+    }
+
+    constexpr float kLocalForward[3] = {0.0f, 0.0f, -1.0f};
+    float controllerForward[3] = {};
+    float headForward[3] = {};
+    RotateMeleeVector(left.aimRotation, kLocalForward, controllerForward);
+    RotateMeleeVector(headRotation, kLocalForward, headForward);
+    constexpr float kWeaponLengthMeters = 0.45f;
+    float tip[3] = {
+        left.aimPosition[0] + controllerForward[0] * kWeaponLengthMeters,
+        left.aimPosition[1] + controllerForward[1] * kWeaponLengthMeters,
+        left.aimPosition[2] + controllerForward[2] * kWeaponLengthMeters};
+    const float headToController[3] = {
+        left.aimPosition[0] - headPosition[0],
+        left.aimPosition[1] - headPosition[1],
+        left.aimPosition[2] - headPosition[2]};
+    const float frontDistance = headToController[0] * headForward[0] +
+        headToController[1] * headForward[1] +
+        headToController[2] * headForward[2];
+    const float controllerDistanceSq =
+        headToController[0] * headToController[0] +
+        headToController[1] * headToController[1] +
+        headToController[2] * headToController[2];
+    if (!std::isfinite(tip[0]) || !std::isfinite(tip[1]) ||
+        !std::isfinite(tip[2]) || !std::isfinite(frontDistance) ||
+        !std::isfinite(controllerDistanceSq)) {
+        ResetPhysicalMelee();
+        return false;
+    }
+
+    auto seedTip = [&]() {
+        memcpy(m_meleePreviousTip, tip, sizeof(m_meleePreviousTip));
+        m_meleePreviousSampleMs = nowMs;
+        m_meleeTipValid = true;
+    };
+    const bool inFront = frontDistance >= 0.08f && controllerDistanceSq <= 2.25f;
+    if (!inFront) {
+        seedTip();
+        m_meleeFilteredSpeed = 0.0f;
+        m_meleeTravel = 0.0f;
+        m_meleeBelowThresholdSinceMs = nowMs;
+        if (!m_physicalMeleeReady && nowMs >= m_physicalMeleeCooldownUntilMs)
+            m_physicalMeleeReady = true;
+        return nowMs < m_physicalMeleePulseUntilMs;
+    }
+    if (!m_meleeTipValid || !m_meleePreviousSampleMs) {
+        seedTip();
+        return false;
+    }
+
+    const uint64_t elapsedMs = nowMs - m_meleePreviousSampleMs;
+    const float delta[3] = {
+        tip[0] - m_meleePreviousTip[0], tip[1] - m_meleePreviousTip[1],
+        tip[2] - m_meleePreviousTip[2]};
+    const float distance = sqrtf(delta[0] * delta[0] + delta[1] * delta[1] +
+                                 delta[2] * delta[2]);
+    if (elapsedMs < 2 || elapsedMs > 100 || !std::isfinite(distance) ||
+        distance > 0.80f) {
+        seedTip();
+        m_meleeFilteredSpeed = 0.0f;
+        m_meleeTravel = 0.0f;
+        return nowMs < m_physicalMeleePulseUntilMs;
+    }
+    seedTip();
+
+    const float speed = distance * 1000.0f / static_cast<float>(elapsedMs);
+    m_meleeFilteredSpeed += (speed - m_meleeFilteredSpeed) * 0.45f;
+    constexpr float kRearmSpeedMps = 0.65f;
+    if (m_meleeFilteredSpeed <= kRearmSpeedMps) {
+        m_meleeTravel = 0.0f;
+        if (!m_meleeBelowThresholdSinceMs) m_meleeBelowThresholdSinceMs = nowMs;
+        if (!m_physicalMeleeReady && nowMs >= m_physicalMeleeCooldownUntilMs &&
+            nowMs - m_meleeBelowThresholdSinceMs >= 120) {
+            m_physicalMeleeReady = true;
+        }
+    } else {
+        m_meleeBelowThresholdSinceMs = 0;
+        if (m_physicalMeleeReady) m_meleeTravel += distance;
+    }
+
+    constexpr float kTriggerSpeedMps = 1.75f;
+    constexpr float kTriggerTravelMeters = 0.10f;
+    if (m_physicalMeleeReady && nowMs >= m_physicalMeleeCooldownUntilMs &&
+        m_meleeFilteredSpeed >= kTriggerSpeedMps &&
+        m_meleeTravel >= kTriggerTravelMeters) {
+        const float measuredTravel = m_meleeTravel;
+        m_physicalMeleeReady = false;
+        m_meleeTravel = 0.0f;
+        m_physicalMeleePulseUntilMs = nowMs + 90;
+        m_physicalMeleeCooldownUntilMs = nowMs + 500;
+        Log("[Input] Left-arm VR melee triggered: speed=%.2fm/s travel=%.3fm front=%.2fm",
+            m_meleeFilteredSpeed, measuredTravel, frontDistance);
+    }
+    return nowMs < m_physicalMeleePulseUntilMs;
 }
 
 void InputHook::ProcessTurn() {
@@ -248,6 +388,14 @@ void InputHook::UpdateState(XrTime displayTime) {
     WeaponAimSystem::Instance().SetFireActive(m_rightTriggerDown);
 
     const uint64_t now = GetTickCount64();
+    uint64_t expectedDotTime = 0;
+    if (right.aimValid && m_motionControlsEnabled.load(std::memory_order_acquire) &&
+        m_dotVisibleAtMs.compare_exchange_strong(
+            expectedDotTime, now + 3000,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        Log("[Input] Aim dot scheduled from tracked right controller");
+    }
+    const bool physicalMeleePulse = UpdatePhysicalMelee(left, now);
     if (m_motionReenableAtMs && now >= m_motionReenableAtMs) {
         m_motionReenableAtMs = 0;
         player::ArmIKSystem::Instance().RequestNativeCalibrationReset();
@@ -343,7 +491,8 @@ void InputHook::UpdateState(XrTime displayTime) {
     if (m_leftGripDown) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
     if (m_rightGripDown) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
     if (left.thumbstickClick && !suppressStickClicks) buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
-    if (right.thumbstickClick && !suppressStickClicks) buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+    if ((right.thumbstickClick || physicalMeleePulse) && !suppressStickClicks)
+        buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
     if (left.menuButton) buttons |= XINPUT_GAMEPAD_START;
     if (echoHeld) buttons |= XINPUT_GAMEPAD_BACK;
 
@@ -384,7 +533,8 @@ void InputHook::UpdateState(XrTime displayTime) {
         setKey('F', m_leftGripDown, m_prevGrip);
         setKey('G', m_rightGripDown, m_prevGrenade);
         setKey(VK_LSHIFT, left.thumbstickClick && !suppressStickClicks, m_prevSprint);
-        setKey('V', right.thumbstickClick && !suppressStickClicks, m_prevMelee);
+        setKey('V', (right.thumbstickClick || physicalMeleePulse) &&
+            !suppressStickClicks, m_prevMelee);
         setKey(VK_ESCAPE, left.menuButton, m_prevMenu);
         setKey(VK_TAB, echoHeld, m_prevEcho);
         setKey('1', (chordDirection & XINPUT_GAMEPAD_DPAD_UP) != 0, m_prevDpadUp);
@@ -541,8 +691,7 @@ void InputHook::RequestMotionCalibrationReset() {
 bool InputHook::IsAimDotVisible() const {
     const uint64_t visibleAt = m_dotVisibleAtMs.load(std::memory_order_acquire);
     return visibleAt != 0 && GetTickCount64() >= visibleAt &&
-        m_motionControlsEnabled.load(std::memory_order_acquire) &&
-        m_weaponPoseActive.load(std::memory_order_acquire);
+        m_motionControlsEnabled.load(std::memory_order_acquire);
 }
 
 bool InputHook::GetWeaponBarrelLocalDirection(float direction[3]) {

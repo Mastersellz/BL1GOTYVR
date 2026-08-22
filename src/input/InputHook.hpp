@@ -7,6 +7,8 @@
 
 namespace bl1gotyvr { namespace input {
 
+struct ControllerState;
+
 struct WeaponComponent {
     uintptr_t address = 0;
     int matrixOffset = 0;
@@ -77,6 +79,8 @@ private:
 
     void ProcessTurn();
     void PollAimTuningKeys();
+    bool UpdatePhysicalMelee(const ControllerState& left, uint64_t nowMs);
+    void ResetPhysicalMelee();
     void ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
                                   const char* outerName, const char* meshName,
                                   uintptr_t component);
@@ -116,6 +120,17 @@ private:
     uint64_t m_bPressMs = 0;
     uint64_t m_bTapPulseUntilMs = 0;
     uint64_t m_motionReenableAtMs = 0;
+
+    /* Physical melee swing detector */
+    float m_meleePreviousTip[3] = {};
+    float m_meleeFilteredSpeed = 0.0f;
+    float m_meleeTravel = 0.0f;
+    uint64_t m_meleePreviousSampleMs = 0;
+    uint64_t m_meleeBelowThresholdSinceMs = 0;
+    uint64_t m_physicalMeleePulseUntilMs = 0;
+    uint64_t m_physicalMeleeCooldownUntilMs = 0;
+    bool m_meleeTipValid = false;
+    bool m_physicalMeleeReady = true;
 
     /* Turn system */
     float m_snapTurnAccum = 0;
