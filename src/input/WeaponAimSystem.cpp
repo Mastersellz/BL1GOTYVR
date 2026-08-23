@@ -968,6 +968,81 @@ PlayerIdentitySnapshot WeaponAimSystem::GetPlayerIdentity() {
     return snapshot;
 }
 
+bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_t pawn) {
+    if (controller < 0x10000 || pawn < 0x10000) return false;
+    int32_t pawnOffset = -1;
+    int32_t controllerOffset = -1;
+    int32_t weaponOffset = -1;
+    int32_t ownerOffset = -1;
+    AcquireSRWLockShared(&m_identityLock);
+    pawnOffset = m_pawnPropertyOffset;
+    controllerOffset = m_controllerPropertyOffset;
+    weaponOffset = m_weaponPropertyOffset;
+    ownerOffset = m_ownerPropertyOffset;
+    ReleaseSRWLockShared(&m_identityLock);
+    if (pawnOffset <= 0 || controllerOffset <= 0 || weaponOffset <= 0 || ownerOffset <= 0)
+        return false;
+
+    uintptr_t publishedPawn = 0;
+    uintptr_t publishedController = 0;
+    uintptr_t weapon = 0;
+    uintptr_t owner = 0;
+    if (!ReadMem(controller + static_cast<uintptr_t>(pawnOffset),
+                 &publishedPawn, sizeof(publishedPawn)) || publishedPawn != pawn ||
+        !ReadMem(pawn + static_cast<uintptr_t>(controllerOffset),
+                 &publishedController, sizeof(publishedController)) ||
+        publishedController != controller ||
+        !ReadMem(pawn + static_cast<uintptr_t>(weaponOffset), &weapon, sizeof(weapon)) ||
+        weapon < 0x10000 ||
+        !ReadMem(weapon + static_cast<uintptr_t>(ownerOffset), &owner, sizeof(owner)) ||
+        owner != pawn) return false;
+
+    const camera::UE3Globals globals = camera::GetUE3GlobalsSnapshot();
+    TArray64 names = {};
+    uintptr_t weaponClass = 0;
+    char weaponName[128] = {};
+    char weaponClassName[128] = {};
+    if (!globals.gNamesValid ||
+        !ReadMem(globals.gNamesAddress, &names, sizeof(names)) ||
+        !ValidateRuntimeObject(globals, names, weapon, "Weapon", weaponClass,
+                               weaponName, sizeof(weaponName), weaponClassName,
+                               sizeof(weaponClassName))) return false;
+
+    bool changed = false;
+    const uintptr_t selectedAimFunction =
+        m_getAdjustedAimFunction.load(std::memory_order_acquire);
+    const uintptr_t selectedAimOwner =
+        m_getAdjustedAimOwnerClass.load(std::memory_order_acquire);
+    const bool selectedAimCompatible = selectedAimFunction == 0 ||
+        ClassDistance(weaponClass, selectedAimOwner) >= 0;
+    AcquireSRWLockExclusive(&m_identityLock);
+    changed = m_localController.load(std::memory_order_acquire) != controller ||
+        m_localPawn.load(std::memory_order_acquire) != pawn ||
+        m_localWeapon.load(std::memory_order_acquire) != weapon ||
+        !m_pawnIdentityValid.load(std::memory_order_acquire) ||
+        !m_weaponIdentityValid.load(std::memory_order_acquire);
+    m_localController.store(controller, std::memory_order_release);
+    m_localPawn.store(pawn, std::memory_order_release);
+    m_localWeapon.store(weapon, std::memory_order_release);
+    m_pawnIdentityValid.store(true, std::memory_order_release);
+    m_weaponIdentityValid.store(true, std::memory_order_release);
+    if (changed) m_identityGeneration.fetch_add(1, std::memory_order_acq_rel);
+    if (changed) m_scriptInvokeAimCalls.store(0, std::memory_order_release);
+    if (!selectedAimCompatible) {
+        m_getAdjustedAimName.store(0, std::memory_order_release);
+        m_getAdjustedAimFunction.store(0, std::memory_order_release);
+        m_getAdjustedAimOwnerClass.store(0, std::memory_order_release);
+    }
+    const uint64_t generation = m_identityGeneration.load(std::memory_order_acquire);
+    ReleaseSRWLockExclusive(&m_identityLock);
+    Log("[WeaponAim] Fast foot identity restored: controller=%p pawn=%p weapon=%p(%s/%s) "
+        "generation=%llu aimCompatible=%d", reinterpret_cast<void*>(controller),
+        reinterpret_cast<void*>(pawn), reinterpret_cast<void*>(weapon), weaponName,
+        weaponClassName, static_cast<unsigned long long>(generation),
+        selectedAimCompatible);
+    return true;
+}
+
 void WeaponAimSystem::Shutdown() {
     m_aimValid.store(false, std::memory_order_release);
     m_aimUpdatedMs.store(0, std::memory_order_release);

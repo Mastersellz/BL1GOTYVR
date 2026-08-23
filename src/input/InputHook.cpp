@@ -890,6 +890,15 @@ void InputHook::ApplyRightHand(int eye) {
         m_weaponPoseActive.store(false, std::memory_order_release);
         return;
     }
+    if (camera::IsVehicleCameraActive()) {
+        AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
+        m_renderWeaponStampActive = false;
+        m_renderWeaponComponent = 0;
+        m_renderWeaponMatrixOffset = 0;
+        ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
+        m_weaponPoseActive.store(false, std::memory_order_release);
+        return;
+    }
     if (m_weaponCalibrationResetRequested.exchange(false, std::memory_order_acq_rel)) {
         m_weaponMountValid = false;
         m_mountWeapon = 0;

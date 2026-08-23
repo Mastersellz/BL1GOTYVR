@@ -2371,9 +2371,11 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
 
         ID3D11Texture2D* bakedHud = hudSeparated && bakeHud
             ? m_hudExtractionTexture : nullptr;
-        ID3D11Texture2D* leftProjection = hudSeparated
+        const bool vehicleWorldSnapshot = worldPairMatches &&
+            camera::IsVehicleCameraActive();
+        ID3D11Texture2D* leftProjection = (hudSeparated || vehicleWorldSnapshot)
             ? m_worldBeforeHudTextures[leftSource] : m_eyeTextures[leftSource];
-        ID3D11Texture2D* rightProjection = hudSeparated
+        ID3D11Texture2D* rightProjection = (hudSeparated || vehicleWorldSnapshot)
             ? m_worldBeforeHudTextures[rightSource] : m_eyeTextures[rightSource];
         leftOk = leftProjection &&
             CopyTextureToEye(context, leftProjection, 0, false, leftSource, bakedHud);
