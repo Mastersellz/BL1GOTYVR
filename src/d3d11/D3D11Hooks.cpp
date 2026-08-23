@@ -39,6 +39,12 @@ using PSSetShaderResourcesFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UI
                                                           ID3D11ShaderResourceView* const*);
 using IASetIndexBufferFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*,
                                                      DXGI_FORMAT, UINT);
+using CreateDeviceFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
+    const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**, D3D_FEATURE_LEVEL*,
+    ID3D11DeviceContext**);
+using CreateDeviceAndSwapChainFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE,
+    HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT, const DXGI_SWAP_CHAIN_DESC*,
+    IDXGISwapChain**, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
 
 static PresentFn       oPresent = nullptr;
 static ResizeBuffersFn oResizeBuffers = nullptr;
@@ -47,6 +53,39 @@ static ResolveSubresourceFn oResolveSubresource = nullptr;
 static OMSetRenderTargetsFn oOMSetRenderTargets = nullptr;
 static PSSetShaderResourcesFn oPSSetShaderResources = nullptr;
 static IASetIndexBufferFn oIASetIndexBuffer = nullptr;
+static CreateDeviceFn oCreateDevice = nullptr;
+static CreateDeviceAndSwapChainFn oCreateDeviceAndSwapChain = nullptr;
+static std::atomic<bool> s_deviceCompatibilityInstalled{false};
+
+static UINT SteamVrCompatibleDeviceFlags(UINT flags) {
+    if (!xr::IsSteamRuntimeSelected()) return flags;
+    const UINT compatible = flags & ~D3D11_CREATE_DEVICE_SINGLETHREADED;
+    if (compatible != flags) {
+        Log("[SteamVR] Removed D3D11_CREATE_DEVICE_SINGLETHREADED from game device");
+    }
+    return compatible;
+}
+
+static HRESULT WINAPI HookedCreateDevice(IDXGIAdapter* adapter,
+    D3D_DRIVER_TYPE driverType, HMODULE software, UINT flags,
+    const D3D_FEATURE_LEVEL* featureLevels, UINT featureLevelCount, UINT sdkVersion,
+    ID3D11Device** device, D3D_FEATURE_LEVEL* selectedFeatureLevel,
+    ID3D11DeviceContext** immediateContext) {
+    return oCreateDevice(adapter, driverType, software, SteamVrCompatibleDeviceFlags(flags),
+        featureLevels, featureLevelCount, sdkVersion, device, selectedFeatureLevel,
+        immediateContext);
+}
+
+static HRESULT WINAPI HookedCreateDeviceAndSwapChain(IDXGIAdapter* adapter,
+    D3D_DRIVER_TYPE driverType, HMODULE software, UINT flags,
+    const D3D_FEATURE_LEVEL* featureLevels, UINT featureLevelCount, UINT sdkVersion,
+    const DXGI_SWAP_CHAIN_DESC* swapChainDesc, IDXGISwapChain** swapChain,
+    ID3D11Device** device, D3D_FEATURE_LEVEL* selectedFeatureLevel,
+    ID3D11DeviceContext** immediateContext) {
+    return oCreateDeviceAndSwapChain(adapter, driverType, software,
+        SteamVrCompatibleDeviceFlags(flags), featureLevels, featureLevelCount, sdkVersion,
+        swapChainDesc, swapChain, device, selectedFeatureLevel, immediateContext);
+}
 
 static ID3D11Device*        s_gameDevice = nullptr;
 static ID3D11DeviceContext*  s_gameContext = nullptr;
@@ -841,12 +880,21 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
         }
         EnsureHandOnlyIndexBuffer(s_gameDevice);
 
+        auto& openXR = xr::OpenXRContext::Instance();
+        if (openXR.NeedsRecovery()) {
+            if (xr::FrameLoop::Instance().PrepareForOpenXRRecovery()) {
+                openXR.Shutdown();
+                s_lastOpenXrAttempt = 0;
+                Log("[BL1GOTYVR] OpenXR session reset; initialization will retry");
+            }
+        }
+
         // Initialize OpenXR on the first frame, then retry periodically so a
         // missing runtime does not stall and spam every Present.
         const bool openXrRetryDue = s_lastOpenXrAttempt == 0 ||
             g_frameCount.load() - s_lastOpenXrAttempt >= 300;
         if (!forceDesktopTest && s_gameDevice &&
-            !xr::OpenXRContext::Instance().IsInitialized() && openXrRetryDue) {
+            !openXR.IsInitialized() && openXrRetryDue) {
             s_lastOpenXrAttempt = g_frameCount.load();
             Log("[BL1GOTYVR] Attempting OpenXR init...");
             // Get backbuffer format
@@ -859,12 +907,10 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
                 bb->GetDesc(&desc);
                 bb->Release();
 
-                if (xr::OpenXRContext::Instance().Initialize(s_gameDevice, desc.Format)) {
+                if (openXR.Initialize(s_gameDevice, desc.Format)) {
                     Log("[BL1GOTYVR] OpenXR initialized (fmt=%u)", (uint32_t)desc.Format);
                 } else {
                     Log("[BL1GOTYVR] OpenXR init failed; retrying in 300 frames");
-                    if (!xr::FrameLoop::Instance().IsDesktopTestMode())
-                        xr::FrameLoop::Instance().ToggleDesktopTestMode();
                 }
             }
         }
@@ -882,7 +928,7 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
         ui::OnPresent(sc);
 
         // Run frame loop (OpenXR submission)
-        if (xr::OpenXRContext::Instance().IsInitialized() ||
+        if ((openXR.IsInitialized() && !openXR.NeedsRecovery()) ||
             xr::FrameLoop::Instance().IsDesktopTestMode()) {
             xr::FrameLoop::Instance().OnPresent(s_gameDevice, s_gameContext, sc);
         }
@@ -922,6 +968,58 @@ static HRESULT WINAPI HookedResizeBuffers(IDXGISwapChain* sc, UINT bufferCount, 
         Log("[BL1GOTYVR] Exception in ResizeBuffers hook: 0x%08X", GetExceptionCode());
     }
     return oResizeBuffers(sc, bufferCount, width, height, newFormat, swapChainFlags);
+}
+
+bool InstallSteamVrDeviceCompatibility() {
+    if (!xr::IsSteamRuntimeSelected()) {
+        Log("[SteamVR] Early D3D11 compatibility hook not needed for selected runtime");
+        return true;
+    }
+    bool expected = false;
+    if (!s_deviceCompatibilityInstalled.compare_exchange_strong(expected, true)) return true;
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+        s_deviceCompatibilityInstalled = false;
+        return false;
+    }
+    HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll");
+    if (!d3d11) d3d11 = LoadLibraryW(L"d3d11.dll");
+    void* createDevice = d3d11
+        ? reinterpret_cast<void*>(GetProcAddress(d3d11, "D3D11CreateDevice")) : nullptr;
+    void* createDeviceAndSwapChain = d3d11
+        ? reinterpret_cast<void*>(GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain")) : nullptr;
+    bool createDeviceHookCreated = false;
+    bool createSwapChainHookCreated = false;
+    if (createDevice && createDeviceAndSwapChain) {
+        createDeviceHookCreated = MH_CreateHook(createDevice, &HookedCreateDevice,
+            reinterpret_cast<void**>(&oCreateDevice)) == MH_OK;
+        if (createDeviceHookCreated) {
+            createSwapChainHookCreated = MH_CreateHook(createDeviceAndSwapChain,
+                &HookedCreateDeviceAndSwapChain,
+                reinterpret_cast<void**>(&oCreateDeviceAndSwapChain)) == MH_OK;
+        }
+    }
+    const bool createDeviceHookEnabled = createDeviceHookCreated &&
+        MH_EnableHook(createDevice) == MH_OK;
+    const bool createSwapChainHookEnabled = createSwapChainHookCreated &&
+        MH_EnableHook(createDeviceAndSwapChain) == MH_OK;
+    if (!createDeviceHookEnabled || !createSwapChainHookEnabled) {
+        if (createDeviceHookCreated) {
+            MH_DisableHook(createDevice);
+            MH_RemoveHook(createDevice);
+        }
+        if (createSwapChainHookCreated) {
+            MH_DisableHook(createDeviceAndSwapChain);
+            MH_RemoveHook(createDeviceAndSwapChain);
+        }
+        oCreateDevice = nullptr;
+        oCreateDeviceAndSwapChain = nullptr;
+        s_deviceCompatibilityInstalled = false;
+        Log("[SteamVR] ERROR: early D3D11 compatibility hook installation failed");
+        return false;
+    }
+    Log("[SteamVR] Early D3D11 device compatibility active");
+    return true;
 }
 
 bool InstallHooks() {

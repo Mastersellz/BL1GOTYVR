@@ -61,6 +61,7 @@ public:
 
     // Backbuffer resources
     void InvalidateBackbufferResources();
+    bool PrepareForOpenXRRecovery();
 
     // Stereo capture for desktop test mode
     void SaveStereoCapture();
@@ -105,7 +106,7 @@ private:
     void ResetHudCaptureMetadata();
     void ResetStereoPair();
     void StartWaitWorker();
-    void StopWaitWorker();
+    bool StopWaitWorker();
     static DWORD WINAPI WaitWorkerProc(void* context);
 
     bool m_vrActive = false;
@@ -127,6 +128,7 @@ private:
 
     mutable SRWLOCK m_stereoPairLock = SRWLOCK_INIT;
     mutable SRWLOCK m_captureLock = SRWLOCK_INIT;
+    mutable SRWLOCK m_steamSubmissionLock = SRWLOCK_INIT;
     uint64_t m_nextPairSerial = 1;
     int m_nextRenderEye = 0;
     StereoRenderTicket m_activePair = {};
@@ -145,6 +147,12 @@ private:
     XrView m_capturePairViews[2] = {};
     XrView m_submissionViews[2] = {};
     bool m_submissionViewsValid = false;
+    XrView m_steamSubmittedViews[2] = {};
+    bool m_steamSubmittedViewsValid = false;
+    bool m_steamSubmittedHud = false;
+    uint64_t m_steamSubmittedHudSerial = 0;
+    bool m_steamTheaterActive = false;
+    float m_steamTheaterAspect = 1.0f;
     bool m_submissionRightAimValid = false;
     float m_submissionRightAimPosition[3] = {};
     float m_submissionRightAimRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};

@@ -36,7 +36,8 @@ static XrResult SuggestBindings(XrInstance instance, const char* profilePath,
     return xrSuggestInteractionProfileBindings(instance, &suggested);
 }
 
-bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space) {
+bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space,
+                         bool touchPlusEnabled) {
     m_instance = instance;
     m_session = session;
     m_space = space;
@@ -65,7 +66,15 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space) 
     if (XR_FAILED(CreateAction(m_actionSet, &m_leftThumbstick, XR_ACTION_TYPE_VECTOR2F_INPUT,
             "left_thumbstick", "Left Thumbstick")) ||
         XR_FAILED(CreateAction(m_actionSet, &m_rightThumbstick, XR_ACTION_TYPE_VECTOR2F_INPUT,
-            "right_thumbstick", "Right Thumbstick"))) return false;
+            "right_thumbstick", "Right Thumbstick")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_leftThumbstickX, XR_ACTION_TYPE_FLOAT_INPUT,
+            "left_thumbstick_x", "Left Thumbstick X")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_leftThumbstickY, XR_ACTION_TYPE_FLOAT_INPUT,
+            "left_thumbstick_y", "Left Thumbstick Y")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_rightThumbstickX, XR_ACTION_TYPE_FLOAT_INPUT,
+            "right_thumbstick_x", "Right Thumbstick X")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_rightThumbstickY, XR_ACTION_TYPE_FLOAT_INPUT,
+            "right_thumbstick_y", "Right Thumbstick Y"))) return false;
 
     // Create trigger actions
     if (XR_FAILED(CreateAction(m_actionSet, &m_leftTrigger, XR_ACTION_TYPE_FLOAT_INPUT,
@@ -102,7 +111,7 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space) 
     };
     auto suggest = [&](const char* profile, const XrActionSuggestedBinding* values,
                        uint32_t count) {
-        XrActionSuggestedBinding valid[16] = {};
+        XrActionSuggestedBinding valid[32] = {};
         uint32_t validCount = 0;
         for (uint32_t i = 0; i < count; ++i)
             if (values[i].binding != XR_NULL_PATH) valid[validCount++] = values[i];
@@ -117,6 +126,10 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space) 
         {m_rightAimPose, path("/user/hand/right/input/aim/pose")},
         {m_leftThumbstick, path("/user/hand/left/input/thumbstick")},
         {m_rightThumbstick, path("/user/hand/right/input/thumbstick")},
+        {m_leftThumbstickX, path("/user/hand/left/input/thumbstick/x")},
+        {m_leftThumbstickY, path("/user/hand/left/input/thumbstick/y")},
+        {m_rightThumbstickX, path("/user/hand/right/input/thumbstick/x")},
+        {m_rightThumbstickY, path("/user/hand/right/input/thumbstick/y")},
         {m_leftTrigger, path("/user/hand/left/input/trigger/value")},
         {m_rightTrigger, path("/user/hand/right/input/trigger/value")},
         {m_leftGrip, path("/user/hand/left/input/squeeze/value")},
@@ -131,6 +144,9 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space) 
     };
     if (!suggest("/interaction_profiles/oculus/touch_controller", touch, _countof(touch)))
         return false;
+    if (touchPlusEnabled &&
+        !suggest("/interaction_profiles/meta/touch_controller_plus", touch, _countof(touch)))
+        return false;
 
     XrActionSuggestedBinding index[] = {
         {m_leftPose, path("/user/hand/left/input/grip/pose")},
@@ -138,6 +154,10 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space) 
         {m_rightAimPose, path("/user/hand/right/input/aim/pose")},
         {m_leftThumbstick, path("/user/hand/left/input/thumbstick")},
         {m_rightThumbstick, path("/user/hand/right/input/thumbstick")},
+        {m_leftThumbstickX, path("/user/hand/left/input/thumbstick/x")},
+        {m_leftThumbstickY, path("/user/hand/left/input/thumbstick/y")},
+        {m_rightThumbstickX, path("/user/hand/right/input/thumbstick/x")},
+        {m_rightThumbstickY, path("/user/hand/right/input/thumbstick/y")},
         {m_leftTrigger, path("/user/hand/left/input/trigger/value")},
         {m_rightTrigger, path("/user/hand/right/input/trigger/value")},
         {m_leftGrip, path("/user/hand/left/input/squeeze/value")},
@@ -156,6 +176,10 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space) 
         {m_rightAimPose, path("/user/hand/right/input/aim/pose")},
         {m_leftThumbstick, path("/user/hand/left/input/trackpad")},
         {m_rightThumbstick, path("/user/hand/right/input/trackpad")},
+        {m_leftThumbstickX, path("/user/hand/left/input/trackpad/x")},
+        {m_leftThumbstickY, path("/user/hand/left/input/trackpad/y")},
+        {m_rightThumbstickX, path("/user/hand/right/input/trackpad/x")},
+        {m_rightThumbstickY, path("/user/hand/right/input/trackpad/y")},
         {m_leftTrigger, path("/user/hand/left/input/trigger/value")},
         {m_rightTrigger, path("/user/hand/right/input/trigger/value")},
         {m_menuButton, path("/user/hand/left/input/menu/click")},
@@ -179,7 +203,8 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space) 
     attachInfo.actionSets = &m_actionSet;
     if (XR_FAILED(xrAttachSessionActionSets(m_session, &attachInfo))) return false;
 
-    Log("[XRInput] Initialized (16 actions, Quest A/B/X/Y, separate right aim pose)");
+    Log("[XRInput] Initialized (20 actions, Quest A/B/X/Y, scalar stick fallback, "
+        "TouchPlus=%d)", touchPlusEnabled ? 1 : 0);
     return true;
 }
 
@@ -229,6 +254,8 @@ void XRInput::UpdateControllerStateUnlocked(int hand, XrTime displayTime) {
     ControllerState& ctrl = m_controllers[hand];
     XrAction poseAction = (hand == 0) ? m_leftPose : m_rightPose;
     XrAction thumbstickAction = (hand == 0) ? m_leftThumbstick : m_rightThumbstick;
+    XrAction thumbstickXAction = (hand == 0) ? m_leftThumbstickX : m_rightThumbstickX;
+    XrAction thumbstickYAction = (hand == 0) ? m_leftThumbstickY : m_rightThumbstickY;
     XrAction triggerAction = (hand == 0) ? m_leftTrigger : m_rightTrigger;
     XrAction gripAction = (hand == 0) ? m_leftGrip : m_rightGrip;
     XrSpace poseSpace = (hand == 0) ? m_leftPoseSpace : m_rightPoseSpace;
@@ -311,6 +338,16 @@ void XRInput::UpdateControllerStateUnlocked(int hand, XrTime displayTime) {
         ctrl.thumbstickX = thumbState.currentState.x;
         ctrl.thumbstickY = thumbState.currentState.y;
     }
+    XrActionStateFloat thumbXState{XR_TYPE_ACTION_STATE_FLOAT};
+    getInfo.action = thumbstickXAction;
+    const XrResult thumbXResult = xrGetActionStateFloat(m_session, &getInfo, &thumbXState);
+    if (XR_SUCCEEDED(thumbXResult) && thumbXState.isActive)
+        ctrl.thumbstickX = thumbXState.currentState;
+    XrActionStateFloat thumbYState{XR_TYPE_ACTION_STATE_FLOAT};
+    getInfo.action = thumbstickYAction;
+    const XrResult thumbYResult = xrGetActionStateFloat(m_session, &getInfo, &thumbYState);
+    if (XR_SUCCEEDED(thumbYResult) && thumbYState.isActive)
+        ctrl.thumbstickY = thumbYState.currentState;
 
     // Get trigger
     ctrl.trigger = 0.0f;
@@ -349,11 +386,33 @@ void XRInput::UpdateControllerStateUnlocked(int hand, XrTime displayTime) {
     const uint64_t updateCount = ++updateCounts[hand];
     if (updateCount == 1 || updateCount % 300 == 0) {
         Log("[XRInput] hand=%s poseResult=%d active=%d locateResult=%d flags=0x%llX "
-            "valid=%d stickActive=%d triggerActive=%d gripActive=%d values=(%.2f,%.2f %.2f %.2f)",
+            "valid=%d stickActive=%d scalarActive=%d/%d triggerActive=%d gripActive=%d "
+            "buttons=%d%d%d%d%d%d values=(%.2f,%.2f %.2f %.2f)",
             hand == 0 ? "left" : "right", (int)poseResult, poseState.isActive,
             (int)locationResult, static_cast<unsigned long long>(location.locationFlags),
-            ctrl.valid, thumbState.isActive, triggerState.isActive, gripState.isActive,
+            ctrl.valid, thumbState.isActive, thumbXState.isActive, thumbYState.isActive,
+            triggerState.isActive, gripState.isActive,
+            ctrl.buttonA, ctrl.buttonB, ctrl.buttonX, ctrl.buttonY,
+            ctrl.thumbstickClick, ctrl.menuButton,
             ctrl.thumbstickX, ctrl.thumbstickY, ctrl.trigger, ctrl.grip);
+    }
+}
+
+void XRInput::LogCurrentInteractionProfiles() const {
+    if (m_session == XR_NULL_HANDLE || m_instance == XR_NULL_HANDLE) return;
+    const char* hands[] = {"left", "right"};
+    const char* paths[] = {"/user/hand/left", "/user/hand/right"};
+    for (int hand = 0; hand < 2; ++hand) {
+        XrPath userPath = XR_NULL_PATH;
+        if (xrStringToPath(m_instance, paths[hand], &userPath) != XR_SUCCESS) continue;
+        XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE};
+        const XrResult result = xrGetCurrentInteractionProfile(m_session, userPath, &state);
+        char profile[XR_MAX_PATH_LENGTH] = {};
+        uint32_t length = 0;
+        if (result == XR_SUCCESS && state.interactionProfile != XR_NULL_PATH)
+            xrPathToString(m_instance, state.interactionProfile, sizeof(profile), &length, profile);
+        Log("[XRInput] Current %s interaction profile: result=%d path='%s'",
+            hands[hand], static_cast<int>(result), profile[0] ? profile : "<none>");
     }
 }
 

@@ -6,6 +6,7 @@
 
 namespace bl1gotyvr { namespace d3d11 {
 
+bool InstallSteamVrDeviceCompatibility();
 bool InstallHooks();
 ID3D11Device* GetGameDevice();
 ID3D11DeviceContext* GetGameContext();

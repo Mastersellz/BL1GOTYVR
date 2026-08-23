@@ -302,6 +302,8 @@ static void RegisterCommands() {
 static DWORD WINAPI InitializeThread(LPVOID) {
     if (!bl1gotyvr::display::Initialize())
         LogInternal("[BL1GOTYVR] ERROR: Display hooks were not installed");
+    if (!bl1gotyvr::d3d11::InstallSteamVrDeviceCompatibility())
+        LogInternal("[BL1GOTYVR] ERROR: SteamVR D3D11 compatibility was not installed");
     if (s_displayReadyEvent) SetEvent(s_displayReadyEvent);
     Sleep(250);
     const HRESULT comInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);

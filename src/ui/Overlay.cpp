@@ -188,6 +188,12 @@ void DrawUi() {
             "Use Ctrl+numpad tuning to move bullets and dot together.");
     }
 
+    if (ImGui::CollapsingHeader("OpenXR")) {
+        ImGui::SliderFloat("Refresh rate (Hz)", &settings.openxr_refresh_rate_hz,
+                           0.0f, 144.0f, "%.0f Hz");
+        ImGui::TextWrapped("0 keeps the runtime default. A change applies after the OpenXR session restarts.");
+    }
+
     ImGui::Separator();
     if (ImGui::Button("Save settings")) {
         s_status = config::SaveLoaded() ? "Saved to BL1GOTYVR.ini" : "Save failed";

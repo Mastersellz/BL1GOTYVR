@@ -38,6 +38,9 @@ void Load(const char* path) {
         ReadFloat("Stereo", "IPD", s_settings.ipd_mm, path), 50.0f, 80.0f);
     s_settings.convergence_m = std::clamp(
         ReadFloat("Stereo", "Convergence", s_settings.convergence_m, path), 0.0f, 20.0f);
+    s_settings.openxr_refresh_rate_hz = std::clamp(
+        ReadFloat("OpenXR", "RefreshRateHz", s_settings.openxr_refresh_rate_hz, path),
+        0.0f, 240.0f);
     s_settings.near_plane = std::clamp(
         ReadFloat("Rendering", "NearPlane", s_settings.near_plane, path), 0.01f, 10.0f);
     s_settings.far_plane = std::clamp(
@@ -152,9 +155,10 @@ void Load(const char* path) {
         s_settings.vanilla_hands_filter ? 1 : 0, path) != 0;
 
     Log("[Config] Loaded %s: %dx%d scale=%.2f FOV=%.1f IPD=%.1fmm "
-        "convergenceShift=%.2f%% aim=(%.2f,%.2f) target=%.1fm",
+        "convergenceShift=%.2f%% refresh=%.1fHz aim=(%.2f,%.2f) target=%.1fm",
         path, s_settings.render_width, s_settings.render_height, s_settings.resolution_scale,
         s_settings.fov_degrees, s_settings.ipd_mm, s_settings.convergence_m,
+        s_settings.openxr_refresh_rate_hz,
         s_settings.aim_pitch_degrees, s_settings.aim_yaw_degrees,
         s_settings.aim_convergence_m);
     WIN32_FILE_ATTRIBUTE_DATA attributes = {};
@@ -191,6 +195,7 @@ void Save(const char* path) {
     WriteFloat("Display", "FOV", s_settings.fov_degrees, path);
     WriteFloat("Stereo", "IPD", s_settings.ipd_mm, path);
     WriteFloat("Stereo", "Convergence", s_settings.convergence_m, path);
+    WriteFloat("OpenXR", "RefreshRateHz", s_settings.openxr_refresh_rate_hz, path);
     WriteFloat("Rendering", "NearPlane", s_settings.near_plane, path);
     WriteFloat("Rendering", "FarPlane", s_settings.far_plane, path);
     WriteFloat("Tracking", "PositionScale", s_settings.positional_scale, path);

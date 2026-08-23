@@ -24,7 +24,7 @@ set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     OpenXR
     GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git
-    GIT_TAG release-1.1.43
+    GIT_TAG release-1.1.58
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(OpenXR)

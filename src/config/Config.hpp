@@ -11,6 +11,7 @@ struct Settings {
     float fov_degrees = 100.0f;
     float ipd_mm = 64.0f;
     float convergence_m = 0.0f;
+    float openxr_refresh_rate_hz = 72.0f; /* 0 keeps the runtime default */
     float near_plane = 0.1f;
     float far_plane = 10000.0f;
     float positional_scale = 1.0f;

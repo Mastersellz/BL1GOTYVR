@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <Xinput.h>
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <vector>

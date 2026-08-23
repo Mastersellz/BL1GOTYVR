@@ -7,47 +7,48 @@
 #include <cstring>
 #include <algorithm>
 #include <cctype>
-#include <tlhelp32.h>
+#include <cstdio>
+#include <cwctype>
 
 namespace bl1gotyvr { namespace xr {
 
-static bool IsProcessRunning(const wchar_t* executableName) {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return false;
-    PROCESSENTRY32W entry = {};
-    entry.dwSize = sizeof(entry);
-    bool found = false;
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            if (_wcsicmp(entry.szExeFile, executableName) == 0) {
-                found = true;
-                break;
-            }
-        } while (Process32NextW(snapshot, &entry));
+static bool ReadSelectedRuntime(wchar_t path[1024], const char*& source) {
+    path[0] = L'\0';
+    source = "none";
+    if (GetEnvironmentVariableW(L"XR_RUNTIME_JSON", path, 1024) > 0) {
+        source = "XR_RUNTIME_JSON";
+        return true;
     }
-    CloseHandle(snapshot);
-    return found;
+    DWORD bytes = 1024 * sizeof(wchar_t);
+    const LSTATUS status = RegGetValueW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Khronos\\OpenXR\\1", L"ActiveRuntime", RRF_RT_REG_SZ,
+        nullptr, path, &bytes);
+    if (status == ERROR_SUCCESS && path[0]) {
+        source = "ActiveRuntime";
+        return true;
+    }
+    return false;
 }
 
-static void ConfigureRuntimeOverride() {
-    constexpr const char* kVdxrManifest =
-        "C:\\Program Files\\Virtual Desktop Streamer\\OpenXR\\virtualdesktop-openxr.json";
-    const bool virtualDesktopRunning = IsProcessRunning(L"VirtualDesktop.Server.exe");
-    const DWORD attributes = GetFileAttributesA(kVdxrManifest);
-    if (virtualDesktopRunning && attributes != INVALID_FILE_ATTRIBUTES &&
-        (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-        SetEnvironmentVariableA("XR_RUNTIME_JSON", kVdxrManifest);
-        Log("[OpenXR] Auto runtime override: Virtual Desktop detected; XR_RUNTIME_JSON=%s",
-            kVdxrManifest);
+bool IsSteamRuntimeSelected() {
+    wchar_t path[1024] = {};
+    const char* source = nullptr;
+    if (!ReadSelectedRuntime(path, source)) return false;
+    for (wchar_t* current = path; *current; ++current)
+        *current = static_cast<wchar_t>(towlower(*current));
+    return wcsstr(path, L"steamvr") != nullptr ||
+        wcsstr(path, L"steamxr") != nullptr;
+}
+
+static void LogSelectedRuntime() {
+    wchar_t path[1024] = {};
+    const char* source = nullptr;
+    if (!ReadSelectedRuntime(path, source)) {
+        Log("[OpenXR] No runtime selection found in XR_RUNTIME_JSON or ActiveRuntime");
         return;
     }
-
-    char existing[1024] = {};
-    if (GetEnvironmentVariableA("XR_RUNTIME_JSON", existing, sizeof(existing)) > 0) {
-        Log("[OpenXR] Preserving launcher runtime override: %s", existing);
-    } else {
-        Log("[OpenXR] Virtual Desktop not detected; using active OpenXR runtime");
-    }
+    Log("[OpenXR] Selected runtime (%s): %ls [SteamVR=%d]", source, path,
+        IsSteamRuntimeSelected() ? 1 : 0);
 }
 
 static XrFovf CenterVerticalFov(const XrFovf& source) {
@@ -160,8 +161,62 @@ XrResult OpenXRContext::CheckResult(XrResult result, const char* call) {
     return result;
 }
 
+void OpenXRContext::RequestRecovery(const char* call, XrResult result) {
+    bool expected = false;
+    if (m_recoveryRequested.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        Log("[OpenXR] Recovery requested by %s: %d", call ? call : "unknown",
+            static_cast<int>(result));
+    }
+}
+
+bool OpenXRContext::ObserveFrameResult(const char* call, XrResult result) {
+    if (result == XR_SESSION_LOSS_PENDING) {
+        RequestRecovery(call, result);
+        return true;
+    }
+    if (XR_FAILED(result)) {
+        Log("[OpenXR] %s failed: %d", call, static_cast<int>(result));
+        RequestRecovery(call, result);
+        return false;
+    }
+    return true;
+}
+
+bool OpenXRContext::WaitForSwapchainImage(XrSwapchain swapchain, const char* label) {
+    constexpr XrDuration kWaitSlice = 50LL * 1000LL * 1000LL;
+    constexpr int kMaxWaitSlices = 40;
+    XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    waitInfo.timeout = kWaitSlice;
+    for (int attempt = 0; attempt < kMaxWaitSlices; ++attempt) {
+        const XrResult result = xrWaitSwapchainImage(swapchain, &waitInfo);
+        if (result == XR_TIMEOUT_EXPIRED) {
+            PollEvents();
+            if (NeedsRecovery()) return false;
+            continue;
+        }
+        return ObserveFrameResult(label, result);
+    }
+    Log("[OpenXR] %s timed out for 2 seconds", label);
+    RequestRecovery(label, XR_TIMEOUT_EXPIRED);
+    return false;
+}
+
+void OpenXRContext::RequestSessionExit() {
+    if (m_session == XR_NULL_HANDLE || !m_deviceBound.load(std::memory_order_acquire)) return;
+    const XrResult result = xrRequestExitSession(m_session);
+    if (XR_FAILED(result) && result != XR_ERROR_SESSION_NOT_RUNNING) {
+        Log("[OpenXR] xrRequestExitSession failed: %d", static_cast<int>(result));
+    }
+}
+
 bool OpenXRContext::Initialize(ID3D11Device* device, DXGI_FORMAT backbufferFormat) {
-    if (m_initialized) return true;
+    if (m_initialized.load(std::memory_order_acquire)) return true;
+
+    m_recoveryRequested.store(false, std::memory_order_release);
+    m_sessionState.store(XR_SESSION_STATE_UNKNOWN, std::memory_order_release);
+    m_deviceBound.store(false, std::memory_order_release);
+    m_endSessionPending.store(false, std::memory_order_release);
 
     Log("[OpenXR] Initializing...");
 
@@ -178,20 +233,22 @@ bool OpenXRContext::Initialize(ID3D11Device* device, DXGI_FORMAT backbufferForma
     if (!CreateSwapchains()) { Shutdown(); return false; }
 
     // Initialize XR input system
-    if (!input::XRInput::Instance().Initialize(m_instance, m_session, m_stageSpace)) {
+    if (!input::XRInput::Instance().Initialize(
+            m_instance, m_session, m_stageSpace, m_touchControllerPlusSupported)) {
         Log("[OpenXR] XR input initialization failed");
-        m_initialized = true;
+        m_initialized.store(true, std::memory_order_release);
         Shutdown();
         return false;
     }
 
-    m_initialized = true;
+    m_initialized.store(true, std::memory_order_release);
     Log("[OpenXR] Initialized successfully (IPD=%.1fmm)", m_ipd * 1000.0f);
     return true;
 }
 
 void OpenXRContext::Shutdown() {
-    if (!m_initialized && m_instance == XR_NULL_HANDLE && m_session == XR_NULL_HANDLE &&
+    if (!m_initialized.load(std::memory_order_acquire) &&
+        m_instance == XR_NULL_HANDLE && m_session == XR_NULL_HANDLE &&
         !m_device && !m_context) return;
     Log("[OpenXR] Shutting down...");
 
@@ -215,9 +272,17 @@ void OpenXRContext::Shutdown() {
     if (m_stageSpace != XR_NULL_HANDLE) { xrDestroySpace(m_stageSpace); m_stageSpace = XR_NULL_HANDLE; }
     if (m_viewSpace != XR_NULL_HANDLE) { xrDestroySpace(m_viewSpace); m_viewSpace = XR_NULL_HANDLE; }
 
-    // End session if active
+    // xrEndSession is only legal after the runtime reports STOPPING. Destroying
+    // a session is sufficient for recovery when that transition never arrives.
     if (m_session != XR_NULL_HANDLE) {
-        if (m_deviceBound) xrEndSession(m_session);
+        const XrSessionState state = m_sessionState.load(std::memory_order_acquire);
+        if (state == XR_SESSION_STATE_STOPPING &&
+            m_endSessionPending.exchange(false, std::memory_order_acq_rel)) {
+            const XrResult endResult = xrEndSession(m_session);
+            if (XR_FAILED(endResult))
+                Log("[OpenXR] xrEndSession during teardown failed: %d",
+                    static_cast<int>(endResult));
+        }
         xrDestroySession(m_session);
         m_session = XR_NULL_HANDLE;
     }
@@ -233,6 +298,7 @@ void OpenXRContext::Shutdown() {
 
     AcquireSRWLockExclusive(&m_poseLock);
     m_frameActive = false;
+    m_predictedDisplayTime.store(0, std::memory_order_release);
     m_viewsValid = false;
     m_poseValid = false;
     m_renderedViewValid[0] = m_renderedViewValid[1] = false;
@@ -240,12 +306,18 @@ void OpenXRContext::Shutdown() {
     memset(m_renderedViews, 0, sizeof(m_renderedViews));
     ReleaseSRWLockExclusive(&m_poseLock);
 
-    m_initialized = false;
-    m_deviceBound = false;
+    m_initialized.store(false, std::memory_order_release);
+    m_deviceBound.store(false, std::memory_order_release);
+    m_endSessionPending.store(false, std::memory_order_release);
+    m_sessionState.store(XR_SESSION_STATE_UNKNOWN, std::memory_order_release);
+    m_recoveryRequested.store(false, std::memory_order_release);
     m_systemProperties = {XR_TYPE_SYSTEM_PROPERTIES};
     m_runtimeName[0] = '\0';
+    m_isSteamRuntime = false;
     m_isVdxr = false;
     m_integratedHud = false;
+    m_refreshRateSupported = false;
+    m_touchControllerPlusSupported = false;
     m_theaterAnchored = false;
     m_theaterPose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
     Log("[OpenXR] Shutdown complete");
@@ -254,9 +326,10 @@ void OpenXRContext::Shutdown() {
 bool OpenXRContext::CreateInstance() {
     Log("[OpenXR] Creating instance...");
 
-    // Match ME2VR: choose VDXR before the loader performs any runtime-facing
-    // call. Steam Link/SteamVR continue through the system active runtime.
-    ConfigureRuntimeOverride();
+    // Respect the loader's standard environment/registry selection. Runtime
+    // classification is diagnostic and must never silently replace it.
+    m_isSteamRuntime = IsSteamRuntimeSelected();
+    LogSelectedRuntime();
 
     // Enumerate extensions
     uint32_t extCount = 0;
@@ -266,23 +339,33 @@ bool OpenXRContext::CreateInstance() {
     xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, exts.data());
 
     bool hasD3D11 = false;
+    bool hasRefreshRate = false;
+    bool hasTouchControllerPlus = false;
     for (const auto& e : exts) {
         if (strcmp(e.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0) {
             hasD3D11 = true;
-            break;
         }
+        if (strcmp(e.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0)
+            hasRefreshRate = true;
+        if (strcmp(e.extensionName, XR_META_TOUCH_CONTROLLER_PLUS_EXTENSION_NAME) == 0)
+            hasTouchControllerPlus = true;
     }
     if (!hasD3D11) {
         Log("[OpenXR] ERROR: XR_KHR_D3D11_ENABLE not supported");
         return false;
     }
 
-    const char* enabledExts[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
+    std::vector<const char*> enabledExts = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+    if (hasRefreshRate) enabledExts.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    if (hasTouchControllerPlus)
+        enabledExts.push_back(XR_META_TOUCH_CONTROLLER_PLUS_EXTENSION_NAME);
+    m_refreshRateSupported = hasRefreshRate;
+    m_touchControllerPlusSupported = hasTouchControllerPlus;
 
     XrInstanceCreateInfo ci = {};
     ci.type = XR_TYPE_INSTANCE_CREATE_INFO;
-    ci.enabledExtensionCount = 1;
-    ci.enabledExtensionNames = enabledExts;
+    ci.enabledExtensionCount = static_cast<uint32_t>(enabledExts.size());
+    ci.enabledExtensionNames = enabledExts.data();
 
     XrApplicationInfo& appInfo = ci.applicationInfo;
     strcpy(appInfo.applicationName, "BL1GOTYVR");
@@ -305,16 +388,18 @@ bool OpenXRContext::CreateInstance() {
         m_isVdxr = strstr(normalized, "vdxr") != nullptr ||
             strstr(normalized, "virtual desktop") != nullptr ||
             strstr(normalized, "virtualdesktop") != nullptr;
+        m_isSteamRuntime = m_isSteamRuntime || strstr(normalized, "steamvr") != nullptr ||
+            strstr(normalized, "steamxr") != nullptr;
         const bool metaCompatibility =
             strstr(normalized, "meta compatibility mode") != nullptr;
         m_integratedHud = m_isVdxr || metaCompatibility;
         Log("[OpenXR] Instance created: runtime='%s' version=%u.%u.%u "
-            "vdxr=%d integratedHud=%d API=1.0",
+            "steamvr=%d vdxr=%d integratedHud=%d API=1.0",
             properties.runtimeName,
             static_cast<unsigned>(XR_VERSION_MAJOR(properties.runtimeVersion)),
             static_cast<unsigned>(XR_VERSION_MINOR(properties.runtimeVersion)),
             static_cast<unsigned>(XR_VERSION_PATCH(properties.runtimeVersion)),
-            m_isVdxr ? 1 : 0, m_integratedHud ? 1 : 0);
+            m_isSteamRuntime ? 1 : 0, m_isVdxr ? 1 : 0, m_integratedHud ? 1 : 0);
     } else {
         Log("[OpenXR] Instance created; xrGetInstanceProperties=%d", (int)r);
     }
@@ -350,14 +435,49 @@ bool OpenXRContext::CreateSession() {
     PFN_xrGetD3D11GraphicsRequirementsKHR getReqs = nullptr;
     xrGetInstanceProcAddr(m_instance, "xrGetD3D11GraphicsRequirementsKHR",
                           (PFN_xrVoidFunction*)&getReqs);
-    if (getReqs) {
-        XrGraphicsRequirementsD3D11KHR reqs = {};
-        reqs.type = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR;
-        r = getReqs(m_instance, m_systemId, &reqs);
-        if (r != XR_SUCCESS) {
-            Log("[OpenXR] xrGetD3D11GraphicsRequirementsKHR = %d", (int)r);
+    if (!getReqs) {
+        Log("[OpenXR] ERROR: xrGetD3D11GraphicsRequirementsKHR unavailable");
+        return false;
+    }
+    XrGraphicsRequirementsD3D11KHR reqs = {
+        XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
+    r = getReqs(m_instance, m_systemId, &reqs);
+    if (XR_FAILED(r)) {
+        Log("[OpenXR] ERROR: xrGetD3D11GraphicsRequirementsKHR = %d", (int)r);
+        return false;
+    }
+    const UINT creationFlags = m_device->GetCreationFlags();
+    const D3D_FEATURE_LEVEL featureLevel = m_device->GetFeatureLevel();
+    Log("[OpenXR] Game D3D11 device: flags=0x%X singleThreaded=%d feature=0x%X "
+        "required=0x%X", creationFlags,
+        (creationFlags & D3D11_CREATE_DEVICE_SINGLETHREADED) ? 1 : 0,
+        static_cast<unsigned>(featureLevel), static_cast<unsigned>(reqs.minFeatureLevel));
+    if (featureLevel < reqs.minFeatureLevel) {
+        Log("[OpenXR] ERROR: game D3D11 feature level is below runtime requirement");
+        return false;
+    }
+
+    IDXGIDevice* dxgiDevice = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    DXGI_ADAPTER_DESC adapterDesc = {};
+    const bool adapterKnown = SUCCEEDED(m_device->QueryInterface(
+        __uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice))) && dxgiDevice &&
+        SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) && adapter &&
+        SUCCEEDED(adapter->GetDesc(&adapterDesc));
+    if (adapter) adapter->Release();
+    if (dxgiDevice) dxgiDevice->Release();
+    if (adapterKnown) {
+        const bool luidMatches = adapterDesc.AdapterLuid.HighPart == reqs.adapterLuid.HighPart &&
+            adapterDesc.AdapterLuid.LowPart == reqs.adapterLuid.LowPart;
+        Log("[OpenXR] Game adapter='%ls' LUID=%08X:%08X runtime=%08X:%08X match=%d",
+            adapterDesc.Description, static_cast<unsigned>(adapterDesc.AdapterLuid.HighPart),
+            adapterDesc.AdapterLuid.LowPart,
+            static_cast<unsigned>(reqs.adapterLuid.HighPart), reqs.adapterLuid.LowPart,
+            luidMatches ? 1 : 0);
+        if (!luidMatches) {
+            Log("[OpenXR] ERROR: game and OpenXR runtime selected different GPUs");
+            return false;
         }
-        Log("[OpenXR] D3D11 min feature level: %d", (int)reqs.minFeatureLevel);
     }
 
     // Create session with D3D11 binding
@@ -378,9 +498,76 @@ bool OpenXRContext::CreateSession() {
 
     // The graphics device is attached, but the session is not running until
     // the runtime reports READY and xrBeginSession succeeds.
-    m_deviceBound = false;
+    m_deviceBound.store(false, std::memory_order_release);
+    ConfigureRefreshRate();
+    if (NeedsRecovery()) return false;
     Log("[OpenXR] Session created");
     return true;
+}
+
+void OpenXRContext::ConfigureRefreshRate() {
+    if (!m_refreshRateSupported || m_session == XR_NULL_HANDLE) {
+        Log("[OpenXR] XR_FB_display_refresh_rate unavailable; runtime controls pacing");
+        return;
+    }
+    PFN_xrEnumerateDisplayRefreshRatesFB enumerateRates = nullptr;
+    PFN_xrGetDisplayRefreshRateFB getRate = nullptr;
+    PFN_xrRequestDisplayRefreshRateFB requestRate = nullptr;
+    xrGetInstanceProcAddr(m_instance, "xrEnumerateDisplayRefreshRatesFB",
+        reinterpret_cast<PFN_xrVoidFunction*>(&enumerateRates));
+    xrGetInstanceProcAddr(m_instance, "xrGetDisplayRefreshRateFB",
+        reinterpret_cast<PFN_xrVoidFunction*>(&getRate));
+    xrGetInstanceProcAddr(m_instance, "xrRequestDisplayRefreshRateFB",
+        reinterpret_cast<PFN_xrVoidFunction*>(&requestRate));
+    if (!enumerateRates || !getRate || !requestRate) {
+        Log("[OpenXR] Display refresh extension functions unavailable");
+        return;
+    }
+    uint32_t rateCount = 0;
+    XrResult result = enumerateRates(m_session, 0, &rateCount, nullptr);
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrEnumerateDisplayRefreshRatesFB", result);
+    if (result != XR_SUCCESS || !rateCount) {
+        Log("[OpenXR] xrEnumerateDisplayRefreshRatesFB failed: %d",
+            static_cast<int>(result));
+        return;
+    }
+    std::vector<float> rates(rateCount);
+    result = enumerateRates(m_session, rateCount, &rateCount, rates.data());
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrEnumerateDisplayRefreshRatesFB", result);
+    if (result != XR_SUCCESS) return;
+    float currentRate = 0.0f;
+    result = getRate(m_session, &currentRate);
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrGetDisplayRefreshRateFB", result);
+    if (result != XR_SUCCESS) return;
+    char supported[256] = {};
+    size_t used = 0;
+    for (float rate : rates) {
+        const int written = snprintf(supported + used, sizeof(supported) - used,
+            used ? ", %.0f" : "%.0f", rate);
+        if (written <= 0 || static_cast<size_t>(written) >= sizeof(supported) - used) break;
+        used += static_cast<size_t>(written);
+    }
+    const float configured = config::Get().openxr_refresh_rate_hz;
+    Log("[OpenXR] Display refresh: current=%.1fHz supported=[%s] requested=%.1fHz",
+        currentRate, supported, configured);
+    if (configured <= 0.0f) return;
+    const auto nearest = std::min_element(rates.begin(), rates.end(),
+        [configured](float left, float right) {
+            return fabsf(left - configured) < fabsf(right - configured);
+        });
+    if (nearest == rates.end()) return;
+    result = requestRate(m_session, *nearest);
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrRequestDisplayRefreshRateFB", result);
+    if (result != XR_SUCCESS) {
+        Log("[OpenXR] xrRequestDisplayRefreshRateFB(%.1f) failed: %d", *nearest,
+            static_cast<int>(result));
+    } else {
+        Log("[OpenXR] Requested display refresh rate %.1fHz", *nearest);
+    }
 }
 
 bool OpenXRContext::CreateSpaces() {
@@ -395,7 +582,9 @@ bool OpenXRContext::CreateSpaces() {
     spaceCI.poseInReferenceSpace.orientation.w = 1.0f;
 
     XrResult r = xrCreateReferenceSpace(m_session, &spaceCI, &m_stageSpace);
-    if (XR_FAILED(r)) {
+    if (r == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrCreateReferenceSpace(LOCAL)", r);
+    if (r != XR_SUCCESS) {
         Log("[OpenXR] ERROR: xrCreateReferenceSpace(LOCAL) = %d", (int)r);
         return false;
     }
@@ -403,8 +592,11 @@ bool OpenXRContext::CreateSpaces() {
     // View space
     spaceCI.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     r = xrCreateReferenceSpace(m_session, &spaceCI, &m_viewSpace);
+    if (r == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrCreateReferenceSpace(VIEW)", r);
     if (r != XR_SUCCESS) {
         Log("[OpenXR] WARNING: xrCreateReferenceSpace(VIEW) = %d", (int)r);
+        if (r == XR_SESSION_LOSS_PENDING) return false;
     }
 
     Log("[OpenXR] Reference spaces created");
@@ -475,26 +667,56 @@ bool OpenXRContext::CreateSwapchains() {
 
     // Get recommended swapchain sizes
     uint32_t viewConfigCount = 0;
-    xrEnumerateViewConfigurations(m_instance, m_systemId, 0, &viewConfigCount, nullptr);
+    XrResult result = xrEnumerateViewConfigurations(
+        m_instance, m_systemId, 0, &viewConfigCount, nullptr);
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrEnumerateViewConfigurations", result);
+    if (result != XR_SUCCESS || !viewConfigCount) return false;
     std::vector<XrViewConfigurationType> viewTypes(viewConfigCount);
-    xrEnumerateViewConfigurations(m_instance, m_systemId, viewConfigCount, &viewConfigCount, viewTypes.data());
+    result = xrEnumerateViewConfigurations(m_instance, m_systemId, viewConfigCount,
+        &viewConfigCount, viewTypes.data());
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrEnumerateViewConfigurations", result);
+    if (result != XR_SUCCESS || std::find(viewTypes.begin(), viewTypes.end(),
+            XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) == viewTypes.end()) {
+        Log("[OpenXR] ERROR: PRIMARY_STEREO view configuration unavailable");
+        return false;
+    }
 
     // Get view config views for PRIMARY_STEREO
     uint32_t viewCount = 0;
-    xrEnumerateViewConfigurationViews(m_instance, m_systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount, nullptr);
+    result = xrEnumerateViewConfigurationViews(m_instance, m_systemId,
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount, nullptr);
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrEnumerateViewConfigurationViews", result);
+    if (result != XR_SUCCESS || viewCount < 2) return false;
     std::vector<XrViewConfigurationView> viewConfigs(viewCount, { XR_TYPE_VIEW_CONFIGURATION_VIEW });
-    xrEnumerateViewConfigurationViews(m_instance, m_systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount, &viewCount, viewConfigs.data());
+    result = xrEnumerateViewConfigurationViews(m_instance, m_systemId,
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount, &viewCount,
+        viewConfigs.data());
 
-    if (viewCount < 2) {
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrEnumerateViewConfigurationViews", result);
+    if (result != XR_SUCCESS || viewCount < 2) {
         Log("[OpenXR] ERROR: Expected 2 views, got %u", viewCount);
         return false;
     }
 
     // Enumerate supported swapchain formats
     uint32_t formatCount = 0;
-    xrEnumerateSwapchainFormats(m_session, 0, &formatCount, nullptr);
+    result = xrEnumerateSwapchainFormats(m_session, 0, &formatCount, nullptr);
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrEnumerateSwapchainFormats", result);
+    if (result != XR_SUCCESS || !formatCount) {
+        Log("[OpenXR] ERROR: no swapchain formats: %d", static_cast<int>(result));
+        return false;
+    }
     std::vector<int64_t> formats(formatCount);
-    xrEnumerateSwapchainFormats(m_session, formatCount, &formatCount, formats.data());
+    result = xrEnumerateSwapchainFormats(
+        m_session, formatCount, &formatCount, formats.data());
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrEnumerateSwapchainFormats", result);
+    if (result != XR_SUCCESS || !formatCount) return false;
 
     const DXGI_FORMAT requestedFormat = m_swapchainFormat;
     // Log all supported formats for runtime debugging (VDXR vs SteamVR)
@@ -532,6 +754,8 @@ bool OpenXRContext::CreateSwapchains() {
         sci.mipCount = 1;
 
         XrResult r = xrCreateSwapchain(m_session, &sci, &eyes[i]->swapchain);
+        if (r == XR_SESSION_LOSS_PENDING)
+            RequestRecovery("xrCreateSwapchain(eye)", r);
         if (r != XR_SUCCESS) {
             Log("[OpenXR] ERROR: xrCreateSwapchain(eye %d) = %d", i, (int)r);
             return false;
@@ -544,9 +768,20 @@ bool OpenXRContext::CreateSwapchains() {
 
         // Get swapchain images
         uint32_t imgCount = 0;
-        xrEnumerateSwapchainImages(eyes[i]->swapchain, 0, &imgCount, nullptr);
+        r = xrEnumerateSwapchainImages(eyes[i]->swapchain, 0, &imgCount, nullptr);
+        if (r == XR_SESSION_LOSS_PENDING)
+            RequestRecovery("xrEnumerateSwapchainImages(eye)", r);
+        if (r != XR_SUCCESS || !imgCount) {
+            Log("[OpenXR] ERROR: xrEnumerateSwapchainImages count eye %d = %d", i,
+                static_cast<int>(r));
+            return false;
+        }
         eyes[i]->images.resize(imgCount, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
-        xrEnumerateSwapchainImages(eyes[i]->swapchain, imgCount, &imgCount, (XrSwapchainImageBaseHeader*)eyes[i]->images.data());
+        r = xrEnumerateSwapchainImages(eyes[i]->swapchain, imgCount, &imgCount,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(eyes[i]->images.data()));
+        if (r == XR_SESSION_LOSS_PENDING)
+            RequestRecovery("xrEnumerateSwapchainImages(eye)", r);
+        if (r != XR_SUCCESS) return false;
 
         Log("[OpenXR] Eye %d: %ux%u, %u images", i, sci.width, sci.height, imgCount);
 
@@ -572,13 +807,15 @@ bool OpenXRContext::CanSubmitHud() const {
         format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
         format == DXGI_FORMAT_B8G8R8A8_UNORM ||
         format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-    return m_initialized && config::Get().hud_enabled && alphaFormat &&
+    return m_initialized.load(std::memory_order_acquire) && !NeedsRecovery() &&
+        config::Get().hud_enabled && alphaFormat &&
         m_viewSpace != XR_NULL_HANDLE &&
         m_systemProperties.graphicsProperties.maxLayerCount >= 2;
 }
 
 bool OpenXRContext::WantsHudCapture() const {
-    return m_initialized && config::Get().hud_enabled &&
+    return m_initialized.load(std::memory_order_acquire) && !NeedsRecovery() &&
+        config::Get().hud_enabled &&
         !config::Get().debug_force_no_hud_layer;
 }
 
@@ -632,6 +869,10 @@ bool OpenXRContext::CreateHudSwapchain(uint32_t width, uint32_t height) {
     createInfo.arraySize = 1;
     createInfo.mipCount = 1;
     XrResult result = xrCreateSwapchain(m_session, &createInfo, &m_hud.swapchain);
+    if (result == XR_SESSION_LOSS_PENDING) {
+        RequestRecovery("xrCreateSwapchain(HUD)", result);
+        return false;
+    }
     if (result != XR_SUCCESS) {
         m_hud.swapchain = XR_NULL_HANDLE;
         Log("[HUD] xrCreateSwapchain failed: %d", (int)result);
@@ -640,6 +881,8 @@ bool OpenXRContext::CreateHudSwapchain(uint32_t width, uint32_t height) {
 
     uint32_t imageCount = 0;
     result = xrEnumerateSwapchainImages(m_hud.swapchain, 0, &imageCount, nullptr);
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrEnumerateSwapchainImages(HUD)", result);
     if (result != XR_SUCCESS || !imageCount) {
         DestroyHudSwapchain();
         return false;
@@ -647,6 +890,8 @@ bool OpenXRContext::CreateHudSwapchain(uint32_t width, uint32_t height) {
     m_hud.images.assign(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
     result = xrEnumerateSwapchainImages(m_hud.swapchain, imageCount, &imageCount,
         reinterpret_cast<XrSwapchainImageBaseHeader*>(m_hud.images.data()));
+    if (result == XR_SESSION_LOSS_PENDING)
+        RequestRecovery("xrEnumerateSwapchainImages(HUD)", result);
     if (result != XR_SUCCESS) {
         DestroyHudSwapchain();
         return false;
@@ -660,6 +905,13 @@ bool OpenXRContext::CreateHudSwapchain(uint32_t width, uint32_t height) {
 bool OpenXRContext::PrepareHudTexture(ID3D11Texture2D* texture,
                                       uint64_t pairSerial) {
     if (!texture || !pairSerial || !CanSubmitHud() || !m_context) return false;
+    const auto& hudConfig = config::Get();
+    const float hudOpacity = hudConfig.hud_opacity;
+    const float hudDistance = hudConfig.hud_distance;
+    const float hudWidthDegrees = hudConfig.hud_width_degrees;
+    const float hudScale = hudConfig.hud_scale;
+    const float hudHorizontalOffset = hudConfig.hud_horizontal_offset;
+    const float hudVerticalOffset = hudConfig.hud_vertical_offset;
     D3D11_TEXTURE2D_DESC sourceDesc = {};
     texture->GetDesc(&sourceDesc);
     if (!sourceDesc.Width || !sourceDesc.Height || sourceDesc.SampleDesc.Count != 1)
@@ -678,121 +930,154 @@ bool OpenXRContext::PrepareHudTexture(ID3D11Texture2D* texture,
     uint32_t imageIndex = 0;
     XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     XrResult result = xrAcquireSwapchainImage(m_hud.swapchain, &acquireInfo, &imageIndex);
-    if (result != XR_SUCCESS) {
+    if (!ObserveFrameResult("xrAcquireSwapchainImage(HUD)", result)) {
         ReleaseSRWLockExclusive(&m_hudLock);
         return false;
     }
-    XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    waitInfo.timeout = XR_INFINITE_DURATION;
-    result = xrWaitSwapchainImage(m_hud.swapchain, &waitInfo);
-    if (result != XR_SUCCESS) {
-        // OpenXR only permits release after a successful wait. Keep the
-        // swapchain intact and fall back to the complete projection pair.
-        Log("[HUD] xrWaitSwapchainImage failed: %d; disabling this HUD frame",
-            (int)result);
+    if (!WaitForSwapchainImage(m_hud.swapchain, "xrWaitSwapchainImage(HUD)")) {
+        // The image was acquired but never became waitable. Recovery destroys
+        // the affected session; releasing here would violate OpenXR call order.
         ReleaseSRWLockExclusive(&m_hudLock);
         return false;
     }
-    bool copied = result == XR_SUCCESS && imageIndex < m_hud.images.size() &&
+    bool copied = !NeedsRecovery() && imageIndex < m_hud.images.size() &&
         m_hud.images[imageIndex].texture &&
         render::HudBlitter::Instance().Blit(
             m_device, m_context, texture, m_hud.images[imageIndex].texture,
-            config::Get().hud_opacity);
+            hudOpacity);
     if (copied) m_context->Flush();
     XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     const XrResult releaseResult = xrReleaseSwapchainImage(m_hud.swapchain, &releaseInfo);
-    copied = copied && releaseResult == XR_SUCCESS;
+    const bool releaseObserved = ObserveFrameResult(
+        "xrReleaseSwapchainImage(HUD)", releaseResult);
+    copied = copied && releaseObserved && releaseResult == XR_SUCCESS;
     if (copied) {
         m_hudPrepared = true;
         m_hudPreparedPairSerial = pairSerial;
+        m_hudPreparedDistance = hudDistance;
+        m_hudPreparedWidthDegrees = hudWidthDegrees;
+        m_hudPreparedScale = hudScale;
+        m_hudPreparedOpacity = hudOpacity;
+        m_hudPreparedHorizontalOffset = hudHorizontalOffset;
+        m_hudPreparedVerticalOffset = hudVerticalOffset;
     }
     ReleaseSRWLockExclusive(&m_hudLock);
     return copied;
 }
 
 void OpenXRContext::PollEvents() {
-    XrEventDataBuffer event = {};
-    event.type = XR_TYPE_EVENT_DATA_BUFFER;
-
-    while (xrPollEvent(m_instance, &event) == XR_SUCCESS) {
-        if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
-            auto& stateChanged = *reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
-            m_sessionState = stateChanged.state;
-            Log("[OpenXR] Session state changed: %d", (int)m_sessionState);
-
-            switch (m_sessionState) {
-            case XR_SESSION_STATE_READY:
-                if (!m_deviceBound) {
-                    XrSessionBeginInfo bi = {};
-                    bi.type = XR_TYPE_SESSION_BEGIN_INFO;
-                    bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-                    const XrResult beginResult = xrBeginSession(m_session, &bi);
-                    if (beginResult == XR_SUCCESS) {
-                        m_deviceBound = true;
-                        Log("[OpenXR] Session READY - began");
-                    } else {
-                        Log("[OpenXR] ERROR: xrBeginSession = %d", (int)beginResult);
-                    }
-                }
-                break;
-            case XR_SESSION_STATE_STOPPING:
-                if (m_deviceBound) {
-                    xrEndSession(m_session);
-                    m_deviceBound = false;
-                    Log("[OpenXR] Session STOPPING - ended");
-                }
-                break;
-            case XR_SESSION_STATE_LOSS_PENDING:
-            case XR_SESSION_STATE_EXITING:
-                Log("[OpenXR] Session state %d - shutting down", (int)m_sessionState);
-                break;
-            default:
-                break;
-            }
+    if (m_instance == XR_NULL_HANDLE) return;
+    AcquireSRWLockExclusive(&m_eventLock);
+    while (true) {
+        XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
+        const XrResult pollResult = xrPollEvent(m_instance, &event);
+        if (pollResult == XR_EVENT_UNAVAILABLE) break;
+        if (XR_FAILED(pollResult)) {
+            Log("[OpenXR] xrPollEvent failed: %d", static_cast<int>(pollResult));
+            RequestRecovery("xrPollEvent", pollResult);
+            break;
         }
-        event.type = XR_TYPE_EVENT_DATA_BUFFER;
+        if (event.type == XR_TYPE_EVENT_DATA_EVENTS_LOST) {
+            const auto& lost = *reinterpret_cast<XrEventDataEventsLost*>(&event);
+            Log("[OpenXR] WARNING: runtime lost %u events", lost.lostEventCount);
+            continue;
+        }
+        if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
+            RequestRecovery("XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING",
+                            XR_ERROR_INSTANCE_LOST);
+            continue;
+        }
+        if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+            input::XRInput::Instance().LogCurrentInteractionProfiles();
+            continue;
+        }
+        if (event.type != XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) continue;
+
+        const auto& stateChanged =
+            *reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
+        if (stateChanged.session != XR_NULL_HANDLE && stateChanged.session != m_session)
+            continue;
+        const XrSessionState state = stateChanged.state;
+        m_sessionState.store(state, std::memory_order_release);
+        Log("[OpenXR] Session state changed: %d", static_cast<int>(state));
+
+        switch (state) {
+        case XR_SESSION_STATE_READY:
+            if (!m_deviceBound.load(std::memory_order_acquire)) {
+                XrSessionBeginInfo beginInfo = {XR_TYPE_SESSION_BEGIN_INFO};
+                beginInfo.primaryViewConfigurationType =
+                    XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                const XrResult beginResult = xrBeginSession(m_session, &beginInfo);
+                ObserveFrameResult("xrBeginSession", beginResult);
+                if (beginResult == XR_SUCCESS) {
+                    m_deviceBound.store(true, std::memory_order_release);
+                    Log("[OpenXR] Session READY - began");
+                } else if (XR_FAILED(beginResult)) {
+                    Log("[OpenXR] ERROR: xrBeginSession = %d", (int)beginResult);
+                }
+            }
+            break;
+        case XR_SESSION_STATE_STOPPING:
+            m_deviceBound.store(false, std::memory_order_release);
+            m_endSessionPending.store(true, std::memory_order_release);
+            Log("[OpenXR] Session STOPPING - ending after frame worker stops");
+            RequestRecovery("session stopped", XR_ERROR_SESSION_NOT_RUNNING);
+            break;
+        case XR_SESSION_STATE_LOSS_PENDING:
+        case XR_SESSION_STATE_EXITING:
+            m_deviceBound.store(false, std::memory_order_release);
+            RequestRecovery("session state loss", XR_SESSION_LOSS_PENDING);
+            break;
+        default:
+            break;
+        }
     }
+    ReleaseSRWLockExclusive(&m_eventLock);
 }
 
 bool OpenXRContext::WaitForFrame() {
     PollEvents();
-    if (!m_deviceBound) return false;
+    if (NeedsRecovery() || !m_deviceBound.load(std::memory_order_acquire)) return false;
 
     XrFrameWaitInfo waitInfo = {};
     waitInfo.type = XR_TYPE_FRAME_WAIT_INFO;
     m_frameState = {XR_TYPE_FRAME_STATE};
     XrResult r = xrWaitFrame(m_session, &waitInfo, &m_frameState);
-    if (XR_FAILED(r)) {
-        Log("[OpenXR] xrWaitFrame = %d", (int)r);
+    if (!ObserveFrameResult("xrWaitFrame", r) || r == XR_SESSION_LOSS_PENDING)
         return false;
-    }
-    return true;
+    m_predictedDisplayTime.store(m_frameState.predictedDisplayTime,
+                                 std::memory_order_release);
+    return XR_SUCCEEDED(r);
 }
 
 bool OpenXRContext::BeginFrame() {
-    if (m_frameActive) return true;
+    if (m_frameActive.load(std::memory_order_acquire)) return true;
+    if (NeedsRecovery()) return false;
 
     XrFrameBeginInfo beginInfo = {};
     beginInfo.type = XR_TYPE_FRAME_BEGIN_INFO;
     XrResult r = xrBeginFrame(m_session, &beginInfo);
-    if (XR_FAILED(r)) {
-        Log("[OpenXR] xrBeginFrame = %d", (int)r);
-        return false;
-    }
+    if (!ObserveFrameResult("xrBeginFrame", r)) return false;
     if (r == XR_FRAME_DISCARDED)
         Log("[OpenXR] xrBeginFrame discarded previous frame; continuing");
 
     m_frameActive = true;
-    m_viewsValid = false;
+    // The SteamVR compositor pump runs independently from game rendering.
+    // Keep the previous coherent pose readable until xrLocateViews publishes
+    // the next one instead of creating a brief invalid window every 11 ms.
+    if (!m_isSteamRuntime) m_viewsValid = false;
     AcquireSRWLockExclusive(&m_hudLock);
-    m_hudPrepared = false;
-    m_hudPreparedPairSerial = 0;
+    if (!m_isSteamRuntime) {
+        m_hudPrepared = false;
+        m_hudPreparedPairSerial = 0;
+    }
     ReleaseSRWLockExclusive(&m_hudLock);
     return true;
 }
 
 bool OpenXRContext::LocateViews() {
-    if (!m_frameActive || !m_frameState.shouldRender) return false;
+    if (!m_frameActive.load(std::memory_order_acquire) ||
+        !m_frameState.shouldRender || NeedsRecovery()) return false;
 
     XrViewState viewState = {};
     viewState.type = XR_TYPE_VIEW_STATE;
@@ -809,11 +1094,16 @@ bool OpenXRContext::LocateViews() {
     uint32_t viewCount = 0;
 
     XrResult r = xrLocateViews(m_session, &locInfo, &viewState, 2, &viewCount, views);
-    if (r != XR_SUCCESS || viewCount < 2) return false;
+    if (!ObserveFrameResult("xrLocateViews", r) || viewCount < 2) return false;
 
     AcquireSRWLockExclusive(&m_poseLock);
     m_poseValid = (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                   (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+    if (!m_poseValid) {
+        m_viewsValid = false;
+        ReleaseSRWLockExclusive(&m_poseLock);
+        return false;
+    }
 
     // Extract per-eye poses.
     for (int i = 0; i < 2; i++) {
@@ -942,7 +1232,7 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
                              const XrView* exactRenderedViews,
                              bool submitHudLayer,
                              uint64_t hudPairSerial) {
-    if (!m_frameActive) return false;
+    if (!m_frameActive.load(std::memory_order_acquire)) return false;
 
     XrFrameEndInfo endInfo = {};
     endInfo.type = XR_TYPE_FRAME_END_INFO;
@@ -993,12 +1283,12 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
         endInfo.layerCount = 1;
         endInfo.layers = layers;
 
-        if (submitHudLayer && hudPairSerial && ShouldSeparateHud()) {
+        if (submitHudLayer && hudPairSerial &&
+            (m_isSteamRuntime || ShouldSeparateHud())) {
             AcquireSRWLockShared(&m_hudLock);
             hudLockHeld = true;
-            const auto& hudConfig = config::Get();
             if (m_hudPrepared && m_hudPreparedPairSerial == hudPairSerial &&
-                m_hud.swapchain != XR_NULL_HANDLE && CanSubmitHud()) {
+                m_hud.swapchain != XR_NULL_HANDLE) {
                 hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                 hudLayer.space = m_viewSpace;
                 hudLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -1010,13 +1300,13 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
                 hudLayer.subImage.imageArrayIndex = 0;
                 hudLayer.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
                 hudLayer.pose.position = {
-                    hudConfig.hud_horizontal_offset,
-                    hudConfig.hud_vertical_offset,
-                    -hudConfig.hud_distance};
+                    m_hudPreparedHorizontalOffset,
+                    m_hudPreparedVerticalOffset,
+                    -m_hudPreparedDistance};
                 constexpr float kDegreesToRadians = 0.01745329251994329577f;
-                const float baseWidth = 2.0f * hudConfig.hud_distance * tanf(
-                    hudConfig.hud_width_degrees * kDegreesToRadians * 0.5f);
-                hudLayer.size.width = baseWidth * hudConfig.hud_scale;
+                const float baseWidth = 2.0f * m_hudPreparedDistance * tanf(
+                    m_hudPreparedWidthDegrees * kDegreesToRadians * 0.5f);
+                hudLayer.size.width = baseWidth * m_hudPreparedScale;
                 hudLayer.size.height = hudLayer.size.width *
                     static_cast<float>(m_hud.height) /
                     static_cast<float>(m_hud.width);
@@ -1026,8 +1316,8 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
                 if (!loggedHudLayer) {
                     Log("[HUD] VIEW-space quad active: distance=%.2fm width=%.1fdeg "
                         "scale=%.2f opacity=%.2f",
-                        hudConfig.hud_distance, hudConfig.hud_width_degrees,
-                        hudConfig.hud_scale, hudConfig.hud_opacity);
+                        m_hudPreparedDistance, m_hudPreparedWidthDegrees,
+                        m_hudPreparedScale, m_hudPreparedOpacity);
                     loggedHudLayer = true;
                 }
             }
@@ -1037,13 +1327,14 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
         if (++noLayerCount <= 5 || noLayerCount % 300 == 0)
             Log("[OpenXR] EndFrame: NO LAYERS (submit=%d views=%d shouldRender=%d sessionState=%d count=%llu)",
                 (int)submitProjectionLayer, (int)m_viewsValid, (int)ShouldRender(),
-                (int)m_sessionState, noLayerCount);
+                GetSessionState(), noLayerCount);
     }
 
     XrResult r = xrEndFrame(m_session, &endInfo);
     if (hudLockHeld) ReleaseSRWLockShared(&m_hudLock);
-    if (r != XR_SUCCESS) {
-        Log("[OpenXR] xrEndFrame FAILED: %d layers=%d result=%d",
+    const bool resultObserved = ObserveFrameResult("xrEndFrame", r);
+    if (!resultObserved || r == XR_SESSION_LOSS_PENDING) {
+        Log("[OpenXR] xrEndFrame FAILED: layers=%d result=%d",
             (int)endInfo.layerCount, (int)r);
     } else {
         static uint64_t endFrameOk = 0;
@@ -1055,15 +1346,20 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
 
     m_frameActive = false;
     AcquireSRWLockExclusive(&m_hudLock);
-    m_hudPrepared = false;
-    m_hudPreparedPairSerial = 0;
+    // SteamVR's compositor pump can present the same completed projection
+    // pair more than once. Keep its matching HUD swapchain image available
+    // until the game publishes the next complete pair.
+    if (!m_isSteamRuntime) {
+        m_hudPrepared = false;
+        m_hudPreparedPairSerial = 0;
+    }
     ReleaseSRWLockExclusive(&m_hudLock);
     return r == XR_SUCCESS;
 }
 
 bool OpenXRContext::EndFrameTheater(float sourceAspect, float distance,
                                     float width) {
-    if (!m_frameActive) return false;
+    if (!m_frameActive.load(std::memory_order_acquire)) return false;
 
     const float aspect = std::clamp(sourceAspect, 0.5f, 3.0f);
     const float safeDistance = std::clamp(distance, 0.5f, 10.0f);
@@ -1109,7 +1405,8 @@ bool OpenXRContext::EndFrameTheater(float sourceAspect, float distance,
     endInfo.layers = ShouldRender() ? layers : nullptr;
 
     const XrResult result = xrEndFrame(m_session, &endInfo);
-    if (XR_FAILED(result)) {
+    const bool resultObserved = ObserveFrameResult("xrEndFrame(theater)", result);
+    if (!resultObserved || result == XR_SESSION_LOSS_PENDING) {
         Log("[OpenXR] xrEndFrame(theater) FAILED: %d", static_cast<int>(result));
     } else {
         static uint64_t theaterFrames = 0;
@@ -1125,7 +1422,7 @@ bool OpenXRContext::EndFrameTheater(float sourceAspect, float distance,
     m_hudPrepared = false;
     m_hudPreparedPairSerial = 0;
     ReleaseSRWLockExclusive(&m_hudLock);
-    return XR_SUCCEEDED(result);
+    return result == XR_SUCCESS;
 }
 
 }} // namespace bl1gotyvr::xr

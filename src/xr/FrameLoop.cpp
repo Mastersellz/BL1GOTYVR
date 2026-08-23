@@ -26,6 +26,11 @@ FrameLoop& FrameLoop::Instance() {
 
 void FrameLoop::Initialize() {
     Log("[FrameLoop] Initializing...");
+    if (m_waitWorker && !StopWaitWorker()) {
+        OpenXRContext::Instance().RequestRecovery(
+            "frame worker survived reinitialization", XR_ERROR_RUNTIME_FAILURE);
+        return;
+    }
     m_vrActive = true;
     m_desktopTestMode = false;
     m_gdiLatencyCorrection = true;
@@ -34,6 +39,13 @@ void FrameLoop::Initialize() {
     m_frameCount = 0;
     m_missingTicketPresents = 0;
     m_hasSubmittedStereoProjection = false;
+    AcquireSRWLockExclusive(&m_steamSubmissionLock);
+    m_steamSubmittedViewsValid = false;
+    m_steamSubmittedHud = false;
+    m_steamSubmittedHudSerial = 0;
+    m_steamTheaterActive = false;
+    m_steamTheaterAspect = 1.0f;
+    ReleaseSRWLockExclusive(&m_steamSubmissionLock);
     m_desktopCaptureMask = 0;
     m_desktopPairSerial = 0;
     m_poseSeeded = false;
@@ -75,16 +87,57 @@ void FrameLoop::Shutdown() {
 
 DWORD WINAPI FrameLoop::WaitWorkerProc(void* context) {
     auto* frameLoop = static_cast<FrameLoop*>(context);
+    auto& xr = OpenXRContext::Instance();
+    if (xr.IsSteamRuntime()) {
+        Log("[FrameLoop] SteamVR compositor pump started");
+        uint64_t submittedFrames = 0;
+        while (!frameLoop->m_waitWorkerStop.load(std::memory_order_acquire)) {
+            if (!xr.WaitForFrame()) {
+                if (xr.NeedsRecovery()) return 0;
+                Sleep(10);
+                continue;
+            }
+            if (!xr.BeginFrame()) {
+                if (xr.NeedsRecovery()) return 0;
+                Sleep(1);
+                continue;
+            }
+
+            const bool located = xr.ShouldRender() && xr.LocateViews();
+            AcquireSRWLockShared(&frameLoop->m_steamSubmissionLock);
+            const bool recovering = xr.NeedsRecovery();
+            const bool submitProjection = !recovering && located &&
+                frameLoop->m_steamSubmittedViewsValid;
+            const bool submitted = recovering
+                ? xr.EndFrame(false)
+                : located && frameLoop->m_steamTheaterActive
+                    ? xr.EndFrameTheater(frameLoop->m_steamTheaterAspect)
+                    : xr.EndFrame(
+                    submitProjection,
+                    submitProjection ? frameLoop->m_steamSubmittedViews : nullptr,
+                    submitProjection && frameLoop->m_steamSubmittedHud,
+                    submitProjection ? frameLoop->m_steamSubmittedHudSerial : 0);
+            ReleaseSRWLockShared(&frameLoop->m_steamSubmissionLock);
+            if (submitted && submitProjection &&
+                (++submittedFrames <= 5 || submittedFrames % 600 == 0)) {
+                Log("[FrameLoop] SteamVR compositor pump submitted frame (count=%llu)",
+                    static_cast<unsigned long long>(submittedFrames));
+            }
+            if (xr.NeedsRecovery()) return 0;
+        }
+        return 0;
+    }
+
     while (!frameLoop->m_waitWorkerStop.load(std::memory_order_acquire)) {
         if (WaitForSingleObject(frameLoop->m_waitRequestEvent, INFINITE) != WAIT_OBJECT_0)
             break;
         if (frameLoop->m_waitWorkerStop.load(std::memory_order_acquire)) break;
-        auto& xr = OpenXRContext::Instance();
         while (!frameLoop->m_waitWorkerStop.load(std::memory_order_acquire)) {
             if (xr.IsInitialized() && xr.WaitForFrame()) {
                 SetEvent(frameLoop->m_waitReadyEvent);
                 break;
             }
+            if (xr.NeedsRecovery()) return 0;
             Sleep(10);
         }
     }
@@ -113,16 +166,42 @@ void FrameLoop::StartWaitWorker() {
     Log("[FrameLoop] OpenXR wait worker started");
 }
 
-void FrameLoop::StopWaitWorker() {
-    if (!m_waitWorker) return;
+bool FrameLoop::StopWaitWorker() {
+    if (!m_waitWorker) return true;
     m_waitWorkerStop.store(true, std::memory_order_release);
     SetEvent(m_waitRequestEvent);
-    WaitForSingleObject(m_waitWorker, 2000);
+    const DWORD waitResult = WaitForSingleObject(m_waitWorker, 2000);
+    if (waitResult != WAIT_OBJECT_0) {
+        Log("[FrameLoop] OpenXR wait worker is still inside runtime; recovery deferred");
+        return false;
+    }
     CloseHandle(m_waitWorker);
     CloseHandle(m_waitRequestEvent);
     CloseHandle(m_waitReadyEvent);
     m_waitWorker = nullptr;
     m_waitRequestEvent = m_waitReadyEvent = nullptr;
+    return true;
+}
+
+bool FrameLoop::PrepareForOpenXRRecovery() {
+    auto& openXR = OpenXRContext::Instance();
+    openXR.RequestSessionExit();
+    if (!StopWaitWorker()) return false;
+    InvalidateBackbufferResources();
+    m_poseSeeded = false;
+    m_hasSubmittedStereoProjection = false;
+    m_missingTicketPresents = 0;
+    m_submissionViewsValid = false;
+    AcquireSRWLockExclusive(&m_steamSubmissionLock);
+    m_steamSubmittedViewsValid = false;
+    m_steamSubmittedHud = false;
+    m_steamSubmittedHudSerial = 0;
+    m_steamTheaterActive = false;
+    m_steamTheaterAspect = 1.0f;
+    ReleaseSRWLockExclusive(&m_steamSubmissionLock);
+    m_submissionRightAimValid = false;
+    Log("[FrameLoop] OpenXR frame state reset for session recovery");
+    return true;
 }
 
 void FrameLoop::InvalidateBackbufferResources() {
@@ -879,29 +958,32 @@ bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* 
                                   ID3D11Texture2D* hudOverlay,
                                   bool flatSource) {
     auto& xr = OpenXRContext::Instance();
+    if (xr.NeedsRecovery()) return false;
     EyeData& eyeData = (eye == 0) ? xr.GetLeftEye() : xr.GetRightEye();
 
     // Acquire swapchain image
     uint32_t imageIndex = 0;
     XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
     XrResult r = xrAcquireSwapchainImage(eyeData.swapchain, &acquireInfo, &imageIndex);
-    if (r != XR_SUCCESS) {
-        Log("[FrameLoop] xrAcquireSwapchainImage(eye %d) = %d", eye, (int)r);
+    if (!xr.ObserveFrameResult("xrAcquireSwapchainImage(eye)", r)) {
         return false;
     }
 
-    XrSwapchainImageWaitInfo waitInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-    waitInfo.timeout = XR_INFINITE_DURATION;
-    r = xrWaitSwapchainImage(eyeData.swapchain, &waitInfo);
-    if (r != XR_SUCCESS) {
-        Log("[FrameLoop] xrWaitSwapchainImage(eye %d) = %d", eye, (int)r);
-        XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-        xrReleaseSwapchainImage(eyeData.swapchain, &releaseInfo);
+    if (!xr.WaitForSwapchainImage(eyeData.swapchain,
+                                  "xrWaitSwapchainImage(eye)")) {
+        // Recovery owns this acquired-but-not-waited image. Releasing it here
+        // would produce XR_ERROR_CALL_ORDER_INVALID.
         return false;
+    }
+    if (imageIndex >= eyeData.images.size() || !eyeData.images[imageIndex].texture) {
+        Log("[FrameLoop] Invalid OpenXR image index: eye=%d index=%u count=%zu",
+            eye, imageIndex, eyeData.images.size());
+        xr.RequestRecovery("invalid swapchain image index", XR_ERROR_RUNTIME_FAILURE);
     }
 
     // Get destination texture from swapchain image
-    ID3D11Texture2D* destTex = eyeData.images[imageIndex].texture;
+    ID3D11Texture2D* destTex = imageIndex < eyeData.images.size()
+        ? eyeData.images[imageIndex].texture : nullptr;
 
     // Render into an application-owned texture with the concrete OpenXR
     // format, then copy into the runtime-owned image. VDXR/Meta exposes
@@ -909,11 +991,12 @@ bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* 
     // instead of creating application RTVs on runtime resources.
     D3D11_TEXTURE2D_DESC srcDesc, dstDesc;
     source->GetDesc(&srcDesc);
-    destTex->GetDesc(&dstDesc);
+    if (destTex) destTex->GetDesc(&dstDesc);
 
     ID3D11Device* device = nullptr;
     context->GetDevice(&device);
-    bool copied = device && EnsureSwapchainUploadTexture(device, dstDesc, eye);
+    bool copied = !xr.NeedsRecovery() && destTex && device &&
+        EnsureSwapchainUploadTexture(device, dstDesc, eye);
     if (device) device->Release();
     ID3D11Texture2D* uploadTexture = copied ? m_swapchainUploadTextures[eye] : nullptr;
     D3D11_TEXTURE2D_DESC uploadDesc = {};
@@ -952,8 +1035,8 @@ bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* 
     if (copied) context->Flush();
     XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     const XrResult releaseResult = xrReleaseSwapchainImage(eyeData.swapchain, &releaseInfo);
-    if (releaseResult != XR_SUCCESS) {
-        Log("[FrameLoop] xrReleaseSwapchainImage(eye %d) = %d", eye, (int)releaseResult);
+    if (!xr.ObserveFrameResult("xrReleaseSwapchainImage(eye)", releaseResult) ||
+        releaseResult != XR_SUCCESS) {
         copied = false;
     }
     return copied;
@@ -1457,6 +1540,28 @@ bool FrameLoop::TrySubmitTheaterFrame(ID3D11Device* device,
     auto& xr = OpenXRContext::Instance();
     if (!device || !context || !swapChain || !xr.IsInitialized() || !m_poseSeeded)
         return false;
+
+    if (xr.IsSteamRuntime() && m_waitWorker) {
+        ID3D11Texture2D* backbuffer = d3d11::AcquireCurrentBackbuffer(swapChain);
+        if (!backbuffer) return false;
+        D3D11_TEXTURE2D_DESC desc = {};
+        backbuffer->GetDesc(&desc);
+        bool copied = false;
+        if (desc.Width && desc.Height && desc.SampleDesc.Count == 1) {
+            AcquireSRWLockExclusive(&m_steamSubmissionLock);
+            copied = CopyTextureToEye(context, backbuffer, 0, false, -1, nullptr, true);
+            if (copied) {
+                context->Flush();
+                m_steamTheaterAspect = static_cast<float>(desc.Width) / desc.Height;
+                m_steamTheaterActive = true;
+            } else {
+                xr.RequestRecovery("SteamVR theater upload failed", XR_ERROR_RUNTIME_FAILURE);
+            }
+            ReleaseSRWLockExclusive(&m_steamSubmissionLock);
+        }
+        backbuffer->Release();
+        return copied;
+    }
 
     StartWaitWorker();
     bool waitReady = m_waitReadyEvent &&
@@ -2300,7 +2405,8 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     XrView submittedViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
     bool xrFrameBegun = false;
     bool preparedWaitConsumed = false;
-    if (completePair) {
+    const bool steamCompositorPump = xr.IsSteamRuntime();
+    if (completePair && !steamCompositorPump) {
         StartWaitWorker();
         preparedWaitConsumed = m_waitReadyEvent &&
             WaitForSingleObject(m_waitReadyEvent, 1) == WAIT_OBJECT_0;
@@ -2331,7 +2437,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         } else {
             m_poseSeeded = true;
         }
-    } else if (completePair) {
+    } else if (completePair && !steamCompositorPump) {
         completePair = false;
     }
     if (completePair) {
@@ -2353,6 +2459,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         m_submissionAimConvergenceMeters = renderedTicket.aimConvergenceMeters;
         m_submissionProjectionCorrection = renderedTicket.projectionCorrection;
         m_submissionRenderAspect = renderedTicket.renderAspect;
+        if (steamCompositorPump) AcquireSRWLockExclusive(&m_steamSubmissionLock);
         AcquireSRWLockExclusive(&m_captureLock);
         D3D11_TEXTURE2D_DESC finalDesc[2] = {}, worldDesc[2] = {};
         if (m_eyeTextures[0]) m_eyeTextures[0]->GetDesc(&finalDesc[0]);
@@ -2420,16 +2527,30 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         submittedViews[0] = capturedPairViews[leftSource];
         submittedViews[1] = capturedPairViews[rightSource];
         completePair = leftOk && rightOk;
+        if (steamCompositorPump && completePair) {
+            m_steamSubmittedViews[0] = submittedViews[0];
+            m_steamSubmittedViews[1] = submittedViews[1];
+            m_steamSubmittedViewsValid = true;
+            m_steamSubmittedHud = hudQuadPrepared;
+            m_steamSubmittedHudSerial = hudQuadPrepared ? renderedTicket.pairSerial : 0;
+            m_steamTheaterActive = false;
+        } else if (steamCompositorPump) {
+            xr.RequestRecovery("partial SteamVR stereo upload", XR_ERROR_RUNTIME_FAILURE);
+        }
+        if (steamCompositorPump) ReleaseSRWLockExclusive(&m_steamSubmissionLock);
         if (completePair) context->Flush();
     }
 
     // A left-eye engine frame does not own an OpenXR frame. The completed
     // right eye waits once, submits both frozen views, and seeds the pose for
     // the next pair, matching ME2VR's synchronized AER cadence.
-    const bool submitted = xrFrameBegun && xr.EndFrame(
-        completePair, completePair ? submittedViews : nullptr,
-        completePair && hudQuadPrepared,
-        completePair && hudQuadPrepared ? renderedTicket.pairSerial : 0);
+    const bool submitted = steamCompositorPump
+        ? completePair
+        : xrFrameBegun && xr.EndFrame(
+            completePair, completePair ? submittedViews : nullptr,
+            completePair && hudQuadPrepared,
+            completePair && hudQuadPrepared ? renderedTicket.pairSerial : 0);
+    if (steamCompositorPump && completePair) StartWaitWorker();
     if (preparedWaitConsumed && m_waitRequestEvent) SetEvent(m_waitRequestEvent);
     static bool loggedFirstSubmission = false;
     if (submitted && completePair && !loggedFirstSubmission) {

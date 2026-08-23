@@ -12,12 +12,13 @@ other DXGI-based overlay before installing this mod. Removing the proxy
 
 Run `BL1GOTYVRConfig.exe` from the same directory as `BL1GOTYVR.dll`. The
 utility writes `BL1GOTYVR.ini`. Optical and tracking settings reload live after
-Save; only resolution changes require restarting the game.
+Save; resolution and OpenXR refresh-rate changes require restarting the game.
 
 | Setting | Range | Effect |
 |---|---:|---|
 | Render width/height | 640x480 to 7680x4320 | Game backbuffer resolution |
 | Resolution scale | 0.50 to 2.00 | OpenXR eye swapchain scale |
+| OpenXR refresh rate | 0 or 1 to 240 Hz | Requests the nearest runtime-supported rate; `0` keeps the runtime default |
 | Camera FOV | 60 to 150 degrees | UE3 camera FOV during each eye render |
 | IPD | 50 to 80 mm | Physical separation between eye cameras |
 | Convergence shift | 0 to 20% per eye | Horizontal eye-image shift; `10` is the recommended GDI/AFR baseline and `0` keeps images parallel |

@@ -29,11 +29,13 @@ class XRInput {
 public:
     static XRInput& Instance();
 
-    bool Initialize(XrInstance instance, XrSession session, XrSpace space);
+    bool Initialize(XrInstance instance, XrSession session, XrSpace space,
+                    bool touchPlusEnabled);
     void Shutdown();
     bool SyncActions();
     void UpdateControllerStates(XrTime displayTime);
     bool GetControllerSnapshot(ControllerState controllers[2], uint64_t* generation = nullptr) const;
+    void LogCurrentInteractionProfiles() const;
 
 private:
     XRInput() = default;
@@ -56,6 +58,10 @@ private:
     // Thumbstick
     XrAction m_leftThumbstick = XR_NULL_HANDLE;
     XrAction m_rightThumbstick = XR_NULL_HANDLE;
+    XrAction m_leftThumbstickX = XR_NULL_HANDLE;
+    XrAction m_leftThumbstickY = XR_NULL_HANDLE;
+    XrAction m_rightThumbstickX = XR_NULL_HANDLE;
+    XrAction m_rightThumbstickY = XR_NULL_HANDLE;
 
     // Trigger
     XrAction m_leftTrigger = XR_NULL_HANDLE;

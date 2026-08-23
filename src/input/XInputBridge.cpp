@@ -119,9 +119,12 @@ bool XInputBridge::PatchHostImports() {
             bool getState = false;
             bool extended = false;
             if (IMAGE_SNAP_BY_ORDINAL64(originalThunk[index].u1.Ordinal)) {
-                extended = IMAGE_ORDINAL64(
-                    originalThunk[index].u1.Ordinal) == 100;
-                getState = extended;
+                const WORD ordinal = static_cast<WORD>(IMAGE_ORDINAL64(
+                    originalThunk[index].u1.Ordinal));
+                // XInput 1.3 exports the standard GetState entry as ordinal 2.
+                // UE3 imports it by ordinal rather than by its public name.
+                extended = ordinal == 100;
+                getState = ordinal == 2 || extended;
             } else {
                 const auto* import = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
                     module + originalThunk[index].u1.AddressOfData);
@@ -202,6 +205,11 @@ DWORD XInputBridge::MergeVrState(
     DWORD userIndex, XINPUT_STATE* state, DWORD originalResult) {
     auto& bridge = Instance();
     if (userIndex != 0) return originalResult;
+
+    static std::atomic<std::uint64_t> pollCount{0};
+    const std::uint64_t currentPoll = pollCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (currentPoll == 1)
+        Log("[XInput] Game XInputGetState polling intercepted");
 
     std::lock_guard<std::mutex> lock(bridge.m_stateMutex);
     const std::uint64_t now = GetTickCount64();

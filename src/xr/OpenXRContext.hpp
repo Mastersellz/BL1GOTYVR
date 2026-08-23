@@ -15,6 +15,7 @@ namespace bl1gotyvr { namespace xr {
 
 // Format equivalence check for cross-runtime compatibility (SteamVR, VDXR, WMR).
 bool AreFormatsCompatible(DXGI_FORMAT a, DXGI_FORMAT b);
+bool IsSteamRuntimeSelected();
 
 struct EyeData {
     XrSwapchain swapchain = XR_NULL_HANDLE;
@@ -31,7 +32,13 @@ public:
 
     bool Initialize(ID3D11Device* device, DXGI_FORMAT backbufferFormat);
     void Shutdown();
-    bool IsInitialized() const { return m_initialized; }
+    bool IsInitialized() const { return m_initialized.load(std::memory_order_acquire); }
+    bool IsSteamRuntime() const { return m_isSteamRuntime; }
+    bool NeedsRecovery() const { return m_recoveryRequested.load(std::memory_order_acquire); }
+    void RequestRecovery(const char* call, XrResult result);
+    bool ObserveFrameResult(const char* call, XrResult result);
+    bool WaitForSwapchainImage(XrSwapchain swapchain, const char* label);
+    void RequestSessionExit();
 
     // Frame lifecycle
     bool WaitForFrame();
@@ -55,9 +62,11 @@ public:
     bool IsFrameActive() const { return m_frameActive; }
     bool HasLocatedViews() const { return m_viewsValid; }
     bool ShouldRender() const { return m_frameState.shouldRender == XR_TRUE; }
-    XrTime GetPredictedDisplayTime() const { return m_frameState.predictedDisplayTime; }
+    XrTime GetPredictedDisplayTime() const {
+        return m_predictedDisplayTime.load(std::memory_order_acquire);
+    }
     bool HasValidPose() const { return m_poseValid; }
-    int GetSessionState() const { return (int)m_sessionState; }
+    int GetSessionState() const { return (int)m_sessionState.load(std::memory_order_acquire); }
     bool GetPoseSnapshot(float headPosition[3], float headRotation[4],
                          XrView views[2]) const;
 
@@ -94,24 +103,31 @@ private:
     bool CreateSession();
     bool CreateSpaces();
     bool CreateSwapchains();
+    void ConfigureRefreshRate();
     bool CreateHudSwapchain(uint32_t width, uint32_t height);
     void DestroyHudSwapchain();
     void PollEvents();
 
     XrResult CheckResult(XrResult result, const char* call);
 
-    bool m_initialized = false;
-    bool m_deviceBound = false;
+    std::atomic<bool> m_initialized{false};
+    std::atomic<bool> m_deviceBound{false};
+    std::atomic<bool> m_recoveryRequested{false};
+    std::atomic<bool> m_endSessionPending{false};
 
     // OpenXR core
     XrInstance m_instance = XR_NULL_HANDLE;
     XrSystemId m_systemId = XR_NULL_SYSTEM_ID;
     XrSession m_session = XR_NULL_HANDLE;
-    XrSessionState m_sessionState = XR_SESSION_STATE_UNKNOWN;
+    std::atomic<XrSessionState> m_sessionState{XR_SESSION_STATE_UNKNOWN};
     XrSystemProperties m_systemProperties = {XR_TYPE_SYSTEM_PROPERTIES};
     char m_runtimeName[XR_MAX_RUNTIME_NAME_SIZE] = {};
+    bool m_isSteamRuntime = false;
     bool m_isVdxr = false;
     bool m_integratedHud = false;
+    bool m_refreshRateSupported = false;
+    bool m_touchControllerPlusSupported = false;
+    SRWLOCK m_eventLock = SRWLOCK_INIT;
 
     // Spaces
     XrSpace m_stageSpace = XR_NULL_HANDLE;
@@ -119,6 +135,7 @@ private:
 
     // Frame
     XrFrameState m_frameState = {XR_TYPE_FRAME_STATE};
+    std::atomic<XrTime> m_predictedDisplayTime{0};
     std::atomic<bool> m_frameActive{false};
     XrView m_views[2] = {};
     XrView m_renderedViews[2] = {};
@@ -134,6 +151,12 @@ private:
     EyeData m_hud;
     bool m_hudPrepared = false;
     uint64_t m_hudPreparedPairSerial = 0;
+    float m_hudPreparedDistance = 1.5f;
+    float m_hudPreparedWidthDegrees = 50.0f;
+    float m_hudPreparedScale = 1.0f;
+    float m_hudPreparedOpacity = 1.0f;
+    float m_hudPreparedHorizontalOffset = 0.0f;
+    float m_hudPreparedVerticalOffset = 0.0f;
     SRWLOCK m_hudLock = SRWLOCK_INIT;
 
     // Computed matrices (row-major, 4x4)

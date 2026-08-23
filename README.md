@@ -38,7 +38,7 @@ eye rendering.
 
 Dependencies are fetched automatically by CMake:
 
-- OpenXR SDK 1.1.43
+- OpenXR SDK 1.1.58
 - MinHook 1.3.4
 
 ## Installation
@@ -60,9 +60,9 @@ Only one `dxgi.dll` proxy can occupy the game directory. Remove or chain any
 other DXGI proxy before installing the mod. To disable automatic loading,
 remove this mod's `dxgi.dll`; the game executable is never patched.
 
-Start the selected OpenXR runtime before launching the game. When Virtual
-Desktop Streamer is running, the mod automatically selects its VDXR manifest.
-Otherwise it uses the active system OpenXR runtime, including SteamVR.
+Select and start the desired OpenXR runtime before launching the game. The mod
+respects `XR_RUNTIME_JSON` when supplied; otherwise it uses the system
+`ActiveRuntime` selection, including SteamVR and VDXR.
 
 ## Configuration
 
