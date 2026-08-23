@@ -397,9 +397,9 @@ void InputHook::UpdateState(XrTime displayTime) {
     uint64_t expectedDotTime = 0;
     if (right.aimValid && m_motionControlsEnabled.load(std::memory_order_acquire) &&
         m_dotVisibleAtMs.compare_exchange_strong(
-            expectedDotTime, now + 3000,
+            expectedDotTime, now,
             std::memory_order_acq_rel, std::memory_order_acquire)) {
-        Log("[Input] Aim dot scheduled from tracked right controller");
+        Log("[Input] Aim dot enabled from tracked right controller");
     }
     const bool physicalMeleePulse = UpdatePhysicalMelee(left, now);
     if (m_motionReenableAtMs && now >= m_motionReenableAtMs) {
@@ -701,8 +701,10 @@ void InputHook::RequestMotionCalibrationReset() {
 
 bool InputHook::IsAimDotVisible() const {
     const uint64_t visibleAt = m_dotVisibleAtMs.load(std::memory_order_acquire);
-    return visibleAt != 0 && GetTickCount64() >= visibleAt &&
-        m_motionControlsEnabled.load(std::memory_order_acquire);
+    if (visibleAt == 0 || GetTickCount64() < visibleAt ||
+        !m_motionControlsEnabled.load(std::memory_order_acquire)) return false;
+    if (camera::IsVehicleCameraActive()) return true;
+    return WeaponAimSystem::Instance().GetPlayerIdentity().weaponValid;
 }
 
 bool InputHook::GetWeaponBarrelLocalDirection(float direction[3]) {
@@ -975,10 +977,11 @@ void InputHook::ApplyRightHand(int eye) {
         m_weaponIdentityStableSinceMs = now;
         m_weaponMountValid = false;
         m_mountIdentityGeneration = 0;
+        ActivateWeaponAimProfile(inventory.pawn, inventory.weapon, active->outerName,
+                                 active->meshName, active->component);
         if (equippedWeaponChanged &&
             m_motionControlsEnabled.exchange(false, std::memory_order_acq_rel)) {
             m_motionReenableAtMs = now + 700;
-            m_dotVisibleAtMs.store(0, std::memory_order_release);
             player::ArmIKSystem::Instance().SetEnabled(false);
             m_nativeWeaponCalibrationResetRequested.store(true, std::memory_order_release);
             m_weaponCalibrationResetRequested.store(true, std::memory_order_release);
@@ -1151,10 +1154,10 @@ void InputHook::ApplyRightHand(int eye) {
     m_componentCount = 1;
     m_weaponPoseActive.store(true, std::memory_order_release);
     uint64_t expectedDotTime = 0;
-    const uint64_t dotVisibleAt = GetTickCount64() + 3000;
+    const uint64_t dotVisibleAt = GetTickCount64();
     if (m_dotVisibleAtMs.compare_exchange_strong(expectedDotTime, dotVisibleAt,
             std::memory_order_acq_rel, std::memory_order_acquire)) {
-        Log("[WeaponPose] Aim dot scheduled 3 seconds after motion activation");
+        Log("[WeaponPose] Aim dot enabled with active weapon profile");
     }
     if (m_lastDrivenWeapon != inventory.weapon ||
         m_lastDrivenComponent != active->component) {

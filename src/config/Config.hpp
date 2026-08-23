@@ -45,6 +45,7 @@ float hud_horizontal_offset = 0.0f;
     float weapon_position_scale = 0.5f;
     float aim_pitch_degrees = 0.0f;
     float aim_yaw_degrees = 0.0f;
+    float aim_convergence_m = 20.0f;
     float weapon_offset_forward = 0.0f;
     float weapon_offset_right = 0.0f;
     float weapon_offset_up = 0.0f;
@@ -66,7 +67,7 @@ float hud_horizontal_offset = 0.0f;
     float right_hand_rotation_yaw = 0.0f;
     float right_hand_rotation_roll = 0.0f;
 
-    /* Aim dot offsets in normalized eye UV */
+    /* Legacy visual-only aim dot offsets in normalized eye UV */
     float dot_horizontal_offset = 0.0f;
     float dot_vertical_offset = 0.0f;
 

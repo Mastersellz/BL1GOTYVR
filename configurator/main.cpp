@@ -32,7 +32,7 @@ struct Field {
     bool integer;
 };
 
-constexpr std::array<Field, 10> kFields = {{
+constexpr std::array<Field, 11> kFields = {{
     {101, "Render width", "Display", "Width", "2048", 640.0f, 7680.0f, true},
     {102, "Render height", "Display", "Height", "2048", 480.0f, 4320.0f, true},
     {103, "Resolution scale", "Display", "ResolutionScale", "1.00", 0.5f, 2.0f, false},
@@ -43,6 +43,7 @@ constexpr std::array<Field, 10> kFields = {{
     {108, "Far plane", "Rendering", "FarPlane", "10000", 100.0f, 100000.0f, false},
     {109, "Position scale", "Tracking", "PositionScale", "1.00", 0.0f, 5.0f, false},
     {110, "Rotation scale", "Tracking", "RotationScale", "1.00", 0.0f, 5.0f, false},
+    {111, "Aim target distance (m)", "Dot", "ConvergenceDistance", "20.0", 1.0f, 100.0f, false},
 }};
 
 struct RenderPreset {

@@ -671,13 +671,10 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
     }
 
     const player::ArmRigStatus rig = player::ArmIKSystem::Instance().GetStatus();
-    if (!rig.rigValid || !rig.skeletalMesh) {
-        ResetHandViewmodelIdentity();
-        oIASetIndexBuffer(context, indexBuffer, format, offset);
-        return;
-    }
-    if ((s_targetComponent && s_targetComponent != rig.component) ||
-        (s_targetSkeletalMesh && s_targetSkeletalMesh != rig.skeletalMesh))
+    const bool rigIdentityValid = rig.rigValid && rig.component && rig.skeletalMesh;
+    if (rigIdentityValid &&
+        ((s_targetComponent && s_targetComponent != rig.component) ||
+         (s_targetSkeletalMesh && s_targetSkeletalMesh != rig.skeletalMesh)))
         ResetHandViewmodelIdentity();
 
     ID3D11Buffer* vertexBuffer = nullptr;
@@ -706,10 +703,13 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
             s_targetVertexBuffer->AddRef();
             s_targetIndexBuffer = indexBuffer;
             s_targetIndexBuffer->AddRef();
-            s_targetComponent = rig.component;
-            s_targetSkeletalMesh = rig.skeletalMesh;
+            s_targetComponent = rigIdentityValid ? rig.component : 0;
+            s_targetSkeletalMesh = rigIdentityValid ? rig.skeletalMesh : 0;
             Log("[VanillaHands] Viewmodel buffers locked: VB=%p IB=%p",
                 s_targetVertexBuffer, s_targetIndexBuffer);
+        } else if (rigIdentityValid && !s_targetComponent && !s_targetSkeletalMesh) {
+            s_targetComponent = rig.component;
+            s_targetSkeletalMesh = rig.skeletalMesh;
         }
         indexBuffer->AddRef();
         s_replacedSourceIndexBuffer = indexBuffer;

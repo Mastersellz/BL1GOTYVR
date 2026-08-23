@@ -959,11 +959,13 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                     input::InputHook::Instance().SetCanonicalWeaponPose(
                         worldWeaponPosition, weaponForward, weaponUp,
                         armCameraLocation, nativeCameraForward, nativeCameraUp);
+                    input::WeaponAimSystem::Instance().UpdateDirection(
+                        worldAimOrigin, worldForward,
+                        renderTicket.aimConvergenceMeters);
                 } else {
                     input::InputHook::Instance().ClearCanonicalWeaponPose();
+                    input::WeaponAimSystem::Instance().InvalidateDirection();
                 }
-                input::WeaponAimSystem::Instance().UpdateDirection(
-                    worldAimOrigin, worldForward);
             } else {
                 input::InputHook::Instance().ClearCanonicalWeaponPose();
                 input::WeaponAimSystem::Instance().InvalidateDirection();

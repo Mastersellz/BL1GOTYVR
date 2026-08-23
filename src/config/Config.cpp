@@ -99,6 +99,9 @@ void Load(const char* path) {
         ReadFloat("Weapon", "AimPitch", s_settings.aim_pitch_degrees, path), -45.0f, 45.0f);
     s_settings.aim_yaw_degrees = std::clamp(
         ReadFloat("Weapon", "AimYaw", s_settings.aim_yaw_degrees, path), -45.0f, 45.0f);
+    s_settings.aim_convergence_m = std::clamp(
+        ReadFloat("Dot", "ConvergenceDistance", s_settings.aim_convergence_m, path),
+        1.0f, 100.0f);
     s_settings.weapon_offset_forward = std::clamp(
         ReadFloat("Weapon", "OffsetForward", s_settings.weapon_offset_forward, path), -100.0f, 100.0f);
     s_settings.weapon_offset_right = std::clamp(
@@ -149,10 +152,11 @@ void Load(const char* path) {
         s_settings.vanilla_hands_filter ? 1 : 0, path) != 0;
 
     Log("[Config] Loaded %s: %dx%d scale=%.2f FOV=%.1f IPD=%.1fmm "
-        "convergenceShift=%.2f%% aim=(%.2f,%.2f)",
+        "convergenceShift=%.2f%% aim=(%.2f,%.2f) target=%.1fm",
         path, s_settings.render_width, s_settings.render_height, s_settings.resolution_scale,
         s_settings.fov_degrees, s_settings.ipd_mm, s_settings.convergence_m,
-        s_settings.aim_pitch_degrees, s_settings.aim_yaw_degrees);
+        s_settings.aim_pitch_degrees, s_settings.aim_yaw_degrees,
+        s_settings.aim_convergence_m);
     WIN32_FILE_ATTRIBUTE_DATA attributes = {};
     if (GetFileAttributesExA(path, GetFileExInfoStandard, &attributes))
         s_lastWriteTime = attributes.ftLastWriteTime;
@@ -223,6 +227,7 @@ void Save(const char* path) {
     WriteFloat("Weapon", "PositionScale", s_settings.weapon_position_scale, path);
     WriteFloat("Weapon", "AimPitch", s_settings.aim_pitch_degrees, path);
     WriteFloat("Weapon", "AimYaw", s_settings.aim_yaw_degrees, path);
+    WriteFloat("Dot", "ConvergenceDistance", s_settings.aim_convergence_m, path);
     WriteFloat("Weapon", "OffsetForward", s_settings.weapon_offset_forward, path);
     WriteFloat("Weapon", "OffsetRight", s_settings.weapon_offset_right, path);
     WriteFloat("Weapon", "OffsetUp", s_settings.weapon_offset_up, path);

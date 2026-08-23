@@ -540,39 +540,62 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
             m_submissionAimPitchDegrees, m_submissionAimYawDegrees, aimForward);
         float trackingForward[3] = {};
         rotate(m_submissionRightAimRotation, aimForward, trackingForward);
+        const float directionLength = sqrtf(
+            trackingForward[0] * trackingForward[0] +
+            trackingForward[1] * trackingForward[1] +
+            trackingForward[2] * trackingForward[2]);
         // The dot is drawn into the destination eye. sourceEye may refer to a
         // crossed/reversed capture texture and must not select the eye pose.
         const XrView& eyeView = m_submissionViews[eye];
-        const float inverseEye[4] = {
-            -eyeView.pose.orientation.x, -eyeView.pose.orientation.y,
-            -eyeView.pose.orientation.z, eyeView.pose.orientation.w
-        };
-        float eyeLocal[3] = {};
-        rotate(inverseEye, trackingForward, eyeLocal);
-        if (eyeLocal[2] < -0.001f) {
-            const float tangentX = eyeLocal[0] / -eyeLocal[2];
-            const float tangentY = eyeLocal[1] / -eyeLocal[2];
-            const float tanLeft = tanf(eyeView.fov.angleLeft);
-            const float tanRight = tanf(eyeView.fov.angleRight);
-            const float tanDown = tanf(eyeView.fov.angleDown);
-            const float tanUp = tanf(eyeView.fov.angleUp);
-            // Horizontal crop follows the asymmetric eye FOV. Vertical crop
-            // deliberately centers the symmetric UE3 source projection, so
-            // the marker must use that same centered span to match world hits.
-            dotU = (tangentX - tanLeft) / (tanRight - tanLeft);
-            const float verticalHalfSpan = (tanUp - tanDown) * 0.5f;
-            dotV = (verticalHalfSpan - tangentY) / (verticalHalfSpan * 2.0f);
-            dotEnabled = dotU >= 0.0f && dotU <= 1.0f &&
-                          dotV >= 0.0f && dotV <= 1.0f ? 1.0f : 0.0f;
-            static uint32_t rayProjectionLogs = 0;
-            if (eye == 0 && (++rayProjectionLogs % 300) == 1) {
-                Log("[AimRay] Quest aim q=(%.3f,%.3f,%.3f,%.3f) "
-                    "trackingDir=(%.3f,%.3f,%.3f) eyeDir=(%.3f,%.3f,%.3f) "
-                    "dot=(%.3f,%.3f)",
-                    m_submissionRightAimRotation[0], m_submissionRightAimRotation[1],
-                    m_submissionRightAimRotation[2], m_submissionRightAimRotation[3],
-                    trackingForward[0], trackingForward[1], trackingForward[2],
-                    eyeLocal[0], eyeLocal[1], eyeLocal[2], dotU, dotV);
+        const float convergenceMeters = (std::max)(1.0f,
+            (std::min)(100.0f, m_submissionAimConvergenceMeters));
+        if (std::isfinite(directionLength) && directionLength > 1.0e-5f &&
+            std::isfinite(convergenceMeters)) {
+            const float directionScale = convergenceMeters / directionLength;
+            const float targetStage[3] = {
+                m_submissionRightAimPosition[0] + trackingForward[0] * directionScale,
+                m_submissionRightAimPosition[1] + trackingForward[1] * directionScale,
+                m_submissionRightAimPosition[2] + trackingForward[2] * directionScale
+            };
+            const float eyeDelta[3] = {
+                targetStage[0] - eyeView.pose.position.x,
+                targetStage[1] - eyeView.pose.position.y,
+                targetStage[2] - eyeView.pose.position.z
+            };
+            const float inverseEye[4] = {
+                -eyeView.pose.orientation.x, -eyeView.pose.orientation.y,
+                -eyeView.pose.orientation.z, eyeView.pose.orientation.w
+            };
+            float eyeLocal[3] = {};
+            rotate(inverseEye, eyeDelta, eyeLocal);
+            if (eyeLocal[2] >= -0.001f) {
+                dotEnabled = 0.0f;
+            } else {
+                const float tangentX = eyeLocal[0] / -eyeLocal[2];
+                const float tangentY = eyeLocal[1] / -eyeLocal[2];
+                const float tanLeft = tanf(eyeView.fov.angleLeft);
+                const float tanRight = tanf(eyeView.fov.angleRight);
+                const float tanDown = tanf(eyeView.fov.angleDown);
+                const float tanUp = tanf(eyeView.fov.angleUp);
+                // Horizontal crop follows the asymmetric eye FOV. Vertical crop
+                // deliberately centers the symmetric UE3 source projection, so
+                // the marker must use that same centered span to match world hits.
+                dotU = (tangentX - tanLeft) / (tanRight - tanLeft);
+                const float verticalHalfSpan = (tanUp - tanDown) * 0.5f;
+                dotV = (verticalHalfSpan - tangentY) / (verticalHalfSpan * 2.0f);
+                dotEnabled = dotU >= 0.0f && dotU <= 1.0f &&
+                              dotV >= 0.0f && dotV <= 1.0f ? 1.0f : 0.0f;
+                static uint32_t rayProjectionLogs = 0;
+                if (eye == 0 && (++rayProjectionLogs % 300) == 1) {
+                    Log("[AimRay] Quest aim q=(%.3f,%.3f,%.3f,%.3f) "
+                        "target=(%.3f,%.3f,%.3f) eyeLocal=(%.3f,%.3f,%.3f) "
+                        "distance=%.1fm dot=(%.3f,%.3f)",
+                        m_submissionRightAimRotation[0], m_submissionRightAimRotation[1],
+                        m_submissionRightAimRotation[2], m_submissionRightAimRotation[3],
+                        targetStage[0], targetStage[1], targetStage[2],
+                        eyeLocal[0], eyeLocal[1], eyeLocal[2], convergenceMeters,
+                        dotU, dotV);
+                }
             }
         }
     }
@@ -978,6 +1001,7 @@ bool FrameLoop::AcquireRenderTicket(StereoRenderTicket& ticket) {
         m_activePair.views[1] = currentViews[1];
         m_activePair.aimPitchDegrees = config::Get().aim_pitch_degrees;
         m_activePair.aimYawDegrees = config::Get().aim_yaw_degrees;
+        m_activePair.aimConvergenceMeters = config::Get().aim_convergence_m;
         m_activePair.rightAimValid = controllers[1].aimValid;
         if (m_activePair.rightAimValid) {
             memcpy(m_activePair.rightAimPosition, controllers[1].aimPosition,
@@ -2326,6 +2350,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         }
         m_submissionAimPitchDegrees = renderedTicket.aimPitchDegrees;
         m_submissionAimYawDegrees = renderedTicket.aimYawDegrees;
+        m_submissionAimConvergenceMeters = renderedTicket.aimConvergenceMeters;
         m_submissionProjectionCorrection = renderedTicket.projectionCorrection;
         m_submissionRenderAspect = renderedTicket.renderAspect;
         AcquireSRWLockExclusive(&m_captureLock);

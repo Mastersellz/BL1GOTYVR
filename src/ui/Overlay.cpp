@@ -181,15 +181,11 @@ void DrawUi() {
     }
 
     if (ImGui::CollapsingHeader("Aim dot", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextWrapped("Screen correction in percent. Positive vertical moves the dot up.");
-        float horizontalPercent = settings.dot_horizontal_offset * 100.0f;
-        float verticalPercent = settings.dot_vertical_offset * 100.0f;
-        if (ImGui::SliderFloat("Horizontal (%)", &horizontalPercent,
-                               -25.0f, 25.0f, "%+.2f%%"))
-            settings.dot_horizontal_offset = horizontalPercent * 0.01f;
-        if (ImGui::SliderFloat("Vertical (%)", &verticalPercent,
-                               -25.0f, 25.0f, "%+.2f%%"))
-            settings.dot_vertical_offset = verticalPercent * 0.01f;
+        ImGui::SliderFloat("Target distance (m)", &settings.aim_convergence_m,
+                           1.0f, 100.0f, "%.1f m");
+        ImGui::TextWrapped(
+            "The active weapon profile stores aim pitch/yaw automatically. "
+            "Use Ctrl+numpad tuning to move bullets and dot together.");
     }
 
     ImGui::Separator();

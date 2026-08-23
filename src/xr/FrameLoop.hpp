@@ -24,6 +24,7 @@ struct StereoRenderTicket {
     float rightAimRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     float aimPitchDegrees = 0.0f;
     float aimYawDegrees = 0.0f;
+    float aimConvergenceMeters = 20.0f;
     uint64_t armTargetGeneration = 0;
     XrView views[2] = {};
 };
@@ -149,6 +150,7 @@ private:
     float m_submissionRightAimRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     float m_submissionAimPitchDegrees = 0.0f;
     float m_submissionAimYawDegrees = 0.0f;
+    float m_submissionAimConvergenceMeters = 20.0f;
     float m_lastDotSettings[2][4] = {};
     bool m_submissionProjectionCorrection = true;
     float m_submissionRenderAspect = 1.0f;

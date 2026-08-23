@@ -21,7 +21,8 @@ class WeaponAimSystem {
 public:
     static WeaponAimSystem& Instance();
 
-    void UpdateDirection(const float worldOrigin[3], const float worldDirection[3]);
+    void UpdateDirection(const float worldOrigin[3], const float worldDirection[3],
+                         float convergenceMeters);
     void InvalidateDirection() {
         m_aimValid.store(false, std::memory_order_release);
         m_aimTargetValid.store(false, std::memory_order_release);

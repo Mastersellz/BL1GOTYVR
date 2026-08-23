@@ -7,6 +7,7 @@
 
 #include <Windows.h>
 #include <Psapi.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -20,6 +21,21 @@ constexpr int32_t kRotUnisPerTurn = 65536;
 constexpr float kRadiansToUnis = 65536.0f / 6.2831853071795864769f;
 constexpr uintptr_t kProcessEventRva = 0x01CB460;
 constexpr size_t kProcessEventVtableIndex = 67;
+
+bool DirectionToRotator(const float direction[3], int32_t rotation[3]) {
+    if (!direction || !rotation) return false;
+    const float horizontal = sqrtf(direction[0] * direction[0] +
+                                   direction[1] * direction[1]);
+    const float length = sqrtf(horizontal * horizontal + direction[2] * direction[2]);
+    if (!std::isfinite(horizontal) || !std::isfinite(length) || length < 1.0e-5f)
+        return false;
+    rotation[0] = static_cast<int32_t>(lroundf(
+        atan2f(direction[2], horizontal) * kRadiansToUnis));
+    rotation[1] = static_cast<int32_t>(lroundf(
+        atan2f(direction[1], direction[0]) * kRadiansToUnis));
+    rotation[2] = 0;
+    return true;
+}
 
 struct TArray64 {
     uint64_t data = 0;
@@ -210,7 +226,8 @@ void BuildCalibratedLocalForward(float pitchDegrees, float yawDegrees, float out
 }
 
 void WeaponAimSystem::UpdateDirection(const float worldOrigin[3],
-                                      const float worldDirection[3]) {
+                                      const float worldDirection[3],
+                                      float convergenceMeters) {
     if (!worldOrigin || !worldDirection) return;
     const float x = worldDirection[0];
     const float y = worldDirection[1];
@@ -230,15 +247,17 @@ void WeaponAimSystem::UpdateDirection(const float worldOrigin[3],
     m_aimPitch.store(pitch, std::memory_order_relaxed);
     m_aimYaw.store(yaw, std::memory_order_relaxed);
     m_aimRoll.store(0, std::memory_order_relaxed);
-    constexpr float kProjectileConvergenceUe = 20.0f * 100.0f;
+    if (!std::isfinite(convergenceMeters)) return;
+    const float targetDistanceUe = (std::max)(1.0f,
+        (std::min)(100.0f, convergenceMeters)) * 100.0f;
     m_aimOriginX.store(worldOrigin[0], std::memory_order_relaxed);
     m_aimOriginY.store(worldOrigin[1], std::memory_order_relaxed);
     m_aimOriginZ.store(worldOrigin[2], std::memory_order_relaxed);
-    m_aimTargetX.store(worldOrigin[0] + x / length * kProjectileConvergenceUe,
+    m_aimTargetX.store(worldOrigin[0] + x / length * targetDistanceUe,
                        std::memory_order_relaxed);
-    m_aimTargetY.store(worldOrigin[1] + y / length * kProjectileConvergenceUe,
+    m_aimTargetY.store(worldOrigin[1] + y / length * targetDistanceUe,
                        std::memory_order_relaxed);
-    m_aimTargetZ.store(worldOrigin[2] + z / length * kProjectileConvergenceUe,
+    m_aimTargetZ.store(worldOrigin[2] + z / length * targetDistanceUe,
                        std::memory_order_relaxed);
     m_aimTargetValid.store(true, std::memory_order_release);
     m_aimUpdatedMs.store(GetTickCount64(), std::memory_order_release);
@@ -247,7 +266,8 @@ void WeaponAimSystem::UpdateDirection(const float worldOrigin[3],
     static std::atomic<bool> loggedFirst{false};
     if (!loggedFirst.exchange(true)) {
         Log("[WeaponAim] UpdateDirection first call: dir=(%.3f,%.3f,%.3f) "
-            "rot=(%d,%d,%d)", x, y, z, pitch, yaw, 0);
+            "rot=(%d,%d,%d) target=%.1fm", x, y, z, pitch, yaw, 0,
+            targetDistanceUe * 0.01f);
     }
 }
 
@@ -573,10 +593,35 @@ void __fastcall WeaponAimSystem::HookedScriptInvoke(void* object, void* frame,
     };
     float origin[3] = {};
     const bool originReadable = locals && ReadDirect(locals, origin, sizeof(origin));
-    // The compositor dot represents this angular direction at infinity. Use
-    // the same direction for GetAdjustedAim so surface depth cannot introduce
-    // controller-to-camera parallax between the marker and the shot trace.
-    const bool finiteTargetUsed = false;
+    bool finiteTargetUsed = false;
+    if (desiredValid && originReadable &&
+        system.m_aimTargetValid.load(std::memory_order_acquire)) {
+        const float aimOrigin[3] = {
+            system.m_aimOriginX.load(std::memory_order_relaxed),
+            system.m_aimOriginY.load(std::memory_order_relaxed),
+            system.m_aimOriginZ.load(std::memory_order_relaxed)
+        };
+        const float target[3] = {
+            system.m_aimTargetX.load(std::memory_order_relaxed),
+            system.m_aimTargetY.load(std::memory_order_relaxed),
+            system.m_aimTargetZ.load(std::memory_order_relaxed)
+        };
+        const float originDx = origin[0] - aimOrigin[0];
+        const float originDy = origin[1] - aimOrigin[1];
+        const float originDz = origin[2] - aimOrigin[2];
+        constexpr float kMaxFireOriginDistanceUe = 1000.0f;
+        if (std::isfinite(originDx) && std::isfinite(originDy) &&
+            std::isfinite(originDz) &&
+            originDx * originDx + originDy * originDy + originDz * originDz <=
+                kMaxFireOriginDistanceUe * kMaxFireOriginDistanceUe) {
+            const float finiteDirection[3] = {
+                target[0] - origin[0],
+                target[1] - origin[1],
+                target[2] - origin[2]
+            };
+            finiteTargetUsed = DirectionToRotator(finiteDirection, desired);
+        }
+    }
     bool overrideEnabled = false;
     bool resultReadable = false;
     bool written = false;
@@ -1045,6 +1090,7 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
 
 void WeaponAimSystem::Shutdown() {
     m_aimValid.store(false, std::memory_order_release);
+    m_aimTargetValid.store(false, std::memory_order_release);
     m_aimUpdatedMs.store(0, std::memory_order_release);
     m_fireActive.store(false, std::memory_order_release);
     m_vehicleSecondaryFireActive.store(false, std::memory_order_release);
