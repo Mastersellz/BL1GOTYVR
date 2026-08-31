@@ -113,7 +113,8 @@ static uintptr_t             s_targetComponent = 0;
 static uintptr_t             s_targetSkeletalMesh = 0;
 static ID3D11Buffer*         s_replacedSourceIndexBuffer = nullptr;
 static std::atomic<bool>     s_vanillaHandsFilterEnabled{false};
-static bool                  s_handOnlyBufferAttempted = false;
+static std::atomic<float>    s_vanillaHandsCutThreshold{74.0f};
+static std::atomic<bool>     s_handOnlyBufferAttempted{false};
 
 static constexpr UINT kHandsVertexStride = 32;
 
@@ -130,6 +131,12 @@ static constexpr HandBufferSignature kHandBufferSignatures[] = {
     {"Mordecai", 3318 * kHandsVertexStride, 16347 * sizeof(uint16_t), 74.0f},
     {"Roland",   2561 * kHandsVertexStride, 13116 * sizeof(uint16_t), 74.0f},
 };
+static SRWLOCK               s_handFilterLock = SRWLOCK_INIT;
+static ID3D11Buffer*         s_pendingHandVertexBuffer = nullptr;
+static ID3D11Buffer*         s_pendingHandIndexBuffer = nullptr;
+static const HandBufferSignature* s_pendingHandSignature = nullptr;
+static uintptr_t             s_pendingHandComponent = 0;
+static uintptr_t             s_pendingHandSkeletalMesh = 0;
 
 static const HandBufferSignature* FindHandBufferSignature(
     UINT vertexBufferSize, UINT vertexStride, UINT indexBufferSize) {
@@ -137,6 +144,13 @@ static const HandBufferSignature* FindHandBufferSignature(
     for (const auto& signature : kHandBufferSignatures) {
         if (signature.vertexBufferSize == vertexBufferSize &&
             signature.indexBufferSize == indexBufferSize)
+            return &signature;
+    }
+    // Some UE3 paths expose a repacked vertex stream with the same immutable
+    // character index buffer. The readback below validates every index before
+    // a replacement can be used.
+    for (const auto& signature : kHandBufferSignatures) {
+        if (signature.indexBufferSize == indexBufferSize)
             return &signature;
     }
     return nullptr;
@@ -147,6 +161,40 @@ static bool IsKnownHandsIndexBufferSize(UINT size) {
         if (signature.indexBufferSize == size) return true;
     }
     return false;
+}
+
+static bool IsGameDeviceContext(ID3D11DeviceContext* context) {
+    if (!context || !s_gameDevice) return false;
+    if (context == s_gameContext) return true;
+
+    static SRWLOCK contextLock = SRWLOCK_INIT;
+    static ID3D11DeviceContext* knownContexts[16] = {};
+    AcquireSRWLockShared(&contextLock);
+    for (auto* known : knownContexts) {
+        if (known == context) {
+            ReleaseSRWLockShared(&contextLock);
+            return true;
+        }
+    }
+    ReleaseSRWLockShared(&contextLock);
+
+    ID3D11Device* device = nullptr;
+    context->GetDevice(&device);
+    const bool matches = device == s_gameDevice;
+    if (device) device->Release();
+    if (!matches) return false;
+
+    AcquireSRWLockExclusive(&contextLock);
+    for (auto*& known : knownContexts) {
+        if (known == context) break;
+        if (!known) {
+            known = context;
+            Log("[VanillaHands] Game deferred context accepted: context=%p", context);
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&contextLock);
+    return true;
 }
 
 ID3D11Device* GetGameDevice() { return s_gameDevice; }
@@ -563,6 +611,18 @@ static void ReleaseReplacedSourceIndexBuffer() {
 }
 
 static void ResetHandViewmodelIdentity() {
+    AcquireSRWLockExclusive(&s_handFilterLock);
+    if (s_pendingHandVertexBuffer) {
+        s_pendingHandVertexBuffer->Release();
+        s_pendingHandVertexBuffer = nullptr;
+    }
+    if (s_pendingHandIndexBuffer) {
+        s_pendingHandIndexBuffer->Release();
+        s_pendingHandIndexBuffer = nullptr;
+    }
+    s_pendingHandSignature = nullptr;
+    s_pendingHandComponent = 0;
+    s_pendingHandSkeletalMesh = 0;
     if (s_targetVertexBuffer) {
         s_targetVertexBuffer->Release();
         s_targetVertexBuffer = nullptr;
@@ -578,6 +638,7 @@ static void ResetHandViewmodelIdentity() {
         s_handOnlyIndexBuffer = nullptr;
     }
     s_handOnlyBufferAttempted = false;
+    ReleaseSRWLockExclusive(&s_handFilterLock);
 }
 
 static void RestoreSourceIndexBuffer(ID3D11DeviceContext* context) {
@@ -619,24 +680,26 @@ static bool ReadBuffer(ID3D11DeviceContext* context, ID3D11Buffer* source,
     return SUCCEEDED(result) && !bytes.empty();
 }
 
-static bool CreateHandOnlyIndexBuffer(ID3D11DeviceContext* context,
-                                      ID3D11Buffer* vertexBuffer,
-                                      ID3D11Buffer* indexBuffer,
-                                      const HandBufferSignature& signature) {
+static ID3D11Buffer* CreateHandOnlyIndexBuffer(
+        ID3D11DeviceContext* context, ID3D11Buffer* vertexBuffer,
+        ID3D11Buffer* indexBuffer, const HandBufferSignature& signature) {
     std::vector<uint8_t> vertexBytes;
     std::vector<uint8_t> indexBytes;
     if (!ReadBuffer(context, vertexBuffer, vertexBytes) ||
         !ReadBuffer(context, indexBuffer, indexBytes)) {
         Log("[VanillaHands] ERROR: viewmodel buffer readback failed");
-        return false;
+        return nullptr;
     }
 
     const size_t vertexCount = vertexBytes.size() / kHandsVertexStride;
     const size_t indexCount = indexBytes.size() / sizeof(uint16_t);
-    if (vertexCount == 0 || indexCount == 0 || indexCount % 3 != 0) return false;
+    if (vertexCount == 0 || indexCount == 0 || indexCount % 3 != 0)
+        return nullptr;
     std::vector<uint16_t> filtered(indexCount);
     memcpy(filtered.data(), indexBytes.data(), indexBytes.size());
     size_t keptTriangles = 0;
+    const float positionThreshold = s_vanillaHandsCutThreshold.load(
+        std::memory_order_acquire);
     for (size_t start = 0; start < indexCount; start += 3) {
         bool keep = true;
         for (size_t corner = 0; corner < 3; ++corner) {
@@ -648,7 +711,7 @@ static bool CreateHandOnlyIndexBuffer(ID3D11DeviceContext* context,
             }
             memcpy(&x, vertexBytes.data() + static_cast<size_t>(vertex) *
                 kHandsVertexStride, sizeof(x));
-            if (!std::isfinite(x) || std::fabs(x) < signature.positionThreshold) {
+            if (!std::isfinite(x) || std::fabs(x) < positionThreshold) {
                 keep = false;
                 break;
             }
@@ -663,12 +726,12 @@ static bool CreateHandOnlyIndexBuffer(ID3D11DeviceContext* context,
     if (keptTriangles == 0 || keptTriangles == indexCount / 3) {
         Log("[VanillaHands] ERROR: unsafe dynamic cut rejected: kept=%zu/%zu",
             keptTriangles, indexCount / 3);
-        return false;
+        return nullptr;
     }
 
     ID3D11Device* device = nullptr;
     context->GetDevice(&device);
-    if (!device) return false;
+    if (!device) return nullptr;
     D3D11_BUFFER_DESC desc = {};
     desc.ByteWidth = static_cast<UINT>(indexBytes.size());
     desc.Usage = D3D11_USAGE_IMMUTABLE;
@@ -680,21 +743,42 @@ static bool CreateHandOnlyIndexBuffer(ID3D11DeviceContext* context,
     device->Release();
     if (FAILED(result) || !replacement) {
         Log("[VanillaHands] ERROR: dynamic index buffer creation failed: 0x%08X", result);
-        return false;
+        return nullptr;
     }
-    if (s_handOnlyIndexBuffer) s_handOnlyIndexBuffer->Release();
-    s_handOnlyIndexBuffer = replacement;
     Log("[VanillaHands] %s cut ready: vertices=%zu kept=%zu/%zu threshold=%.1f",
         signature.character, vertexCount, keptTriangles, indexCount / 3,
-        signature.positionThreshold);
-    return true;
+        positionThreshold);
+    return replacement;
+}
+
+static void QueueHandOnlyIndexBuffer(ID3D11Buffer* vertexBuffer,
+                                     ID3D11Buffer* indexBuffer,
+                                     const HandBufferSignature* signature,
+                                     uintptr_t component,
+                                     uintptr_t skeletalMesh) {
+    if (!vertexBuffer || !indexBuffer || !signature) return;
+    AcquireSRWLockExclusive(&s_handFilterLock);
+    if (!s_targetVertexBuffer && !s_pendingHandVertexBuffer &&
+        !s_handOnlyBufferAttempted) {
+        vertexBuffer->AddRef();
+        indexBuffer->AddRef();
+        s_pendingHandVertexBuffer = vertexBuffer;
+        s_pendingHandIndexBuffer = indexBuffer;
+        s_pendingHandSignature = signature;
+        s_pendingHandComponent = component;
+        s_pendingHandSkeletalMesh = skeletalMesh;
+        Log("[VanillaHands] Viewmodel geometry queued for safe Present readback: "
+            "character=%s", signature->character);
+    }
+    ReleaseSRWLockExclusive(&s_handFilterLock);
 }
 
 static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* context,
                                                       ID3D11Buffer* indexBuffer,
                                                       DXGI_FORMAT format, UINT offset) {
+    const bool gameContext = IsGameDeviceContext(context);
     if (context == s_gameContext) ReleaseReplacedSourceIndexBuffer();
-    if (s_insidePresent || context != s_gameContext ||
+    if (s_insidePresent || !gameContext ||
         !s_vanillaHandsFilterEnabled.load(std::memory_order_acquire) ||
         !indexBuffer ||
         format != DXGI_FORMAT_R16_UINT || offset != 0) {
@@ -711,9 +795,15 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
 
     const player::ArmRigStatus rig = player::ArmIKSystem::Instance().GetStatus();
     const bool rigIdentityValid = rig.rigValid && rig.component && rig.skeletalMesh;
+    uintptr_t targetComponent = 0;
+    uintptr_t targetSkeletalMesh = 0;
+    AcquireSRWLockShared(&s_handFilterLock);
+    targetComponent = s_targetComponent;
+    targetSkeletalMesh = s_targetSkeletalMesh;
+    ReleaseSRWLockShared(&s_handFilterLock);
     if (rigIdentityValid &&
-        ((s_targetComponent && s_targetComponent != rig.component) ||
-         (s_targetSkeletalMesh && s_targetSkeletalMesh != rig.skeletalMesh)))
+        ((targetComponent && targetComponent != rig.component) ||
+         (targetSkeletalMesh && targetSkeletalMesh != rig.skeletalMesh)))
         ResetHandViewmodelIdentity();
 
     ID3D11Buffer* vertexBuffer = nullptr;
@@ -726,42 +816,53 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
         ? FindHandBufferSignature(vertexDesc.ByteWidth, vertexStride, indexDesc.ByteWidth)
         : nullptr;
     const bool signatureMatches = signature != nullptr;
-    const bool identityMatches = !s_targetVertexBuffer ||
+    bool targetMissing = true;
+    bool identityMatches = false;
+    ID3D11Buffer* replacement = nullptr;
+    AcquireSRWLockShared(&s_handFilterLock);
+    targetMissing = s_targetVertexBuffer == nullptr;
+    identityMatches = targetMissing ||
         (vertexBuffer == s_targetVertexBuffer && indexBuffer == s_targetIndexBuffer);
+    if (!targetMissing && identityMatches && s_handOnlyIndexBuffer) {
+        replacement = s_handOnlyIndexBuffer;
+        replacement->AddRef();
+    }
+    ReleaseSRWLockShared(&s_handFilterLock);
     if (signatureMatches && identityMatches) {
-        if (!s_targetVertexBuffer) {
-            if (s_handOnlyBufferAttempted ||
-                !CreateHandOnlyIndexBuffer(context, vertexBuffer, indexBuffer, *signature)) {
-                s_handOnlyBufferAttempted = true;
-                vertexBuffer->Release();
-                oIASetIndexBuffer(context, indexBuffer, format, offset);
-                return;
+        if (targetMissing) {
+            QueueHandOnlyIndexBuffer(vertexBuffer, indexBuffer, signature,
+                rigIdentityValid ? rig.component : 0,
+                rigIdentityValid ? rig.skeletalMesh : 0);
+            vertexBuffer->Release();
+            oIASetIndexBuffer(context, indexBuffer, format, offset);
+            return;
+        } else if (replacement) {
+            if (rigIdentityValid && !targetComponent && !targetSkeletalMesh) {
+                AcquireSRWLockExclusive(&s_handFilterLock);
+                if (vertexBuffer == s_targetVertexBuffer &&
+                    indexBuffer == s_targetIndexBuffer) {
+                    s_targetComponent = rig.component;
+                    s_targetSkeletalMesh = rig.skeletalMesh;
+                }
+                ReleaseSRWLockExclusive(&s_handFilterLock);
             }
-            s_handOnlyBufferAttempted = true;
-            s_targetVertexBuffer = vertexBuffer;
-            s_targetVertexBuffer->AddRef();
-            s_targetIndexBuffer = indexBuffer;
-            s_targetIndexBuffer->AddRef();
-            s_targetComponent = rigIdentityValid ? rig.component : 0;
-            s_targetSkeletalMesh = rigIdentityValid ? rig.skeletalMesh : 0;
-            Log("[VanillaHands] Viewmodel buffers locked: VB=%p IB=%p",
-                s_targetVertexBuffer, s_targetIndexBuffer);
-        } else if (rigIdentityValid && !s_targetComponent && !s_targetSkeletalMesh) {
-            s_targetComponent = rig.component;
-            s_targetSkeletalMesh = rig.skeletalMesh;
-        }
-        indexBuffer->AddRef();
-        s_replacedSourceIndexBuffer = indexBuffer;
-        static std::atomic<bool> loggedSwap{false};
-        if (!loggedSwap.exchange(true, std::memory_order_relaxed)) {
+            if (context == s_gameContext) {
+                indexBuffer->AddRef();
+                s_replacedSourceIndexBuffer = indexBuffer;
+            }
+            static std::atomic<bool> loggedSwap{false};
+            if (!loggedSwap.exchange(true, std::memory_order_relaxed)) {
                 Log("[VanillaHands] Geometry cut active: VB=%u stride=%u IB=%u indices=%u",
                     vertexDesc.ByteWidth, vertexStride, indexDesc.ByteWidth,
                     indexDesc.ByteWidth / static_cast<UINT>(sizeof(uint16_t)));
+            }
+            if (vertexBuffer) vertexBuffer->Release();
+            oIASetIndexBuffer(context, replacement, format, 0);
+            replacement->Release();
+            return;
         }
-        if (vertexBuffer) vertexBuffer->Release();
-        oIASetIndexBuffer(context, s_handOnlyIndexBuffer, format, 0);
-        return;
     }
+    if (replacement) replacement->Release();
     if (vertexBuffer) vertexBuffer->Release();
     oIASetIndexBuffer(context, indexBuffer, format, offset);
 }
@@ -769,14 +870,68 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
 static void EnsureHandOnlyIndexBuffer(ID3D11Device* device) {
     if (!device ||
         !s_vanillaHandsFilterEnabled.load(std::memory_order_acquire)) return;
-    if (s_handOnlyDevice == device) return;
     if (s_handOnlyDevice && s_handOnlyDevice != device) {
         ResetHandViewmodelIdentity();
         s_handOnlyDevice->Release();
         s_handOnlyDevice = nullptr;
     }
-    s_handOnlyDevice = device;
-    s_handOnlyDevice->AddRef();
+    if (!s_handOnlyDevice) {
+        s_handOnlyDevice = device;
+        s_handOnlyDevice->AddRef();
+    }
+
+    ID3D11Buffer* vertexBuffer = nullptr;
+    ID3D11Buffer* indexBuffer = nullptr;
+    const HandBufferSignature* signature = nullptr;
+    uintptr_t component = 0;
+    uintptr_t skeletalMesh = 0;
+    AcquireSRWLockExclusive(&s_handFilterLock);
+    if (!s_targetVertexBuffer && s_pendingHandVertexBuffer &&
+        s_pendingHandIndexBuffer && s_pendingHandSignature &&
+        !s_handOnlyBufferAttempted) {
+        vertexBuffer = s_pendingHandVertexBuffer;
+        indexBuffer = s_pendingHandIndexBuffer;
+        signature = s_pendingHandSignature;
+        component = s_pendingHandComponent;
+        skeletalMesh = s_pendingHandSkeletalMesh;
+        s_pendingHandVertexBuffer = nullptr;
+        s_pendingHandIndexBuffer = nullptr;
+        s_pendingHandSignature = nullptr;
+        s_pendingHandComponent = 0;
+        s_pendingHandSkeletalMesh = 0;
+        s_handOnlyBufferAttempted = true;
+    }
+    ReleaseSRWLockExclusive(&s_handFilterLock);
+    if (!vertexBuffer || !indexBuffer || !signature || !s_gameContext) {
+        if (vertexBuffer) vertexBuffer->Release();
+        if (indexBuffer) indexBuffer->Release();
+        return;
+    }
+
+    D3D11_BUFFER_DESC vertexDesc = {};
+    D3D11_BUFFER_DESC indexDesc = {};
+    vertexBuffer->GetDesc(&vertexDesc);
+    indexBuffer->GetDesc(&indexDesc);
+    ID3D11Buffer* replacement = CreateHandOnlyIndexBuffer(
+        s_gameContext, vertexBuffer, indexBuffer, *signature);
+    if (!replacement) {
+        vertexBuffer->Release();
+        indexBuffer->Release();
+        return;
+    }
+
+    AcquireSRWLockExclusive(&s_handFilterLock);
+    if (s_handOnlyIndexBuffer) s_handOnlyIndexBuffer->Release();
+    s_handOnlyIndexBuffer = replacement;
+    s_targetVertexBuffer = vertexBuffer;
+    s_targetIndexBuffer = indexBuffer;
+    s_targetComponent = component;
+    s_targetSkeletalMesh = skeletalMesh;
+    ReleaseSRWLockExclusive(&s_handFilterLock);
+    Log("[VanillaHands] Viewmodel buffers locked: VB=%p bytes=%u stride=%u "
+        "IB=%p bytes=%u",
+        vertexBuffer, vertexDesc.ByteWidth, kHandsVertexStride,
+        indexBuffer, indexDesc.ByteWidth);
 }
 
 // Present hook — main frame entry point
@@ -846,6 +1001,14 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
         }
         s_vanillaHandsFilterEnabled.store(
             config::Get().vanilla_hands_filter, std::memory_order_release);
+        const float cutThreshold = config::Get().vanilla_hands_cut_threshold;
+        const float previousCutThreshold = s_vanillaHandsCutThreshold.exchange(
+            cutThreshold, std::memory_order_acq_rel);
+        if (std::fabs(previousCutThreshold - cutThreshold) > 0.01f) {
+            Log("[VanillaHands] Cut threshold changed %.1f -> %.1f; rebuilding geometry",
+                previousCutThreshold, cutThreshold);
+            ResetHandViewmodelIdentity();
+        }
         if (!config::Get().vanilla_hands_filter) ResetHandViewmodelIdentity();
         ObserveBackbuffer(sc);
         g_frameCount++;

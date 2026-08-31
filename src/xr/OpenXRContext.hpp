@@ -48,7 +48,9 @@ public:
     bool EndFrame(bool submitProjectionLayer = true,
                    const XrView* exactRenderedViews = nullptr,
                    bool submitHudLayer = false,
-                   uint64_t hudPairSerial = 0);
+                   uint64_t hudPairSerial = 0,
+                   bool submitReticleLayer = false,
+                   uint64_t reticlePairSerial = 0);
     bool EndFrameTheater(float sourceAspect, float distance = 2.5f,
                          float width = 2.8f);
     bool CanSubmitHud() const;
@@ -57,6 +59,9 @@ public:
     bool ShouldBakeHud() const;
     bool ShouldSubmitCurrentViews() const { return m_integratedHud; }
     bool PrepareHudTexture(ID3D11Texture2D* texture, uint64_t pairSerial);
+    bool PrepareReticleAt(const float position[3], const float forward[3],
+                          float visualDistance, float angularSizeDegrees,
+                          uint64_t pairSerial);
     void InvalidateHudResources();
 
     bool IsFrameActive() const { return m_frameActive; }
@@ -106,6 +111,9 @@ private:
     void ConfigureRefreshRate();
     bool CreateHudSwapchain(uint32_t width, uint32_t height);
     void DestroyHudSwapchain();
+    bool CreateReticleSwapchain();
+    void DestroyReticleSwapchain();
+    bool PaintReticle();
     void PollEvents();
 
     XrResult CheckResult(XrResult result, const char* call);
@@ -158,6 +166,13 @@ private:
     float m_hudPreparedHorizontalOffset = 0.0f;
     float m_hudPreparedVerticalOffset = 0.0f;
     SRWLOCK m_hudLock = SRWLOCK_INIT;
+    EyeData m_reticle;
+    bool m_reticlePainted = false;
+    bool m_reticlePrepared = false;
+    uint64_t m_reticlePreparedPairSerial = 0;
+    XrPosef m_reticlePose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+    float m_reticleSize = 0.0f;
+    SRWLOCK m_reticleLock = SRWLOCK_INIT;
 
     // Computed matrices (row-major, 4x4)
     float m_viewMatrices[2][4][4] = {};

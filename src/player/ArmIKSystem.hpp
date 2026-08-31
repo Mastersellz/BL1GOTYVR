@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "RoomScaleBody.hpp"
+
 namespace bl1gotyvr::player {
 
 struct ArmRigStatus {
@@ -24,6 +26,18 @@ struct ArmRigStatus {
     uint64_t solvedGeneration = 0;
     uint64_t poseHookCalls = 0;
     uint64_t poseHookApplies = 0;
+};
+
+struct NativeRightHandSnapshot {
+    float worldPosition[3] = {};
+    uintptr_t controller = 0;
+    uintptr_t pawn = 0;
+    uintptr_t weapon = 0;
+    uintptr_t armsComponent = 0;
+    uint64_t identityGeneration = 0;
+    uint64_t updatedMs = 0;
+    uint64_t serial = 0;
+    bool valid = false;
 };
 
 enum class ComponentRole : uint8_t {
@@ -88,15 +102,26 @@ public:
     void RequestInventoryScan();
     void RequestCalibrationReset();
     void RequestNativeCalibrationReset();
+    void RequestRoomScaleReset() {
+        m_roomScaleResetRequested.store(true, std::memory_order_release);
+    }
+    PhysicalPose GetPhysicalPoseIntent() const {
+        return m_physicalPoseIntent.load(std::memory_order_acquire);
+    }
     uint64_t UpdateTargets(const float cameraLocation[3], float gamePitchRadians,
                            float gameYawRadians,
+                           const float headTrackingPosition[3],
+                           const float headTrackingRotation[4],
                            const float trackingReferencePosition[3],
                            const float trackingReferenceRotation[4]);
+    bool GetWorldHandTarget(uint64_t targetGeneration, int hand,
+                            float position[3], float forward[3], float up[3]) const;
     void SetRenderContext(uint64_t renderGeneration, uint64_t targetGeneration);
     bool ReapplyRenderPalette();
     bool ApplyPostAnimation(void* component);
     void Restore();
     ArmRigStatus GetStatus() const;
+    bool GetNativeRightHandSnapshot(NativeRightHandSnapshot& snapshot) const;
     ComponentInventoryStatus GetComponentInventory() const;
     bool FindObservedVehicleComponent(uintptr_t vehicle, uintptr_t& component) const;
 
@@ -114,6 +139,7 @@ private:
     void CheckVisibilityWatchdog();
     bool InstallPoseHook();
     void ObserveComponent(void* component);
+    void CaptureNativeRightHand(void* component);
     void ObserveVehicleComponent(uintptr_t vehicle, uintptr_t component);
     bool Apply(uint64_t renderGeneration, uint64_t targetGeneration,
                bool restoreAfterRender);
@@ -131,6 +157,8 @@ private:
     std::atomic<bool> m_simulationEnabled{false};
     std::atomic<bool> m_calibrationResetRequested{false};
     std::atomic<bool> m_nativeCalibrationResetRequested{false};
+    std::atomic<bool> m_roomScaleResetRequested{true};
+    std::atomic<PhysicalPose> m_physicalPoseIntent{PhysicalPose::Standing};
     std::atomic<bool> m_discoveryRequested{false};
     std::atomic<uint64_t> m_inventoryRequestGeneration{0};
     std::atomic<uint64_t> m_inventoryCompletedGeneration{0};
@@ -163,6 +191,18 @@ private:
     mutable SRWLOCK m_targetLock = SRWLOCK_INIT;
     mutable SRWLOCK m_inventoryLock = SRWLOCK_INIT;
     ComponentInventoryStatus m_inventory;
+    RoomScaleBody m_roomScaleBody;
+    uint64_t m_lastRoomScaleUpdateMs = 0;
+    uint64_t m_roomScaleCalibrationStartedMs = 0;
+    bool m_roomScaleCalibrationPending = true;
+    PhysicalPose m_physicalPoseCandidate = PhysicalPose::Standing;
+    uint64_t m_physicalPoseCandidateSinceMs = 0;
+    bool m_physicalPoseIntentInitialized = false;
+    bool m_leftWeaponGrabActive = false;
+    float m_leftWeaponGrabLocalPosition[3] = {};
+    float m_leftWeaponGrabLocalRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    mutable SRWLOCK m_nativeRightHandLock = SRWLOCK_INIT;
+    NativeRightHandSnapshot m_nativeRightHand;
     mutable SRWLOCK m_visibilityLock = SRWLOCK_INIT;
     bool m_visibilityActive = false;
     uintptr_t m_visibilityController = 0;

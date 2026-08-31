@@ -257,6 +257,9 @@ void OpenXRContext::Shutdown() {
 
     // Destroy swapchains
     InvalidateHudResources();
+    AcquireSRWLockExclusive(&m_reticleLock);
+    DestroyReticleSwapchain();
+    ReleaseSRWLockExclusive(&m_reticleLock);
     if (m_leftEye.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(m_leftEye.swapchain);
         m_leftEye.swapchain = XR_NULL_HANDLE;
@@ -965,6 +968,207 @@ bool OpenXRContext::PrepareHudTexture(ID3D11Texture2D* texture,
     return copied;
 }
 
+void OpenXRContext::DestroyReticleSwapchain() {
+    if (m_reticle.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(m_reticle.swapchain);
+        m_reticle.swapchain = XR_NULL_HANDLE;
+    }
+    m_reticle.images.clear();
+    m_reticle.width = m_reticle.height = 0;
+    m_reticle.submittedWidth = m_reticle.submittedHeight = 0;
+    m_reticlePainted = false;
+    m_reticlePrepared = false;
+    m_reticlePreparedPairSerial = 0;
+}
+
+bool OpenXRContext::CreateReticleSwapchain() {
+    constexpr uint32_t kReticleSize = 64;
+    const bool alphaFormat = m_swapchainFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+        m_swapchainFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+        m_swapchainFormat == DXGI_FORMAT_B8G8R8A8_UNORM ||
+        m_swapchainFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    if (!m_initialized.load(std::memory_order_acquire) ||
+        !m_deviceBound.load(std::memory_order_acquire) || !alphaFormat ||
+        !m_context || m_stageSpace == XR_NULL_HANDLE ||
+        m_systemProperties.graphicsProperties.maxLayerCount < 2) {
+        return false;
+    }
+    if (m_reticle.swapchain != XR_NULL_HANDLE) return true;
+
+    XrSwapchainCreateInfo createInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+        XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    createInfo.format = static_cast<int64_t>(m_swapchainFormat);
+    createInfo.sampleCount = 1;
+    createInfo.width = kReticleSize;
+    createInfo.height = kReticleSize;
+    createInfo.faceCount = 1;
+    createInfo.arraySize = 1;
+    createInfo.mipCount = 1;
+    XrResult result = xrCreateSwapchain(m_session, &createInfo, &m_reticle.swapchain);
+    if (!ObserveFrameResult("xrCreateSwapchain(reticle)", result) ||
+        result != XR_SUCCESS) {
+        m_reticle.swapchain = XR_NULL_HANDLE;
+        return false;
+    }
+    uint32_t imageCount = 0;
+    result = xrEnumerateSwapchainImages(
+        m_reticle.swapchain, 0, &imageCount, nullptr);
+    if (!ObserveFrameResult("xrEnumerateSwapchainImages(reticle count)", result) ||
+        result != XR_SUCCESS || !imageCount) {
+        DestroyReticleSwapchain();
+        return false;
+    }
+    m_reticle.images.assign(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+    result = xrEnumerateSwapchainImages(m_reticle.swapchain, imageCount, &imageCount,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(m_reticle.images.data()));
+    if (!ObserveFrameResult("xrEnumerateSwapchainImages(reticle)", result) ||
+        result != XR_SUCCESS) {
+        DestroyReticleSwapchain();
+        return false;
+    }
+    m_reticle.width = m_reticle.submittedWidth = kReticleSize;
+    m_reticle.height = m_reticle.submittedHeight = kReticleSize;
+    Log("[AimRay] OpenXR endpoint reticle ready: %ux%u images=%u",
+        kReticleSize, kReticleSize, imageCount);
+    return true;
+}
+
+bool OpenXRContext::PaintReticle() {
+    if (m_reticlePainted) return true;
+    if (m_reticle.swapchain == XR_NULL_HANDLE || !m_context) return false;
+    constexpr uint32_t kReticleSize = 64;
+    std::vector<uint32_t> pixels(kReticleSize * kReticleSize, 0);
+    const float center = (kReticleSize - 1) * 0.5f;
+    for (uint32_t y = 0; y < kReticleSize; ++y) {
+        for (uint32_t x = 0; x < kReticleSize; ++x) {
+            const float dx = static_cast<float>(x) - center;
+            const float dy = static_cast<float>(y) - center;
+            const float radius = sqrtf(dx * dx + dy * dy);
+            float alpha = 0.0f;
+            uint8_t color = 0;
+            if (radius <= 13.0f) {
+                alpha = (std::min)(1.0f, 14.0f - radius);
+                color = 255;
+            } else if (radius <= 23.0f) {
+                alpha = (std::min)(1.0f, 24.0f - radius);
+            }
+            const uint32_t a = static_cast<uint32_t>(alpha * 255.0f + 0.5f);
+            pixels[y * kReticleSize + x] =
+                (a << 24) | (static_cast<uint32_t>(color) << 16) |
+                (static_cast<uint32_t>(color) << 8) | color;
+        }
+    }
+
+    uint32_t imageIndex = 0;
+    XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    XrResult result = xrAcquireSwapchainImage(
+        m_reticle.swapchain, &acquireInfo, &imageIndex);
+    if (!ObserveFrameResult("xrAcquireSwapchainImage(reticle)", result) ||
+        result != XR_SUCCESS || imageIndex >= m_reticle.images.size()) return false;
+    if (!WaitForSwapchainImage(m_reticle.swapchain,
+                               "xrWaitSwapchainImage(reticle)")) return false;
+    if (!m_reticle.images[imageIndex].texture) {
+        XrSwapchainImageReleaseInfo releaseInfo = {
+            XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        const XrResult releaseResult = xrReleaseSwapchainImage(
+            m_reticle.swapchain, &releaseInfo);
+        ObserveFrameResult("xrReleaseSwapchainImage(reticle null)", releaseResult);
+        return false;
+    }
+    m_context->UpdateSubresource(m_reticle.images[imageIndex].texture, 0, nullptr,
+        pixels.data(), kReticleSize * sizeof(uint32_t), 0);
+    m_context->Flush();
+    XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    result = xrReleaseSwapchainImage(m_reticle.swapchain, &releaseInfo);
+    m_reticlePainted = ObserveFrameResult(
+        "xrReleaseSwapchainImage(reticle)", result) && result == XR_SUCCESS;
+    return m_reticlePainted;
+}
+
+bool OpenXRContext::PrepareReticleAt(const float position[3], const float forward[3],
+                                     float visualDistance,
+                                     float angularSizeDegrees,
+                                     uint64_t pairSerial) {
+    if (!position || !forward || !pairSerial ||
+        !std::isfinite(visualDistance) || visualDistance < 0.5f ||
+        !std::isfinite(angularSizeDegrees) || angularSizeDegrees <= 0.0f) {
+        return false;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(position[axis]) || !std::isfinite(forward[axis]))
+            return false;
+    }
+    float direction[3] = {forward[0], forward[1], forward[2]};
+    const float length = sqrtf(direction[0] * direction[0] +
+        direction[1] * direction[1] + direction[2] * direction[2]);
+    if (!std::isfinite(length) || length < 1.0e-5f) return false;
+    for (float& value : direction) value /= length;
+
+    float up[3] = {0.0f, 1.0f, 0.0f};
+    if (fabsf(direction[1]) > 0.99f) {
+        up[0] = 0.0f; up[1] = 0.0f; up[2] = 1.0f;
+    }
+    const float zAxis[3] = {-direction[0], -direction[1], -direction[2]};
+    float xAxis[3] = {
+        up[1] * zAxis[2] - up[2] * zAxis[1],
+        up[2] * zAxis[0] - up[0] * zAxis[2],
+        up[0] * zAxis[1] - up[1] * zAxis[0]};
+    const float xLength = sqrtf(xAxis[0] * xAxis[0] +
+        xAxis[1] * xAxis[1] + xAxis[2] * xAxis[2]);
+    if (!std::isfinite(xLength) || xLength < 1.0e-5f) return false;
+    for (float& value : xAxis) value /= xLength;
+    const float yAxis[3] = {
+        zAxis[1] * xAxis[2] - zAxis[2] * xAxis[1],
+        zAxis[2] * xAxis[0] - zAxis[0] * xAxis[2],
+        zAxis[0] * xAxis[1] - zAxis[1] * xAxis[0]};
+
+    XrQuaternionf orientation = {};
+    const float trace = xAxis[0] + yAxis[1] + zAxis[2];
+    if (trace > 0.0f) {
+        const float s = sqrtf(trace + 1.0f) * 2.0f;
+        orientation.w = 0.25f * s;
+        orientation.x = (yAxis[2] - zAxis[1]) / s;
+        orientation.y = (zAxis[0] - xAxis[2]) / s;
+        orientation.z = (xAxis[1] - yAxis[0]) / s;
+    } else if (xAxis[0] > yAxis[1] && xAxis[0] > zAxis[2]) {
+        const float s = sqrtf(1.0f + xAxis[0] - yAxis[1] - zAxis[2]) * 2.0f;
+        orientation.w = (yAxis[2] - zAxis[1]) / s;
+        orientation.x = 0.25f * s;
+        orientation.y = (yAxis[0] + xAxis[1]) / s;
+        orientation.z = (zAxis[0] + xAxis[2]) / s;
+    } else if (yAxis[1] > zAxis[2]) {
+        const float s = sqrtf(1.0f + yAxis[1] - xAxis[0] - zAxis[2]) * 2.0f;
+        orientation.w = (zAxis[0] - xAxis[2]) / s;
+        orientation.x = (yAxis[0] + xAxis[1]) / s;
+        orientation.y = 0.25f * s;
+        orientation.z = (zAxis[1] + yAxis[2]) / s;
+    } else {
+        const float s = sqrtf(1.0f + zAxis[2] - xAxis[0] - yAxis[1]) * 2.0f;
+        orientation.w = (xAxis[1] - yAxis[0]) / s;
+        orientation.x = (zAxis[0] + xAxis[2]) / s;
+        orientation.y = (zAxis[1] + yAxis[2]) / s;
+        orientation.z = 0.25f * s;
+    }
+
+    AcquireSRWLockExclusive(&m_reticleLock);
+    m_reticlePrepared = false;
+    m_reticlePreparedPairSerial = 0;
+    if (!CreateReticleSwapchain() || !PaintReticle()) {
+        ReleaseSRWLockExclusive(&m_reticleLock);
+        return false;
+    }
+    m_reticlePose.orientation = orientation;
+    m_reticlePose.position = {position[0], position[1], position[2]};
+    constexpr float kDegreesToRadians = 0.01745329251994329577f;
+    m_reticleSize = 2.0f * visualDistance * tanf(
+        angularSizeDegrees * kDegreesToRadians * 0.5f);
+    m_reticlePrepared = std::isfinite(m_reticleSize) && m_reticleSize > 0.0f;
+    m_reticlePreparedPairSerial = m_reticlePrepared ? pairSerial : 0;
+    ReleaseSRWLockExclusive(&m_reticleLock);
+    return m_reticlePrepared;
+}
+
 void OpenXRContext::PollEvents() {
     if (m_instance == XR_NULL_HANDLE) return;
     AcquireSRWLockExclusive(&m_eventLock);
@@ -1231,7 +1435,9 @@ bool OpenXRContext::LocateViews() {
 bool OpenXRContext::EndFrame(bool submitProjectionLayer,
                              const XrView* exactRenderedViews,
                              bool submitHudLayer,
-                             uint64_t hudPairSerial) {
+                             uint64_t hudPairSerial,
+                             bool submitReticleLayer,
+                             uint64_t reticlePairSerial) {
     if (!m_frameActive.load(std::memory_order_acquire)) return false;
 
     XrFrameEndInfo endInfo = {};
@@ -1242,8 +1448,10 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
     XrCompositionLayerProjectionView projViews[2] = {};
     XrCompositionLayerProjection projLayer = {};
     XrCompositionLayerQuad hudLayer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-    const XrCompositionLayerBaseHeader* layers[2] = {};
+    XrCompositionLayerQuad reticleLayer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    const XrCompositionLayerBaseHeader* layers[3] = {};
     bool hudLockHeld = false;
+    bool reticleLockHeld = false;
 
     if (submitProjectionLayer && m_viewsValid && ShouldRender()) {
         if (m_theaterAnchored) {
@@ -1283,7 +1491,10 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
         endInfo.layerCount = 1;
         endInfo.layers = layers;
 
-        if (submitHudLayer && hudPairSerial &&
+        const bool reserveReticleLayer = submitReticleLayer && reticlePairSerial;
+        const bool hudFitsWithReticle = !reserveReticleLayer ||
+            m_systemProperties.graphicsProperties.maxLayerCount >= 3;
+        if (submitHudLayer && hudPairSerial && hudFitsWithReticle &&
             (m_isSteamRuntime || ShouldSeparateHud())) {
             AcquireSRWLockShared(&m_hudLock);
             hudLockHeld = true;
@@ -1322,6 +1533,36 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
                 }
             }
         }
+        if (submitReticleLayer && reticlePairSerial &&
+            endInfo.layerCount < m_systemProperties.graphicsProperties.maxLayerCount) {
+            AcquireSRWLockShared(&m_reticleLock);
+            reticleLockHeld = true;
+            if (m_reticlePrepared &&
+                m_reticlePreparedPairSerial == reticlePairSerial &&
+                m_reticle.swapchain != XR_NULL_HANDLE) {
+                reticleLayer.layerFlags =
+                    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                    XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+                reticleLayer.space = m_stageSpace;
+                reticleLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                reticleLayer.subImage.swapchain = m_reticle.swapchain;
+                reticleLayer.subImage.imageRect.offset = {0, 0};
+                reticleLayer.subImage.imageRect.extent = {
+                    static_cast<int32_t>(m_reticle.width),
+                    static_cast<int32_t>(m_reticle.height)};
+                reticleLayer.subImage.imageArrayIndex = 0;
+                reticleLayer.pose = m_reticlePose;
+                reticleLayer.size = {m_reticleSize, m_reticleSize};
+                layers[endInfo.layerCount++] =
+                    reinterpret_cast<const XrCompositionLayerBaseHeader*>(
+                        &reticleLayer);
+                static bool loggedReticleLayer = false;
+                if (!loggedReticleLayer) {
+                    Log("[AimRay] OpenXR endpoint quad active");
+                    loggedReticleLayer = true;
+                }
+            }
+        }
     } else {
         static uint64_t noLayerCount = 0;
         if (++noLayerCount <= 5 || noLayerCount % 300 == 0)
@@ -1331,6 +1572,7 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
     }
 
     XrResult r = xrEndFrame(m_session, &endInfo);
+    if (reticleLockHeld) ReleaseSRWLockShared(&m_reticleLock);
     if (hudLockHeld) ReleaseSRWLockShared(&m_hudLock);
     const bool resultObserved = ObserveFrameResult("xrEndFrame", r);
     if (!resultObserved || r == XR_SESSION_LOSS_PENDING) {
@@ -1354,6 +1596,12 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
         m_hudPreparedPairSerial = 0;
     }
     ReleaseSRWLockExclusive(&m_hudLock);
+    AcquireSRWLockExclusive(&m_reticleLock);
+    if (!m_isSteamRuntime) {
+        m_reticlePrepared = false;
+        m_reticlePreparedPairSerial = 0;
+    }
+    ReleaseSRWLockExclusive(&m_reticleLock);
     return r == XR_SUCCESS;
 }
 

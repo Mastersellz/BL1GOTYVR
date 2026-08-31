@@ -22,6 +22,9 @@ struct StereoRenderTicket {
     bool rightAimValid = false;
     float rightAimPosition[3] = {};
     float rightAimRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    bool aimDotLocalValid = false;
+    float aimDotLocalPosition[3] = {};
+    float aimDotLocalForward[3] = {};
     float aimPitchDegrees = 0.0f;
     float aimYawDegrees = 0.0f;
     float aimConvergenceMeters = 20.0f;
@@ -151,6 +154,8 @@ private:
     bool m_steamSubmittedViewsValid = false;
     bool m_steamSubmittedHud = false;
     uint64_t m_steamSubmittedHudSerial = 0;
+    bool m_steamSubmittedReticle = false;
+    uint64_t m_steamSubmittedReticleSerial = 0;
     bool m_steamTheaterActive = false;
     float m_steamTheaterAspect = 1.0f;
     bool m_submissionRightAimValid = false;
@@ -160,6 +165,7 @@ private:
     float m_submissionAimYawDegrees = 0.0f;
     float m_submissionAimConvergenceMeters = 20.0f;
     float m_lastDotSettings[2][4] = {};
+    bool m_compositorReticleActive = false;
     bool m_submissionProjectionCorrection = true;
     float m_submissionRenderAspect = 1.0f;
 

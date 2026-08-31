@@ -181,11 +181,11 @@ void DrawUi() {
     }
 
     if (ImGui::CollapsingHeader("Aim dot", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::SliderFloat("Target distance (m)", &settings.aim_convergence_m,
-                           1.0f, 100.0f, "%.1f m");
+        ImGui::SliderFloat("Target distance (m)", &settings.dot_distance_m,
+                           0.5f, 20.0f, "%.1f m");
         ImGui::TextWrapped(
-            "The active weapon profile stores aim pitch/yaw automatically. "
-            "Use Ctrl+numpad tuning to move bullets and dot together.");
+            "The OpenXR right-hand aim pose drives the laser, bullets and dot. "
+            "Hand tuning only rotates the visible model.");
     }
 
     if (ImGui::CollapsingHeader("OpenXR")) {

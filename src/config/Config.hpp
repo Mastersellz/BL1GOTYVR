@@ -42,11 +42,26 @@ float hud_horizontal_offset = 0.0f;
     float smooth_turn_speed = 90.0f;
     float locomotion_deadzone = 0.2f;
 
+    /* Room-scale body tracking */
+    bool room_scale_enabled = true;
+    bool room_scale_allow_horizontal = true;
+    bool room_scale_allow_vertical = true;
+    float room_scale_follow_strength = 10.0f;
+    float room_scale_calibrated_height = 170.0f;
+    float room_scale_head_to_chest = 45.0f;
+    float room_scale_head_to_pelvis = 85.0f;
+    float room_scale_shoulder_width = 42.0f;
+    float room_scale_standing_threshold = 0.72f;
+    float room_scale_prone_threshold = 0.35f;
+    float room_scale_pose_hysteresis = 0.04f;
+    bool debug_room_scale = false;
+
     /* Weapon 6DoF */
     float weapon_position_scale = 0.5f;
     float aim_pitch_degrees = 0.0f;
     float aim_yaw_degrees = 0.0f;
     float aim_convergence_m = 20.0f;
+    float dot_distance_m = 5.0f;
     float weapon_offset_forward = 0.0f;
     float weapon_offset_right = 0.0f;
     float weapon_offset_up = 0.0f;
@@ -75,6 +90,7 @@ float hud_horizontal_offset = 0.0f;
     /* Player visibility */
     bool hide_player_body_and_arms = false;
     bool vanilla_hands_filter = true;
+    float vanilla_hands_cut_threshold = 74.0f;
 
     /* Debug */
     bool debug_force_no_hud_layer = false;  /* Skip HUD layer submission for VDXR testing */
@@ -85,8 +101,19 @@ void Load(const char* path);
 void Save(const char* path);
 bool SaveLoaded();
 bool ReloadIfChanged();
-bool LoadWeaponAimProfile(uint64_t key, float& pitch, float& yaw);
-bool SaveWeaponAimProfile(uint64_t key, float pitch, float yaw,
-                          const char* profileName);
+bool LoadWeaponAimProfile(uint64_t key, float& pitch, float& yaw, float& roll,
+                          float& offsetForward, float& offsetRight,
+                          float& offsetUp);
+bool SaveWeaponAimProfile(uint64_t key, float pitch, float yaw, float roll,
+                          float offsetForward, float offsetRight, float offsetUp,
+                           const char* profileName);
+bool LoadAbsoluteWeaponMount(uint64_t key, float matrix[16]);
+bool SaveAbsoluteWeaponMount(uint64_t key, const float matrix[16],
+                             const char* profileName);
+bool LoadWeaponMountProfile(uint64_t key, float matrix[16], float gripLocal[3],
+                            int& barrelAxis, float& barrelSign);
+bool SaveWeaponMountProfile(uint64_t key, const float matrix[16],
+                            const float gripLocal[3], int barrelAxis,
+                            float barrelSign, const char* profileName);
 
 }} // namespace bl1gotyvr::config

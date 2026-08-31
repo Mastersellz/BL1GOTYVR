@@ -721,6 +721,7 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                 s_aimBasisValid = true;
                 s_poseReferenceSimulated = simulatedPose;
                 s_poseReferenceValid = true;
+                player::ArmIKSystem::Instance().RequestRoomScaleReset();
                 Log("[Camera] 6DoF tracking reference captured at pair=%llu",
                     static_cast<unsigned long long>(renderTicket.pairSerial));
             }
@@ -780,9 +781,29 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
             if (simulatedPose || eye == 0) {
                 renderTicket.armTargetGeneration =
                     player::ArmIKSystem::Instance().UpdateTargets(
-                        armCameraLocation, gamePitch, gameYaw, s_poseReferencePosition,
-                        s_poseReferenceRotation);
+                        armCameraLocation, gamePitch, gameYaw, headPosition,
+                        headRotation, s_poseReferencePosition, s_poseReferenceRotation);
             }
+            if (!renderTicket.rightAimValid) {
+                input::ControllerState controllers[2] = {};
+                if (input::XRInput::Instance().GetControllerSnapshot(controllers) &&
+                    controllers[1].valid) {
+                    const auto& right = controllers[1];
+                    memcpy(renderTicket.rightAimPosition,
+                        right.aimValid ? right.aimPosition : right.position,
+                        sizeof(renderTicket.rightAimPosition));
+                    memcpy(renderTicket.rightAimRotation,
+                        right.aimValid ? right.aimRotation : right.rotation,
+                        sizeof(renderTicket.rightAimRotation));
+                    renderTicket.rightAimValid = true;
+                    static std::atomic<bool> loggedAimRepair{false};
+                    if (!loggedAimRepair.exchange(true, std::memory_order_relaxed)) {
+                        Log("[Camera] Weapon aim ticket repaired from live right controller "
+                            "snapshot (aim=%d)", right.aimValid);
+                    }
+                }
+            }
+            renderTicket.aimDotLocalValid = false;
             if (renderTicket.rightAimValid) {
                 if (!s_aimBasisValid) {
                     memcpy(s_aimBasisRotation, s_poseReferenceRotation,
@@ -796,17 +817,9 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                 float relativeAim[4] = {};
                 RelativeQuaternion(s_aimBasisRotation,
                     renderTicket.rightAimRotation, relativeAim);
-                float localForward[3] = {};
-                input::BuildCalibratedLocalForward(
-                    renderTicket.aimPitchDegrees, renderTicket.aimYawDegrees,
-                    localForward);
+                constexpr float localForward[3] = {0.0f, 0.0f, -1.0f};
+                constexpr float localUp[3] = {0.0f, 1.0f, 0.0f};
                 constexpr float kDegreesToRadians = 0.01745329251994329577f;
-                const float trimPitch = renderTicket.aimPitchDegrees * kDegreesToRadians;
-                const float trimYaw = renderTicket.aimYawDegrees * kDegreesToRadians;
-                const float localUp[3] = {
-                    -sinf(trimYaw) * sinf(trimPitch),
-                    cosf(trimPitch),
-                    cosf(trimYaw) * sinf(trimPitch)};
                 float xrForward[3] = {};
                 float xrUp[3] = {};
                 quat_rotate(relativeAim[0], relativeAim[1], relativeAim[2],
@@ -955,13 +968,68 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                         yawCosine * pitchedRayOffset[1],
                     armCameraLocation[2] + pitchedRayOffset[2]
                 };
-                if (input::InputHook::Instance().IsMotionControlsEnabled()) {
+                float canonicalWeaponPosition[3] = {};
+                float canonicalWeaponForward[3] = {};
+                float canonicalWeaponUp[3] = {};
+                bool canonicalWeaponTarget =
+                    player::ArmIKSystem::Instance().GetWorldHandTarget(
+                        renderTicket.armTargetGeneration, 1, canonicalWeaponPosition,
+                        canonicalWeaponForward, canonicalWeaponUp);
+                if (!canonicalWeaponTarget && simulatedPose) {
+                    memcpy(canonicalWeaponPosition, worldWeaponPosition,
+                           sizeof(canonicalWeaponPosition));
+                    memcpy(canonicalWeaponForward, weaponForward,
+                           sizeof(canonicalWeaponForward));
+                    memcpy(canonicalWeaponUp, weaponUp, sizeof(canonicalWeaponUp));
+                    canonicalWeaponTarget = true;
+                }
+                if (input::InputHook::Instance().IsMotionControlsEnabled() &&
+                    canonicalWeaponTarget) {
+                    static std::atomic<bool> loggedCanonicalCandidate{false};
+                    if (!loggedCanonicalCandidate.exchange(true,
+                            std::memory_order_relaxed)) {
+                        Log("[Camera] Canonical weapon pose uses right-hand IK target: "
+                            "position=(%.1f,%.1f,%.1f) forward=(%.3f,%.3f,%.3f) "
+                            "up=(%.3f,%.3f,%.3f)",
+                            canonicalWeaponPosition[0], canonicalWeaponPosition[1],
+                            canonicalWeaponPosition[2], canonicalWeaponForward[0],
+                            canonicalWeaponForward[1], canonicalWeaponForward[2],
+                            canonicalWeaponUp[0], canonicalWeaponUp[1],
+                            canonicalWeaponUp[2]);
+                    }
                     input::InputHook::Instance().SetCanonicalWeaponPose(
-                        worldWeaponPosition, weaponForward, weaponUp,
+                        canonicalWeaponPosition, canonicalWeaponForward,
+                        canonicalWeaponUp,
                         armCameraLocation, nativeCameraForward, nativeCameraUp);
                     input::WeaponAimSystem::Instance().UpdateDirection(
                         worldAimOrigin, worldForward,
-                        renderTicket.aimConvergenceMeters);
+                        settings.dot_distance_m * settings.positional_scale);
+
+                    // Put the compositor marker directly at the finite endpoint
+                    // of the raw OpenXR aim laser. The same pose and distance
+                    // feed ballistics above; visual hand/model trims never enter.
+                    do {
+                        float trackingForward[3] = {};
+                        quat_rotate(renderTicket.rightAimRotation[0],
+                                    renderTicket.rightAimRotation[1],
+                                    renderTicket.rightAimRotation[2],
+                                    renderTicket.rightAimRotation[3],
+                                    localForward, trackingForward);
+                        const float length = sqrtf(
+                            trackingForward[0] * trackingForward[0] +
+                            trackingForward[1] * trackingForward[1] +
+                            trackingForward[2] * trackingForward[2]);
+                        if (!std::isfinite(length) || length < 1.0e-5f) break;
+                        for (int axis = 0; axis < 3; ++axis) {
+                            trackingForward[axis] /= length;
+                            renderTicket.aimDotLocalPosition[axis] =
+                                renderTicket.rightAimPosition[axis] +
+                                trackingForward[axis] * settings.dot_distance_m;
+                            renderTicket.aimDotLocalForward[axis] =
+                                trackingForward[axis];
+                        }
+                        renderTicket.aimDotLocalValid = true;
+                    } while (false);
                 } else {
                     input::InputHook::Instance().ClearCanonicalWeaponPose();
                     input::WeaponAimSystem::Instance().InvalidateDirection();
@@ -987,6 +1055,9 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
             cameraOffsetApplied = true;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             cameraOffsetApplied = false;
+            static std::atomic<bool> loggedCameraPoseException{false};
+            if (!loggedCameraPoseException.exchange(true, std::memory_order_relaxed))
+                Log("[Camera] Exception while preparing camera/controller pose");
         }
     }
 

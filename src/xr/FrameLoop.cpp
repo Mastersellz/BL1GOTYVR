@@ -43,6 +43,8 @@ void FrameLoop::Initialize() {
     m_steamSubmittedViewsValid = false;
     m_steamSubmittedHud = false;
     m_steamSubmittedHudSerial = 0;
+    m_steamSubmittedReticle = false;
+    m_steamSubmittedReticleSerial = 0;
     m_steamTheaterActive = false;
     m_steamTheaterAspect = 1.0f;
     ReleaseSRWLockExclusive(&m_steamSubmissionLock);
@@ -116,7 +118,9 @@ DWORD WINAPI FrameLoop::WaitWorkerProc(void* context) {
                     submitProjection,
                     submitProjection ? frameLoop->m_steamSubmittedViews : nullptr,
                     submitProjection && frameLoop->m_steamSubmittedHud,
-                    submitProjection ? frameLoop->m_steamSubmittedHudSerial : 0);
+                    submitProjection ? frameLoop->m_steamSubmittedHudSerial : 0,
+                    submitProjection && frameLoop->m_steamSubmittedReticle,
+                    submitProjection ? frameLoop->m_steamSubmittedReticleSerial : 0);
             ReleaseSRWLockShared(&frameLoop->m_steamSubmissionLock);
             if (submitted && submitProjection &&
                 (++submittedFrames <= 5 || submittedFrames % 600 == 0)) {
@@ -196,6 +200,8 @@ bool FrameLoop::PrepareForOpenXRRecovery() {
     m_steamSubmittedViewsValid = false;
     m_steamSubmittedHud = false;
     m_steamSubmittedHudSerial = 0;
+    m_steamSubmittedReticle = false;
+    m_steamSubmittedReticleSerial = 0;
     m_steamTheaterActive = false;
     m_steamTheaterAspect = 1.0f;
     ReleaseSRWLockExclusive(&m_steamSubmissionLock);
@@ -601,7 +607,8 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
         }
     }
     float dotU = 0.5f, dotV = 0.5f, dotEnabled = 0.0f;
-    if (!flatSource && m_submissionRightAimValid && m_submissionViewsValid &&
+    if (!flatSource && !m_compositorReticleActive &&
+        m_submissionRightAimValid && m_submissionViewsValid &&
         input::InputHook::Instance().IsAimDotVisible() &&
         sampledEye >= 0 && sampledEye < 2) {
         auto rotate = [](const float quaternion[4], const float vector[3], float output[3]) {
@@ -1082,14 +1089,20 @@ bool FrameLoop::AcquireRenderTicket(StereoRenderTicket& ticket) {
                sizeof(m_activePair.headRotation));
         m_activePair.views[0] = currentViews[0];
         m_activePair.views[1] = currentViews[1];
-        m_activePair.aimPitchDegrees = config::Get().aim_pitch_degrees;
-        m_activePair.aimYawDegrees = config::Get().aim_yaw_degrees;
-        m_activePair.aimConvergenceMeters = config::Get().aim_convergence_m;
-        m_activePair.rightAimValid = controllers[1].aimValid;
+        // The OpenXR aim pose is the immutable laser, reticle and ballistic ray.
+        // Legacy per-weapon profiles only describe old visual calibration data.
+        m_activePair.aimPitchDegrees = 0.0f;
+        m_activePair.aimYawDegrees = 0.0f;
+        m_activePair.aimConvergenceMeters = config::Get().dot_distance_m;
+        m_activePair.rightAimValid = controllers[1].aimValid || controllers[1].valid;
         if (m_activePair.rightAimValid) {
-            memcpy(m_activePair.rightAimPosition, controllers[1].aimPosition,
+            memcpy(m_activePair.rightAimPosition,
+                   controllers[1].aimValid ? controllers[1].aimPosition :
+                       controllers[1].position,
                    sizeof(m_activePair.rightAimPosition));
-            memcpy(m_activePair.rightAimRotation, controllers[1].aimRotation,
+            memcpy(m_activePair.rightAimRotation,
+                   controllers[1].aimValid ? controllers[1].aimRotation :
+                       controllers[1].rotation,
                    sizeof(m_activePair.rightAimRotation));
         }
     }
@@ -2402,6 +2415,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     bool rightOk = false;
     bool hudSeparated = false;
     bool hudQuadPrepared = false;
+    bool reticlePrepared = false;
     XrView submittedViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
     bool xrFrameBegun = false;
     bool preparedWaitConsumed = false;
@@ -2460,6 +2474,45 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         m_submissionProjectionCorrection = renderedTicket.projectionCorrection;
         m_submissionRenderAspect = renderedTicket.renderAspect;
         if (steamCompositorPump) AcquireSRWLockExclusive(&m_steamSubmissionLock);
+        float dotPosition[3] = {};
+        float dotForward[3] = {};
+        bool dotValid = renderedTicket.aimDotLocalValid;
+        if (dotValid) {
+            memcpy(dotPosition, renderedTicket.aimDotLocalPosition,
+                   sizeof(dotPosition));
+            memcpy(dotForward, renderedTicket.aimDotLocalForward,
+                   sizeof(dotForward));
+        } else if (m_submissionRightAimValid) {
+            const float x = renderedTicket.rightAimRotation[0];
+            const float y = renderedTicket.rightAimRotation[1];
+            const float z = renderedTicket.rightAimRotation[2];
+            const float w = renderedTicket.rightAimRotation[3];
+            dotForward[0] = -2.0f * (x * z + w * y);
+            dotForward[1] = -2.0f * (y * z - w * x);
+            dotForward[2] = -(1.0f - 2.0f * (x * x + y * y));
+            const float length = std::sqrt(
+                dotForward[0] * dotForward[0] +
+                dotForward[1] * dotForward[1] +
+                dotForward[2] * dotForward[2]);
+            if (std::isfinite(length) && length > 1.0e-5f) {
+                const float distance = config::Get().dot_distance_m;
+                for (int axis = 0; axis < 3; ++axis) {
+                    dotForward[axis] /= length;
+                    dotPosition[axis] = renderedTicket.rightAimPosition[axis] +
+                        dotForward[axis] * distance;
+                }
+                dotValid = true;
+            }
+        }
+        if (m_submissionRightAimValid && dotValid &&
+            input::InputHook::Instance().IsAimDotVisible()) {
+            const float visualDistance = (std::max)(1.0f,
+                (std::min)(100.0f, renderedTicket.aimConvergenceMeters));
+            reticlePrepared = xr.PrepareReticleAt(
+                dotPosition, dotForward,
+                visualDistance, 1.0f, renderedTicket.pairSerial);
+        }
+        m_compositorReticleActive = reticlePrepared;
         AcquireSRWLockExclusive(&m_captureLock);
         D3D11_TEXTURE2D_DESC finalDesc[2] = {}, worldDesc[2] = {};
         if (m_eyeTextures[0]) m_eyeTextures[0]->GetDesc(&finalDesc[0]);
@@ -2522,6 +2575,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
                 CopyTextureToEye(context, m_eyeTextures[rightSource], 1, false, rightSource);
         }
         ReleaseSRWLockExclusive(&m_captureLock);
+        m_compositorReticleActive = false;
         m_submissionViewsValid = false;
         m_submissionRightAimValid = false;
         submittedViews[0] = capturedPairViews[leftSource];
@@ -2533,6 +2587,9 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
             m_steamSubmittedViewsValid = true;
             m_steamSubmittedHud = hudQuadPrepared;
             m_steamSubmittedHudSerial = hudQuadPrepared ? renderedTicket.pairSerial : 0;
+            m_steamSubmittedReticle = reticlePrepared;
+            m_steamSubmittedReticleSerial = reticlePrepared
+                ? renderedTicket.pairSerial : 0;
             m_steamTheaterActive = false;
         } else if (steamCompositorPump) {
             xr.RequestRecovery("partial SteamVR stereo upload", XR_ERROR_RUNTIME_FAILURE);
@@ -2549,7 +2606,9 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         : xrFrameBegun && xr.EndFrame(
             completePair, completePair ? submittedViews : nullptr,
             completePair && hudQuadPrepared,
-            completePair && hudQuadPrepared ? renderedTicket.pairSerial : 0);
+            completePair && hudQuadPrepared ? renderedTicket.pairSerial : 0,
+            completePair && reticlePrepared,
+            completePair && reticlePrepared ? renderedTicket.pairSerial : 0);
     if (steamCompositorPump && completePair) StartWaitWorker();
     if (preparedWaitConsumed && m_waitRequestEvent) SetEvent(m_waitRequestEvent);
     static bool loggedFirstSubmission = false;

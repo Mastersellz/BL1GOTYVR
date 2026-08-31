@@ -244,24 +244,31 @@ void WeaponAimSystem::UpdateDirection(const float worldOrigin[3],
     const int32_t yaw = static_cast<int32_t>(lroundf(
         atan2f(y, x) * kRadiansToUnis));
 
-    m_aimPitch.store(pitch, std::memory_order_relaxed);
-    m_aimYaw.store(yaw, std::memory_order_relaxed);
-    m_aimRoll.store(0, std::memory_order_relaxed);
     if (!std::isfinite(convergenceMeters)) return;
     const float targetDistanceUe = (std::max)(1.0f,
         (std::min)(100.0f, convergenceMeters)) * 100.0f;
+    const float target[3] = {
+        worldOrigin[0] + x / length * targetDistanceUe,
+        worldOrigin[1] + y / length * targetDistanceUe,
+        worldOrigin[2] + z / length * targetDistanceUe
+    };
+
+    // Publish one coherent ballistic packet. The script hook may run on another
+    // engine thread and must not combine an old origin with a new target.
+    AcquireSRWLockExclusive(&m_ballisticOverrideLock);
+    m_aimPitch.store(pitch, std::memory_order_relaxed);
+    m_aimYaw.store(yaw, std::memory_order_relaxed);
+    m_aimRoll.store(0, std::memory_order_relaxed);
     m_aimOriginX.store(worldOrigin[0], std::memory_order_relaxed);
     m_aimOriginY.store(worldOrigin[1], std::memory_order_relaxed);
     m_aimOriginZ.store(worldOrigin[2], std::memory_order_relaxed);
-    m_aimTargetX.store(worldOrigin[0] + x / length * targetDistanceUe,
-                       std::memory_order_relaxed);
-    m_aimTargetY.store(worldOrigin[1] + y / length * targetDistanceUe,
-                       std::memory_order_relaxed);
-    m_aimTargetZ.store(worldOrigin[2] + z / length * targetDistanceUe,
-                       std::memory_order_relaxed);
+    m_aimTargetX.store(target[0], std::memory_order_relaxed);
+    m_aimTargetY.store(target[1], std::memory_order_relaxed);
+    m_aimTargetZ.store(target[2], std::memory_order_relaxed);
     m_aimTargetValid.store(true, std::memory_order_release);
     m_aimUpdatedMs.store(GetTickCount64(), std::memory_order_release);
     m_aimValid.store(true, std::memory_order_release);
+    ReleaseSRWLockExclusive(&m_ballisticOverrideLock);
 
     static std::atomic<bool> loggedFirst{false};
     if (!loggedFirst.exchange(true)) {
@@ -269,6 +276,13 @@ void WeaponAimSystem::UpdateDirection(const float worldOrigin[3],
             "rot=(%d,%d,%d) target=%.1fm", x, y, z, pitch, yaw, 0,
             targetDistanceUe * 0.01f);
     }
+}
+
+void WeaponAimSystem::InvalidateDirection() {
+    AcquireSRWLockExclusive(&m_ballisticOverrideLock);
+    m_aimValid.store(false, std::memory_order_release);
+    m_aimTargetValid.store(false, std::memory_order_release);
+    ReleaseSRWLockExclusive(&m_ballisticOverrideLock);
 }
 
 void WeaponAimSystem::SetBallisticOverrideEnabled(bool enabled) {
@@ -582,18 +596,22 @@ void __fastcall WeaponAimSystem::HookedScriptInvoke(void* object, void* frame,
     const bool periodicSample = firing ? (count <= 8 || count % 120 == 0) :
         (count <= 8 || count % 600 == 0);
     int32_t rotation[3] = {};
+    float origin[3] = {};
+    const bool originReadable = locals && ReadDirect(locals, origin, sizeof(origin));
+    int32_t desired[3] = {};
+    bool finiteTargetUsed = false;
+    bool overrideEnabled = false;
+    bool resultReadable = false;
+    bool written = false;
+
+    AcquireSRWLockShared(&system.m_ballisticOverrideLock);
     const uint64_t aimUpdatedMs = system.m_aimUpdatedMs.load(std::memory_order_acquire);
     const uint64_t nowMs = GetTickCount64();
     const bool desiredValid = system.m_aimValid.load(std::memory_order_acquire) &&
         aimUpdatedMs != 0 && nowMs >= aimUpdatedMs && nowMs - aimUpdatedMs <= 100;
-    int32_t desired[3] = {
-        system.m_aimPitch.load(std::memory_order_relaxed),
-        system.m_aimYaw.load(std::memory_order_relaxed),
-        system.m_aimRoll.load(std::memory_order_relaxed),
-    };
-    float origin[3] = {};
-    const bool originReadable = locals && ReadDirect(locals, origin, sizeof(origin));
-    bool finiteTargetUsed = false;
+    desired[0] = system.m_aimPitch.load(std::memory_order_relaxed);
+    desired[1] = system.m_aimYaw.load(std::memory_order_relaxed);
+    desired[2] = system.m_aimRoll.load(std::memory_order_relaxed);
     if (desiredValid && originReadable &&
         system.m_aimTargetValid.load(std::memory_order_acquire)) {
         const float aimOrigin[3] = {
@@ -622,10 +640,6 @@ void __fastcall WeaponAimSystem::HookedScriptInvoke(void* object, void* frame,
             finiteTargetUsed = DirectionToRotator(finiteDirection, desired);
         }
     }
-    bool overrideEnabled = false;
-    bool resultReadable = false;
-    bool written = false;
-    AcquireSRWLockShared(&system.m_ballisticOverrideLock);
     overrideEnabled = system.m_ballisticOverrideEnabled.load(std::memory_order_acquire);
     resultReadable = result && (periodicSample || overrideEnabled) &&
         ReadDirect(reinterpret_cast<uintptr_t>(result), rotation, sizeof(rotation));
@@ -1089,8 +1103,7 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
 }
 
 void WeaponAimSystem::Shutdown() {
-    m_aimValid.store(false, std::memory_order_release);
-    m_aimTargetValid.store(false, std::memory_order_release);
+    InvalidateDirection();
     m_aimUpdatedMs.store(0, std::memory_order_release);
     m_fireActive.store(false, std::memory_order_release);
     m_vehicleSecondaryFireActive.store(false, std::memory_order_release);

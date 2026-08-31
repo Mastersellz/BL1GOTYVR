@@ -643,6 +643,7 @@ struct ArmIKSystem::TargetSnapshot {
     Quat rotation[2];
     Quat cameraRotation;
     Vec3 cameraPosition;
+    RoomScaleBodyPose roomScaleBody;
     uint64_t controllerGeneration = 0;
 };
 
@@ -672,8 +673,9 @@ void ArmIKSystem::StartDiscovery() {
         Log("[ArmIK] Discovery thread creation failed: %lu", GetLastError());
         SetEnabled(false);
     }
-    Log("[ArmIK] Discovery started; solver self-test=%s",
-        RunTwoBoneIKSelfTest() ? "PASS" : "FAIL");
+    Log("[ArmIK] Discovery started; solver self-test=%s room-scale=%s",
+        RunTwoBoneIKSelfTest() ? "PASS" : "FAIL",
+        RunRoomScaleBodySelfTest() ? "PASS" : "FAIL");
 }
 
 bool ArmIKSystem::InstallPoseHook() {
@@ -719,6 +721,7 @@ void __fastcall ArmIKSystem::HookedUpdateSkelPose(void* component, float deltaTi
         return;
     }
     system.ObserveComponent(component);
+    system.CaptureNativeRightHand(component);
     input::InputHook::Instance().ReapplyWeaponPose(component);
     const uint64_t calls = system.m_poseHookCalls.fetch_add(
         1, std::memory_order_relaxed) + 1;
@@ -731,6 +734,72 @@ void __fastcall ArmIKSystem::HookedUpdateSkelPose(void* component, float deltaTi
             Log("[ArmIK] First component-space solve committed post-animation");
     }
     system.m_inFlightPoseHooks.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void ArmIKSystem::CaptureNativeRightHand(void* component) {
+    const uintptr_t componentAddress = reinterpret_cast<uintptr_t>(component);
+    Rig rig = {};
+    AcquireSRWLockShared(&m_rigLock);
+    if (m_rig && m_rig->valid && m_rig->component == componentAddress)
+        rig = *m_rig;
+    ReleaseSRWLockShared(&m_rigLock);
+    if (!rig.valid || rig.rightWrist < 0 || rig.rightWrist >= rig.boneCount ||
+        rig.componentPoseStride < static_cast<int>(sizeof(BoneMatrix))) return;
+
+    TArray64 livePose = {};
+    BoneMatrix wrist = {};
+    float localToWorld[16] = {};
+    if (!ReadMemory(rig.component + rig.componentPoseOffset,
+                    &livePose, sizeof(livePose)) ||
+        livePose.data != rig.componentPose || livePose.count != rig.boneCount ||
+        livePose.capacity < livePose.count ||
+        !ReadMemory(rig.componentPose + static_cast<uintptr_t>(rig.rightWrist) *
+                        rig.componentPoseStride,
+                    &wrist, sizeof(wrist)) || !ValidateMatrix(wrist.values) ||
+        !ReadMemory(rig.component + rig.matrixOffset,
+                    localToWorld, sizeof(localToWorld)) ||
+        !ValidateMatrix(localToWorld)) return;
+
+    const input::PlayerIdentitySnapshot identity =
+        input::WeaponAimSystem::Instance().GetPlayerIdentity();
+    if (!identity.pawnValid || !identity.weaponValid ||
+        identity.controller != rig.localController || identity.pawn != rig.localPawn)
+        return;
+
+    const float x = wrist.values[12];
+    const float y = wrist.values[13];
+    const float z = wrist.values[14];
+    NativeRightHandSnapshot snapshot;
+    snapshot.worldPosition[0] = x * localToWorld[0] + y * localToWorld[4] +
+        z * localToWorld[8] + localToWorld[12];
+    snapshot.worldPosition[1] = x * localToWorld[1] + y * localToWorld[5] +
+        z * localToWorld[9] + localToWorld[13];
+    snapshot.worldPosition[2] = x * localToWorld[2] + y * localToWorld[6] +
+        z * localToWorld[10] + localToWorld[14];
+    if (!std::isfinite(snapshot.worldPosition[0]) ||
+        !std::isfinite(snapshot.worldPosition[1]) ||
+        !std::isfinite(snapshot.worldPosition[2])) return;
+    snapshot.controller = identity.controller;
+    snapshot.pawn = identity.pawn;
+    snapshot.weapon = identity.weapon;
+    snapshot.armsComponent = rig.component;
+    snapshot.identityGeneration = identity.generation;
+    snapshot.updatedMs = GetTickCount64();
+    snapshot.valid = true;
+
+    AcquireSRWLockExclusive(&m_nativeRightHandLock);
+    snapshot.serial = m_nativeRightHand.serial + 1;
+    m_nativeRightHand = snapshot;
+    ReleaseSRWLockExclusive(&m_nativeRightHandLock);
+
+    static std::atomic<bool> loggedFirstNativeHand{false};
+    if (!loggedFirstNativeHand.exchange(true, std::memory_order_relaxed)) {
+        Log("[WeaponPose] Native right-wrist anchor published: component=%p "
+            "bone=%d world=(%.1f,%.1f,%.1f)",
+            reinterpret_cast<void*>(rig.component), rig.rightWrist,
+            snapshot.worldPosition[0], snapshot.worldPosition[1],
+            snapshot.worldPosition[2]);
+    }
 }
 
 void ArmIKSystem::ObserveComponent(void* component) {
@@ -837,6 +906,8 @@ void ArmIKSystem::RequestNativeCalibrationReset() {
 }
 
 void ArmIKSystem::RequestRescan() {
+    input::InputHook::Instance().CancelWeaponGrab();
+    m_leftWeaponGrabActive = false;
     AcquireSRWLockExclusive(&m_scanResetLock);
     m_scanEpoch.fetch_add(1, std::memory_order_acq_rel);
     m_inventoryRequestGeneration.fetch_add(1, std::memory_order_acq_rel);
@@ -846,6 +917,9 @@ void ArmIKSystem::RequestRescan() {
     AcquireSRWLockExclusive(&m_rigLock);
     if (m_rig) *m_rig = {};
     ReleaseSRWLockExclusive(&m_rigLock);
+    AcquireSRWLockExclusive(&m_nativeRightHandLock);
+    m_nativeRightHand = {};
+    ReleaseSRWLockExclusive(&m_nativeRightHandLock);
     m_observedComponentsTruncated.store(0, std::memory_order_release);
     for (size_t index = 0; index < m_observedComponents.size(); ++index) {
         m_observedComponentUpdates[index].store(0, std::memory_order_relaxed);
@@ -1983,6 +2057,8 @@ void ArmIKSystem::CheckVisibilityWatchdog() {
 
 uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePitchRadians,
                                     float gameYawRadians,
+                                    const float headTrackingPosition[3],
+                                    const float headTrackingRotation[4],
                                     const float trackingReferencePosition[3],
                                     const float trackingReferenceRotation[4]) {
     if (cameraLocation && std::isfinite(cameraLocation[0]) &&
@@ -2038,6 +2114,17 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
             const float worldScale = 100.0f * config::Get().positional_scale;
             const Vec3 worldOffset = RotateYaw(XrToUe(localXr), gameYawRadians) * worldScale;
             const auto& settings = config::Get();
+            const float* handRotation = hand == 1 && controllers[hand].aimValid
+                ? controllers[hand].aimRotation : controllers[hand].rotation;
+            const Quat controllerRotation = XrControllerToWorld(
+                handRotation, inverseReference,
+                gamePitchRadians, gameYawRadians);
+            float weaponPitch = 0.0f, weaponYaw = 0.0f, weaponRoll = 0.0f;
+            float weaponForward = 0.0f, weaponRight = 0.0f, weaponUp = 0.0f;
+            const bool weaponTuning = hand == 1 &&
+                input::InputHook::Instance().GetActiveWeaponPoseTuning(
+                    weaponPitch, weaponYaw, weaponRoll, weaponForward,
+                    weaponRight, weaponUp);
             const Vec3 localAdjustment = hand == 0
                 ? Vec3{settings.left_hand_offset_forward,
                        settings.left_hand_offset_right,
@@ -2047,27 +2134,201 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
                        settings.right_hand_offset_up};
             const Vec3 worldAdjustment = RotatePitchYaw(
                 localAdjustment, gamePitchRadians, gameYawRadians);
+            const Vec3 weaponAdjustment = weaponTuning
+                ? RotateByQuat(controllerRotation,
+                    {weaponForward, weaponRight, weaponUp}) : Vec3{};
             snapshot.position[hand] = {
-                cameraLocation[0] + worldOffset.x + worldAdjustment.x,
-                cameraLocation[1] + worldOffset.y + worldAdjustment.y,
-                cameraLocation[2] + worldOffset.z + worldAdjustment.z};
-            const float* handRotation = hand == 1 && controllers[hand].aimValid
-                ? controllers[hand].aimRotation : controllers[hand].rotation;
-            const Quat controllerRotation = XrControllerToWorld(
-                handRotation, inverseReference,
-                gamePitchRadians, gameYawRadians);
+                cameraLocation[0] + worldOffset.x + worldAdjustment.x + weaponAdjustment.x,
+                cameraLocation[1] + worldOffset.y + worldAdjustment.y + weaponAdjustment.y,
+                cameraLocation[2] + worldOffset.z + worldAdjustment.z + weaponAdjustment.z};
             const Quat rotationAdjustment = hand == 0
                 ? HandRotationAdjustment(settings.left_hand_rotation_pitch,
                                          settings.left_hand_rotation_yaw,
                                          settings.left_hand_rotation_roll)
-                : HandRotationAdjustment(settings.right_hand_rotation_pitch,
-                                         settings.right_hand_rotation_yaw,
-                                         settings.right_hand_rotation_roll);
+                : HandRotationAdjustment(settings.right_hand_rotation_pitch + weaponPitch,
+                                         settings.right_hand_rotation_yaw + weaponYaw,
+                                         settings.right_hand_rotation_roll + weaponRoll);
             snapshot.rotation[hand] = QuatMultiply(
                 controllerRotation, rotationAdjustment).normalized();
             snapshot.valid[hand] = true;
         }
+
+        if (headTrackingPosition && headTrackingRotation) {
+            const Vec3 trackingHeadDelta{
+                headTrackingPosition[0] - trackingReferencePosition[0],
+                headTrackingPosition[1] - trackingReferencePosition[1],
+                headTrackingPosition[2] - trackingReferencePosition[2]};
+            const Vec3 localHeadXr = RotateByQuat(inverseReference, trackingHeadDelta);
+            const float worldScale = 100.0f * config::Get().positional_scale;
+            const Vec3 physicalHeadOffset = RotateYaw(
+                XrToUe(localHeadXr), gameYawRadians) * worldScale;
+            TrackedBodyInput bodyInput;
+            bodyInput.bodyAnchor = snapshot.cameraPosition;
+            bodyInput.headPosition = snapshot.cameraPosition + physicalHeadOffset;
+            bodyInput.headRotation = XrControllerToWorld(
+                headTrackingRotation, inverseReference, 0.0f, gameYawRadians);
+            bodyInput.leftHandPosition = snapshot.position[0];
+            bodyInput.leftHandRotation = snapshot.rotation[0];
+            bodyInput.rightHandPosition = snapshot.position[1];
+            bodyInput.rightHandRotation = snapshot.rotation[1];
+            bodyInput.leftHandValid = snapshot.valid[0];
+            bodyInput.rightHandValid = snapshot.valid[1];
+
+            const auto& settings = config::Get();
+            RoomScaleBodySettings bodySettings;
+            bodySettings.enabled = settings.room_scale_enabled;
+            bodySettings.allowHorizontal = settings.room_scale_allow_horizontal;
+            bodySettings.allowVertical = settings.room_scale_allow_vertical;
+            bodySettings.followStrength = settings.room_scale_follow_strength;
+            bodySettings.calibratedHeight = settings.room_scale_calibrated_height;
+            bodySettings.headToChest = settings.room_scale_head_to_chest;
+            bodySettings.headToPelvis = settings.room_scale_head_to_pelvis;
+            bodySettings.shoulderWidth = settings.room_scale_shoulder_width;
+            bodySettings.standingThreshold = settings.room_scale_standing_threshold;
+            bodySettings.proneThreshold = settings.room_scale_prone_threshold;
+            bodySettings.poseHysteresis = settings.room_scale_pose_hysteresis;
+
+            const uint64_t now = GetTickCount64();
+            if (m_roomScaleResetRequested.exchange(false, std::memory_order_acq_rel)) {
+                m_roomScaleCalibrationPending = true;
+                m_roomScaleCalibrationStartedMs = now;
+                m_lastRoomScaleUpdateMs = 0;
+                m_physicalPoseIntent.store(
+                    PhysicalPose::Standing, std::memory_order_release);
+                m_physicalPoseIntentInitialized = false;
+                Log("[RoomScale] Waiting 250 ms for stable HMD calibration");
+            }
+            if (m_roomScaleCalibrationPending &&
+                now - m_roomScaleCalibrationStartedMs >= 250) {
+                m_roomScaleBody.Reset(bodyInput.bodyAnchor, bodyInput.headPosition,
+                                      bodySettings.calibratedHeight);
+                m_roomScaleCalibrationPending = false;
+                m_lastRoomScaleUpdateMs = 0;
+                Log("[RoomScale] Body root calibrated");
+            }
+            if (!m_roomScaleCalibrationPending) {
+                const float deltaTime = m_lastRoomScaleUpdateMs
+                    ? static_cast<float>(now - m_lastRoomScaleUpdateMs) * 0.001f
+                    : 1.0f / 72.0f;
+                m_lastRoomScaleUpdateMs = now;
+                snapshot.roomScaleBody = m_roomScaleBody.Update(
+                    bodyInput, deltaTime, bodySettings);
+            }
+            if (snapshot.roomScaleBody.valid) {
+                constexpr uint64_t kPoseDebounceMs = 250;
+                const PhysicalPose observed = snapshot.roomScaleBody.physicalPose;
+                if (!m_physicalPoseIntentInitialized) {
+                    m_physicalPoseIntent.store(observed, std::memory_order_release);
+                    m_physicalPoseCandidate = observed;
+                    m_physicalPoseCandidateSinceMs = now;
+                    m_physicalPoseIntentInitialized = true;
+                } else if (observed != m_physicalPoseCandidate) {
+                    m_physicalPoseCandidate = observed;
+                    m_physicalPoseCandidateSinceMs = now;
+                } else if (observed != m_physicalPoseIntent.load(
+                               std::memory_order_acquire) &&
+                           now - m_physicalPoseCandidateSinceMs >= kPoseDebounceMs) {
+                    m_physicalPoseIntent.store(observed, std::memory_order_release);
+                    Log("[RoomScale] Posture intent=%s",
+                        observed == PhysicalPose::Standing ? "standing" :
+                        observed == PhysicalPose::Crouching ? "crouching" : "prone");
+                }
+                static uint64_t lastRoomScaleLogMs = 0;
+                if (settings.debug_room_scale &&
+                    now - lastRoomScaleLogMs >= 1000) {
+                    lastRoomScaleLogMs = now;
+                    Log("[RoomScale] offset=(%.1f,%.1f,%.1f) height=%.2f",
+                        snapshot.roomScaleBody.physicalOffset.x,
+                        snapshot.roomScaleBody.physicalOffset.y,
+                        snapshot.roomScaleBody.physicalOffset.z,
+                        snapshot.roomScaleBody.heightRatio);
+                }
+            }
+        }
     }
+
+    auto& inputHook = input::InputHook::Instance();
+    float weaponPositionValues[3] = {};
+    float weaponForwardValues[3] = {};
+    float weaponUpValues[3] = {};
+    const bool weaponPoseValid = !snapshot.componentSpace &&
+        !camera::IsVehicleCameraActive() &&
+        inputHook.GetDrivenWeaponFrame(weaponPositionValues,
+                                       weaponForwardValues, weaponUpValues);
+    Vec3 weaponForward = weaponPoseValid
+        ? Vec3{weaponForwardValues[0], weaponForwardValues[1],
+               weaponForwardValues[2]}.normalized() : Vec3{};
+    Vec3 weaponUp = weaponPoseValid
+        ? Vec3{weaponUpValues[0], weaponUpValues[1],
+               weaponUpValues[2]}.normalized() : Vec3{};
+    Vec3 weaponRight{
+        weaponUp.y * weaponForward.z - weaponUp.z * weaponForward.y,
+        weaponUp.z * weaponForward.x - weaponUp.x * weaponForward.z,
+        weaponUp.x * weaponForward.y - weaponUp.y * weaponForward.x};
+    weaponRight = weaponRight.normalized();
+    weaponUp = Vec3{
+        weaponForward.y * weaponRight.z - weaponForward.z * weaponRight.y,
+        weaponForward.z * weaponRight.x - weaponForward.x * weaponRight.z,
+        weaponForward.x * weaponRight.y - weaponForward.y * weaponRight.x}.normalized();
+    const bool weaponFrameValid = weaponPoseValid &&
+        weaponForward.lengthSq() > 0.9f && weaponRight.lengthSq() > 0.9f &&
+        weaponUp.lengthSq() > 0.9f;
+    const Vec3 weaponPosition{weaponPositionValues[0], weaponPositionValues[1],
+                              weaponPositionValues[2]};
+
+    bool weaponGrabNearby = false;
+    if (weaponFrameValid && snapshot.valid[0] &&
+        inputHook.IsMotionControlsEnabled() && inputHook.IsWeaponPoseActive()) {
+        const Vec3 relative = snapshot.position[0] - weaponPosition;
+        float along = relative.x * weaponForward.x +
+            relative.y * weaponForward.y + relative.z * weaponForward.z;
+        along = (std::max)(4.0f, (std::min)(along, 48.0f));
+        const Vec3 gripPoint = weaponPosition + weaponForward * along +
+            weaponRight * -8.0f + weaponUp * -6.0f;
+        constexpr float kGrabActivationRadiusUe = 12.0f;
+        weaponGrabNearby = (snapshot.position[0] - gripPoint).lengthSq() <=
+            kGrabActivationRadiusUe * kGrabActivationRadiusUe;
+    }
+    inputHook.SetWeaponGrabArmed(weaponGrabNearby);
+
+    const bool weaponGrabHeld = inputHook.IsWeaponGrabHeld();
+    if (!weaponGrabHeld) m_leftWeaponGrabActive = false;
+    if (weaponGrabHeld && weaponFrameValid && snapshot.valid[0]) {
+        const Quat weaponRotation = QuatLookAt(weaponForward, weaponUp);
+        if (!m_leftWeaponGrabActive) {
+            const Vec3 fromWeapon = snapshot.position[0] - weaponPosition;
+            m_leftWeaponGrabLocalPosition[0] =
+                fromWeapon.x * weaponForward.x + fromWeapon.y * weaponForward.y +
+                fromWeapon.z * weaponForward.z;
+            m_leftWeaponGrabLocalPosition[1] =
+                fromWeapon.x * weaponRight.x + fromWeapon.y * weaponRight.y +
+                fromWeapon.z * weaponRight.z;
+            m_leftWeaponGrabLocalPosition[2] =
+                fromWeapon.x * weaponUp.x + fromWeapon.y * weaponUp.y +
+                fromWeapon.z * weaponUp.z;
+            const Quat localRotation = QuatMultiply(
+                weaponRotation.conjugate(), snapshot.rotation[0]).normalized();
+            m_leftWeaponGrabLocalRotation[0] = localRotation.x;
+            m_leftWeaponGrabLocalRotation[1] = localRotation.y;
+            m_leftWeaponGrabLocalRotation[2] = localRotation.z;
+            m_leftWeaponGrabLocalRotation[3] = localRotation.w;
+            m_leftWeaponGrabActive = true;
+            Log("[ArmIK] Left hand latched to final weapon transform");
+        }
+        snapshot.position[0] = weaponPosition +
+            weaponForward * m_leftWeaponGrabLocalPosition[0] +
+            weaponRight * m_leftWeaponGrabLocalPosition[1] +
+            weaponUp * m_leftWeaponGrabLocalPosition[2];
+        const Quat localRotation{
+            m_leftWeaponGrabLocalRotation[0], m_leftWeaponGrabLocalRotation[1],
+            m_leftWeaponGrabLocalRotation[2], m_leftWeaponGrabLocalRotation[3]};
+        snapshot.rotation[0] = QuatMultiply(
+            weaponRotation, localRotation).normalized();
+    } else if (weaponGrabHeld) {
+        m_leftWeaponGrabActive = false;
+        inputHook.CancelWeaponGrab();
+    }
+
     AcquireSRWLockExclusive(&m_targetLock);
     if (!m_targets) {
         ReleaseSRWLockExclusive(&m_targetLock);
@@ -2077,6 +2338,39 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
     ReleaseSRWLockExclusive(&m_targetLock);
     m_latestTargetGeneration.store(controllerGeneration, std::memory_order_release);
     return controllerGeneration;
+}
+
+bool ArmIKSystem::GetWorldHandTarget(uint64_t targetGeneration, int hand,
+                                     float position[3], float forward[3],
+                                     float up[3]) const {
+    if (targetGeneration == 0 || hand < 0 || hand > 1 ||
+        !position || !forward || !up) return false;
+    TargetSnapshot snapshot = {};
+    AcquireSRWLockShared(&m_targetLock);
+    if (m_targets)
+        snapshot = m_targets[targetGeneration % kTargetHistorySize];
+    ReleaseSRWLockShared(&m_targetLock);
+    if (snapshot.controllerGeneration != targetGeneration ||
+        !snapshot.valid[hand] || snapshot.componentSpace) return false;
+
+    const Vec3 targetForward = RotateByQuat(snapshot.rotation[hand], {1.0f, 0.0f, 0.0f});
+    const Vec3 targetUp = RotateByQuat(snapshot.rotation[hand], {0.0f, 0.0f, 1.0f});
+    const Vec3& targetPosition = snapshot.position[hand];
+    if (!std::isfinite(targetPosition.x) || !std::isfinite(targetPosition.y) ||
+        !std::isfinite(targetPosition.z) || !std::isfinite(targetForward.x) ||
+        !std::isfinite(targetForward.y) || !std::isfinite(targetForward.z) ||
+        !std::isfinite(targetUp.x) || !std::isfinite(targetUp.y) ||
+        !std::isfinite(targetUp.z)) return false;
+    position[0] = targetPosition.x;
+    position[1] = targetPosition.y;
+    position[2] = targetPosition.z;
+    forward[0] = targetForward.x;
+    forward[1] = targetForward.y;
+    forward[2] = targetForward.z;
+    up[0] = targetUp.x;
+    up[1] = targetUp.y;
+    up[2] = targetUp.z;
+    return true;
 }
 
 void ArmIKSystem::SetRenderContext(uint64_t renderGeneration,
@@ -2347,8 +2641,12 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
             solved[bone].rotation = QuatMultiply(
                 forearmDelta, solved[bone].rotation).normalized();
         }
-        Quat wristCalibration = rig.wristCalibration[hand];
-        if (!rig.wristCalibrationValid[hand]) {
+        // The weapon hand must be deterministic across pawn/map rebuilds.
+        // Its complete controller-to-wrist correction comes from the persisted
+        // global hand settings plus the per-character weapon profile.
+        Quat wristCalibration = hand == 1
+            ? Quat{} : rig.wristCalibration[hand];
+        if (hand != 1 && !rig.wristCalibrationValid[hand]) {
             // The weapon hand inherits the native camera-to-wrist basis and
             // follows OpenXR aim/pose. The off-hand follows grip/pose.
             wristCalibration = QuatMultiply(calibrationReferenceRotation.conjugate(),
@@ -2361,6 +2659,17 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
                 m_rig->wristCalibrationValid[hand] = true;
             }
             ReleaseSRWLockExclusive(&m_rigLock);
+        }
+        if (hand == 1 && !rig.wristCalibrationValid[hand]) {
+            rig.wristCalibration[hand] = {};
+            rig.wristCalibrationValid[hand] = true;
+            AcquireSRWLockExclusive(&m_rigLock);
+            if (m_rig && m_rig->component == rig.component) {
+                m_rig->wristCalibration[hand] = {};
+                m_rig->wristCalibrationValid[hand] = true;
+            }
+            ReleaseSRWLockExclusive(&m_rigLock);
+            Log("[ArmIK] Right wrist uses deterministic identity calibration");
         }
         const Quat desiredWristRotation = QuatMultiply(targetRotation,
             wristCalibration).normalized();
@@ -2517,6 +2826,14 @@ ArmRigStatus ArmIKSystem::GetStatus() const {
     }
     ReleaseSRWLockShared(&m_rigLock);
     return status;
+}
+
+bool ArmIKSystem::GetNativeRightHandSnapshot(
+    NativeRightHandSnapshot& snapshot) const {
+    AcquireSRWLockShared(&m_nativeRightHandLock);
+    snapshot = m_nativeRightHand;
+    ReleaseSRWLockShared(&m_nativeRightHandLock);
+    return snapshot.valid;
 }
 
 ComponentInventoryStatus ArmIKSystem::GetComponentInventory() const {

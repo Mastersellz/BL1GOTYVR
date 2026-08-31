@@ -80,6 +80,7 @@ add_library(BL1GOTYVR SHARED
     src/input/WeaponAimSystem.cpp
     src/player/TwoBoneIK.cpp
     src/player/ArmIKSystem.cpp
+    src/player/RoomScaleBody.cpp
     src/render/HudBlitter.cpp
     src/ui/Overlay.cpp
     src/config/Config.cpp

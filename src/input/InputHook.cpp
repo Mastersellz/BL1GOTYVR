@@ -17,6 +17,9 @@
 
 namespace bl1gotyvr { namespace input {
 
+static void MultiplyMatrix(const float left[16], const float right[16],
+                           float output[16]);
+
 InputHook& InputHook::Instance() {
     static InputHook hook;
     return hook;
@@ -60,15 +63,26 @@ void InputHook::Install() {
     AimHook::Instance().Initialize();
     m_aimTrimPitch = config::Get().aim_pitch_degrees;
     m_aimTrimYaw = config::Get().aim_yaw_degrees;
-    m_defaultAimTrimPitch = m_aimTrimPitch;
-    m_defaultAimTrimYaw = m_aimTrimYaw;
+    m_defaultAimTrimPitch = 0.0f;
+    m_defaultAimTrimYaw = 0.0f;
     m_aimTuningKeysDown = 0;
     memset(m_aimTuningNextRepeatMs, 0, sizeof(m_aimTuningNextRepeatMs));
+    m_handTuningHand = 1;
+    m_handTuningDirty = false;
     m_aimTuningDirty = false;
+    m_activeWeaponTrimPitch.store(0.0f, std::memory_order_release);
+    m_activeWeaponTrimYaw.store(0.0f, std::memory_order_release);
+    m_activeWeaponTrimRoll.store(0.0f, std::memory_order_release);
+    m_activeWeaponOffsetForward.store(0.0f, std::memory_order_release);
+    m_activeWeaponOffsetRight.store(0.0f, std::memory_order_release);
+    m_activeWeaponOffsetUp.store(0.0f, std::memory_order_release);
+    m_activeWeaponTrimValid.store(false, std::memory_order_release);
     memset(m_weaponAimProfiles, 0, sizeof(m_weaponAimProfiles));
     m_weaponAimProfileCursor = 0;
     m_activeWeaponAimProfile = -1;
     m_weaponMountValid = false;
+    m_weaponMountAbsolute = false;
+    m_weaponNativeMatrixValid = false;
     m_mountIdentityGeneration = 0;
     memset(m_weaponMountCache, 0, sizeof(m_weaponMountCache));
     m_weaponMountCacheCursor = 0;
@@ -78,8 +92,7 @@ void InputHook::Install() {
     m_pendingWeaponComponent = 0;
     m_weaponIdentityStableSinceMs = 0;
     m_motionControlsEnabled.store(true, std::memory_order_release);
-    m_motionReenableAtMs = 0;
-    m_dotVisibleAtMs.store(0, std::memory_order_release);
+    m_dotVisibleAtMs.store(GetTickCount64(), std::memory_order_release);
     m_xinputActive = XInputBridge::Instance().Initialize();
 
     m_installed = true;
@@ -91,9 +104,10 @@ void InputHook::Install() {
     Log("[Input] Map: sticks analog, RT fire, LT ADS, A jump, B crouch, "
         "X use/reload, Y cycle, LB skill, RB grenade, L3 sprint, R3 melee, Menu Start");
     Log("[Input] Y chord: tap=Y, hold 400ms=Back/ECHO, hold+left stick=D-pad");
-    Log("[Input] B chord: tap=B, hold 800ms=toggle motion controls");
-    Log("[Input] Aim calibration: Ctrl+Numpad 8/2 pitch, 4/6 yaw, 5 reset; "
-        "release Ctrl to save per weapon");
+    Log("[Input] B chord: tap=B, hold 400ms=toggle motion controls");
+    Log("[Input] Calibration: Ctrl+Numpad 1=global left hand, 3=active weapon, "
+        "0 toggles rotation/position, 8/2 4/6 7/9 adjust axes, "
+        "5 resets current mode; release Ctrl to save");
 }
 
 static bool IsGameForeground(HWND hwnd) {
@@ -161,12 +175,17 @@ void InputHook::ReleaseAllInput() {
     if (mcount) SendInput(mcount, mouse, sizeof(INPUT));
     m_prevTrigger = m_prevButtonA = m_prevVehicleAltFire = 0;
     m_leftTriggerDown = m_rightTriggerDown = false;
+    m_leftTriggerWasDown = false;
     m_leftGripDown = m_rightGripDown = false;
     m_yWasDown = m_yChordUsed = false;
     m_bWasDown = m_bHoldUsed = false;
     m_recenterChordLatched = false;
     m_yPressMs = m_yTapPulseUntilMs = 0;
     m_bPressMs = m_bTapPulseUntilMs = 0;
+    m_weaponGrabArmed.store(false, std::memory_order_release);
+    m_weaponGrabHeld.store(false, std::memory_order_release);
+    m_weaponGrabCancelRequested.store(false, std::memory_order_release);
+    m_weaponGrabLatched = false;
     m_snapTurnAccum = 0;
     ResetPhysicalMelee();
     if (m_outputLive) {
@@ -369,6 +388,14 @@ void InputHook::UpdateState(XrTime displayTime) {
             right.trigger, left.trigger,
             left.thumbstickX, left.thumbstickY,
             right.thumbstickX, right.thumbstickY);
+    const uint64_t now = GetTickCount64();
+    uint64_t expectedDotTime = 0;
+    if (right.aimValid && m_motionControlsEnabled.load(std::memory_order_acquire) &&
+        m_dotVisibleAtMs.compare_exchange_strong(
+            expectedDotTime, now,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        Log("[Input] Aim dot enabled from tracked right controller");
+    }
     if (!left.valid || !right.valid) { ReleaseAllInput(); return; }
     if (!foreground) { ReleaseAllInput(); return; }
     if (ui::IsVisible()) { ReleaseAllInput(); return; }
@@ -384,33 +411,31 @@ void InputHook::UpdateState(XrTime displayTime) {
         right.eulerYaw * kDegreesToRadians, right.eulerRoll * kDegreesToRadians);
 
     m_rightTriggerDown = ApplyHysteresis(right.trigger, m_rightTriggerDown);
+    m_leftTriggerWasDown = m_leftTriggerDown;
     m_leftTriggerDown = ApplyHysteresis(left.trigger, m_leftTriggerDown);
     m_leftGripDown = ApplyHysteresis(left.grip, m_leftGripDown);
     m_rightGripDown = ApplyHysteresis(right.grip, m_rightGripDown);
     const bool vehicleMode = camera::IsVehicleCameraActive();
+    const bool leftTriggerPressed = m_leftTriggerDown && !m_leftTriggerWasDown;
+    const bool weaponGrabCancelled = m_weaponGrabCancelRequested.exchange(
+        false, std::memory_order_acq_rel);
+    if (!m_leftTriggerDown || weaponGrabCancelled || vehicleMode ||
+        !m_motionControlsEnabled.load(std::memory_order_acquire)) {
+        m_weaponGrabLatched = false;
+    } else if (leftTriggerPressed) {
+        m_weaponGrabLatched = m_weaponGrabArmed.load(std::memory_order_acquire);
+        if (m_weaponGrabLatched)
+            Log("[Input] Left trigger latched as two-hand weapon grab");
+    }
+    const bool weaponGrabHeld = m_leftTriggerDown && m_weaponGrabLatched;
+    m_weaponGrabHeld.store(weaponGrabHeld, std::memory_order_release);
+    const bool adsActive = m_leftTriggerDown && !weaponGrabHeld;
     const bool vehicleSecondaryFire = vehicleMode && m_rightGripDown;
     WeaponAimSystem::Instance().SetVehicleSecondaryFireActive(vehicleSecondaryFire);
     WeaponAimSystem::Instance().SetFireActive(
         m_rightTriggerDown || vehicleSecondaryFire);
 
-    const uint64_t now = GetTickCount64();
-    uint64_t expectedDotTime = 0;
-    if (right.aimValid && m_motionControlsEnabled.load(std::memory_order_acquire) &&
-        m_dotVisibleAtMs.compare_exchange_strong(
-            expectedDotTime, now,
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
-        Log("[Input] Aim dot enabled from tracked right controller");
-    }
     const bool physicalMeleePulse = UpdatePhysicalMelee(left, now);
-    if (m_motionReenableAtMs && now >= m_motionReenableAtMs) {
-        m_motionReenableAtMs = 0;
-        player::ArmIKSystem::Instance().RequestNativeCalibrationReset();
-        player::ArmIKSystem::Instance().SetEnabled(true);
-        m_nativeWeaponCalibrationResetRequested.store(true, std::memory_order_release);
-        m_weaponCalibrationResetRequested.store(true, std::memory_order_release);
-        m_motionControlsEnabled.store(true, std::memory_order_release);
-        Log("[Input] Motion controls re-enabled after native-pose settle");
-    }
     const bool yDown = left.buttonY;
     if (yDown && !m_yWasDown) {
         m_yPressMs = now;
@@ -448,30 +473,37 @@ void InputHook::UpdateState(XrTime displayTime) {
         m_bTapPulseUntilMs = 0;
     }
     const uint64_t bHeldMs = bDown && now >= m_bPressMs ? now - m_bPressMs : 0;
-    if (bDown && !m_bHoldUsed && bHeldMs >= 800) {
+    if (bDown && !m_bHoldUsed && bHeldMs >= 400) {
         m_bHoldUsed = true;
         if (m_motionControlsEnabled.exchange(false, std::memory_order_acq_rel)) {
-            m_motionReenableAtMs = 0;
             m_dotVisibleAtMs.store(0, std::memory_order_release);
             player::ArmIKSystem::Instance().SetEnabled(false);
             AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
+            if (m_weaponNativeMatrixValid && m_renderWeaponComponent >= 0x10000 &&
+                m_renderWeaponMatrixOffset > 0) {
+                SIZE_T bytesWritten = 0;
+                WriteProcessMemory(GetCurrentProcess(),
+                    reinterpret_cast<void*>(m_renderWeaponComponent +
+                                            m_renderWeaponMatrixOffset),
+                    m_weaponNativeMatrix, sizeof(m_weaponNativeMatrix), &bytesWritten);
+            }
             m_renderWeaponStampActive = false;
             m_renderWeaponComponent = 0;
             m_renderWeaponMatrixOffset = 0;
             ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
             m_weaponPoseActive.store(false, std::memory_order_release);
+            CancelWeaponGrab();
             WeaponAimSystem::Instance().InvalidateDirection();
             Log("[Input] Motion controls disabled by hold-B");
-        } else if (!m_motionReenableAtMs) {
-            m_motionReenableAtMs = now + 700;
-            Log("[Input] Motion controls will re-enable after 700 ms native-pose settle");
         } else {
-            m_motionReenableAtMs = 0;
-            Log("[Input] Motion-control re-enable cancelled by hold-B");
+            m_weaponCalibrationResetRequested.store(true, std::memory_order_release);
+            m_motionControlsEnabled.store(true, std::memory_order_release);
+            m_dotVisibleAtMs.store(now, std::memory_order_release);
+            Log("[Input] Motion controls enabled; waiting for coherent weapon pose");
         }
     }
     if (!bDown && m_bWasDown && !m_bHoldUsed &&
-        now >= m_bPressMs && now - m_bPressMs < 800) {
+        now >= m_bPressMs && now - m_bPressMs < 400) {
         m_bTapPulseUntilMs = now + 100;
     }
     m_bWasDown = bDown;
@@ -509,7 +541,7 @@ void InputHook::UpdateState(XrTime displayTime) {
         state.moveY = suppressMove ? 0.0f : left.thumbstickY;
         state.turnX = right.thumbstickX;
         state.turnY = right.thumbstickY;
-        state.leftTrigger = m_leftTriggerDown
+        state.leftTrigger = adsActive
             ? (std::max)(left.trigger, 0.55f) : 0.0f;
         state.rightTrigger = m_rightTriggerDown
             ? (std::max)(right.trigger, 0.55f) : 0.0f;
@@ -536,7 +568,7 @@ void InputHook::UpdateState(XrTime displayTime) {
         setMouse(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
             m_rightTriggerDown, m_prevTrigger);
         setMouse(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-            m_leftTriggerDown || vehicleSecondaryFire, m_prevButtonA);
+            adsActive || vehicleSecondaryFire, m_prevButtonA);
         setKey(VK_SPACE, right.buttonA, m_prevJump);
         setKey('C', bTapPulse, m_prevCrouch);
         setKey('E', left.buttonX, m_prevUse);
@@ -572,6 +604,10 @@ void InputHook::PollAimTuningKeys() {
         (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
         (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
     if (!ctrlDown) {
+        if (m_handTuningDirty) {
+            config::SaveLoaded();
+            m_handTuningDirty = false;
+        }
         if (m_aimTuningDirty) {
             SaveActiveAimProfile();
             m_aimTuningDirty = false;
@@ -580,16 +616,11 @@ void InputHook::PollAimTuningKeys() {
         memset(m_aimTuningNextRepeatMs, 0, sizeof(m_aimTuningNextRepeatMs));
         return;
     }
-    if (m_activeWeaponAimProfile < 0 ||
-        m_activeWeaponAimProfile >= kWeaponAimProfileCapacity ||
-        !m_weaponAimProfiles[m_activeWeaponAimProfile].valid) return;
 
     const uint64_t now = GetTickCount64();
-    auto pressed = [&](int numpadKey, int navigationKey, uint32_t bit, int index,
+    auto pressed = [&](int numpadKey, uint32_t bit, int index,
                        bool allowRepeat = true) {
-        const bool down =
-            (GetAsyncKeyState(numpadKey) & 0x8000) != 0 ||
-            (GetAsyncKeyState(navigationKey) & 0x8000) != 0;
+        const bool down = (GetAsyncKeyState(numpadKey) & 0x8000) != 0;
         const bool wasDown = (m_aimTuningKeysDown & bit) != 0;
         if (!down) {
             m_aimTuningKeysDown &= ~bit;
@@ -608,41 +639,100 @@ void InputHook::PollAimTuningKeys() {
         return false;
     };
 
-    const bool increasePitch = pressed(VK_NUMPAD8, VK_UP, 1u << 0, 0);
-    const bool decreasePitch = pressed(VK_NUMPAD2, VK_DOWN, 1u << 1, 1);
-    const bool decreaseYaw = pressed(VK_NUMPAD4, VK_LEFT, 1u << 2, 2);
-    const bool increaseYaw = pressed(VK_NUMPAD6, VK_RIGHT, 1u << 3, 3);
-    const bool reset = pressed(VK_NUMPAD5, VK_CLEAR, 1u << 4, 4, false);
+    const bool selectLeft = pressed(VK_NUMPAD1, 1u << 5, 5, false);
+    const bool selectRight = pressed(VK_NUMPAD3, 1u << 6, 6, false);
+    const bool togglePositionMode = pressed(VK_NUMPAD0, 1u << 9, 9, false);
+    if (selectLeft) m_handTuningHand = 0;
+    if (selectRight) m_handTuningHand = 1;
+    if (togglePositionMode && m_handTuningHand == 1) {
+        m_weaponTuningPositionMode = !m_weaponTuningPositionMode;
+        Log("[Input] Active weapon calibration mode=%s",
+            m_weaponTuningPositionMode ? "position" : "rotation");
+    }
+
+    const bool increasePitch = pressed(VK_NUMPAD8, 1u << 0, 0);
+    const bool decreasePitch = pressed(VK_NUMPAD2, 1u << 1, 1);
+    const bool decreaseYaw = pressed(VK_NUMPAD4, 1u << 2, 2);
+    const bool increaseYaw = pressed(VK_NUMPAD6, 1u << 3, 3);
+    const bool reset = pressed(VK_NUMPAD5, 1u << 4, 4, false);
+    const bool decreaseRoll = pressed(VK_NUMPAD7, 1u << 7, 7);
+    const bool increaseRoll = pressed(VK_NUMPAD9, 1u << 8, 8);
 
     constexpr float kStepDegrees = 0.25f;
+    auto& settings = config::Get();
+    const bool weaponProfile = m_handTuningHand == 1;
+    const bool positionMode = weaponProfile && (m_weaponTuningPositionMode ||
+        ((GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
+         (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0));
+    if (weaponProfile && (m_activeWeaponAimProfile < 0 ||
+        m_activeWeaponAimProfile >= kWeaponAimProfileCapacity)) return;
+    float& pitch = weaponProfile ? m_aimTrimPitch
+                                 : settings.left_hand_rotation_pitch;
+    float& yaw = weaponProfile ? m_aimTrimYaw
+                               : settings.left_hand_rotation_yaw;
+    float& roll = weaponProfile ? m_aimTrimRoll
+                                : settings.left_hand_rotation_roll;
     bool changed = false;
     auto adjust = [&](bool keyPressed, float& value, float amount) {
         if (!keyPressed) return;
         value += amount;
         changed = true;
     };
-    adjust(increasePitch, m_aimTrimPitch, kStepDegrees);
-    adjust(decreasePitch, m_aimTrimPitch, -kStepDegrees);
-    adjust(decreaseYaw, m_aimTrimYaw, -kStepDegrees);
-    adjust(increaseYaw, m_aimTrimYaw, kStepDegrees);
-    if (reset) {
-        m_aimTrimPitch = 0.0f;
-        m_aimTrimYaw = 0.0f;
+    if (positionMode) {
+        constexpr float kStepUe = 0.25f;
+        adjust(increasePitch, m_weaponOffsetUp, kStepUe);
+        adjust(decreasePitch, m_weaponOffsetUp, -kStepUe);
+        adjust(decreaseYaw, m_weaponOffsetRight, -kStepUe);
+        adjust(increaseYaw, m_weaponOffsetRight, kStepUe);
+        adjust(decreaseRoll, m_weaponOffsetForward, -kStepUe);
+        adjust(increaseRoll, m_weaponOffsetForward, kStepUe);
+    } else {
+        adjust(increasePitch, pitch, kStepDegrees);
+        adjust(decreasePitch, pitch, -kStepDegrees);
+        adjust(decreaseYaw, yaw, -kStepDegrees);
+        adjust(increaseYaw, yaw, kStepDegrees);
+        adjust(decreaseRoll, roll, -kStepDegrees);
+        adjust(increaseRoll, roll, kStepDegrees);
+    }
+    if (reset && positionMode) {
+        m_weaponOffsetForward = 0.0f;
+        m_weaponOffsetRight = 0.0f;
+        m_weaponOffsetUp = 0.0f;
+        changed = true;
+    } else if (reset) {
+        pitch = 0.0f;
+        yaw = 0.0f;
+        roll = 0.0f;
         changed = true;
     }
     if (!changed) return;
 
-    m_aimTrimPitch = (std::max)(-45.0f, (std::min)(m_aimTrimPitch, 45.0f));
-    m_aimTrimYaw = (std::max)(-45.0f, (std::min)(m_aimTrimYaw, 45.0f));
-    config::Get().aim_pitch_degrees = m_aimTrimPitch;
-    config::Get().aim_yaw_degrees = m_aimTrimYaw;
-    auto& profile = m_weaponAimProfiles[m_activeWeaponAimProfile];
-    profile.pitch = m_aimTrimPitch;
-    profile.yaw = m_aimTrimYaw;
-    m_aimTuningDirty = true;
-    Log("[Input] Weapon aim trim live: key=%016llX weapon=%p pitch=%.2f yaw=%.2f",
-        static_cast<unsigned long long>(profile.stableKey),
-        reinterpret_cast<void*>(profile.weapon), m_aimTrimPitch, m_aimTrimYaw);
+    pitch = (std::max)(-180.0f, (std::min)(pitch, 180.0f));
+    yaw = (std::max)(-180.0f, (std::min)(yaw, 180.0f));
+    roll = (std::max)(-180.0f, (std::min)(roll, 180.0f));
+    m_weaponOffsetForward = (std::max)(-100.0f,
+        (std::min)(m_weaponOffsetForward, 100.0f));
+    m_weaponOffsetRight = (std::max)(-100.0f,
+        (std::min)(m_weaponOffsetRight, 100.0f));
+    m_weaponOffsetUp = (std::max)(-100.0f,
+        (std::min)(m_weaponOffsetUp, 100.0f));
+    if (weaponProfile) {
+        m_activeWeaponTrimPitch.store(pitch, std::memory_order_release);
+        m_activeWeaponTrimYaw.store(yaw, std::memory_order_release);
+        m_activeWeaponTrimRoll.store(roll, std::memory_order_release);
+        m_activeWeaponOffsetForward.store(
+            m_weaponOffsetForward, std::memory_order_release);
+        m_activeWeaponOffsetRight.store(
+            m_weaponOffsetRight, std::memory_order_release);
+        m_activeWeaponOffsetUp.store(m_weaponOffsetUp, std::memory_order_release);
+        m_aimTuningDirty = true;
+    } else {
+        m_handTuningDirty = true;
+    }
+    Log("[Input] Calibration live: target=%s pitch=%.2f yaw=%.2f roll=%.2f "
+        "offset=(%.2f,%.2f,%.2f)",
+        weaponProfile ? "active_weapon" : "left_hand", pitch, yaw, roll,
+        m_weaponOffsetForward, m_weaponOffsetRight, m_weaponOffsetUp);
 }
 
 /* Weapon Motion */
@@ -676,6 +766,19 @@ void InputHook::SetCanonicalWeaponPose(const float controllerPosition[3],
         !validVector(cameraUp, true)) {
         m_canonicalWeaponPoseValid = false;
         m_weaponPoseActive.store(false, std::memory_order_release);
+        static std::atomic<uint64_t> nextInvalidPoseLogMs{0};
+        const uint64_t now = GetTickCount64();
+        uint64_t nextLog = nextInvalidPoseLogMs.load(std::memory_order_relaxed);
+        if (now >= nextLog && nextInvalidPoseLogMs.compare_exchange_strong(
+                nextLog, now + 1000, std::memory_order_relaxed)) {
+            Log("[WeaponPose] Rejected canonical pose: pos=(%.3f,%.3f,%.3f) "
+                "forward=(%.3f,%.3f,%.3f) up=(%.3f,%.3f,%.3f) "
+                "camera=(%.3f,%.3f,%.3f)",
+                controllerPosition[0], controllerPosition[1], controllerPosition[2],
+                controllerForward[0], controllerForward[1], controllerForward[2],
+                controllerUp[0], controllerUp[1], controllerUp[2],
+                cameraPosition[0], cameraPosition[1], cameraPosition[2]);
+        }
         return;
     }
     memcpy(m_canonicalWeaponPosition, controllerPosition,
@@ -687,11 +790,18 @@ void InputHook::SetCanonicalWeaponPose(const float controllerPosition[3],
     memcpy(m_nativeCameraForward, cameraForward, sizeof(m_nativeCameraForward));
     memcpy(m_nativeCameraUp, cameraUp, sizeof(m_nativeCameraUp));
     m_canonicalWeaponPoseValid = true;
+    static std::atomic<bool> loggedFirstCanonicalPose{false};
+    if (!loggedFirstCanonicalPose.exchange(true, std::memory_order_relaxed)) {
+        Log("[WeaponPose] Canonical controller pose published: "
+            "position=(%.1f,%.1f,%.1f)", controllerPosition[0],
+            controllerPosition[1], controllerPosition[2]);
+    }
 }
 
 void InputHook::ClearCanonicalWeaponPose() {
     m_canonicalWeaponPoseValid = false;
     m_weaponPoseActive.store(false, std::memory_order_release);
+    CancelWeaponGrab();
 }
 
 void InputHook::RequestMotionCalibrationReset() {
@@ -703,8 +813,7 @@ bool InputHook::IsAimDotVisible() const {
     const uint64_t visibleAt = m_dotVisibleAtMs.load(std::memory_order_acquire);
     if (visibleAt == 0 || GetTickCount64() < visibleAt ||
         !m_motionControlsEnabled.load(std::memory_order_acquire)) return false;
-    if (camera::IsVehicleCameraActive()) return true;
-    return WeaponAimSystem::Instance().GetPlayerIdentity().weaponValid;
+    return true;
 }
 
 bool InputHook::GetWeaponBarrelLocalDirection(float direction[3]) {
@@ -718,6 +827,32 @@ bool InputHook::GetWeaponBarrelLocalDirection(float direction[3]) {
     }
     ReleaseSRWLockShared(&m_weaponPoseWriteLock);
     return valid;
+}
+
+bool InputHook::GetDrivenWeaponFrame(float position[3], float forward[3],
+                                     float up[3]) const {
+    if (!position || !forward || !up ||
+        !m_weaponPoseActive.load(std::memory_order_acquire)) return false;
+    bool valid = false;
+    AcquireSRWLockShared(&m_weaponPoseWriteLock);
+    const uint64_t now = GetTickCount64();
+    if (m_renderWeaponStampActive && m_renderWeaponComponent >= 0x10000 &&
+        m_renderWeaponStampUpdatedMs && now >= m_renderWeaponStampUpdatedMs &&
+        now - m_renderWeaponStampUpdatedMs <= 250) {
+        memcpy(position, m_renderWeaponGripPosition,
+               sizeof(m_renderWeaponGripPosition));
+        memcpy(forward, m_renderWeaponForward, sizeof(m_renderWeaponForward));
+        memcpy(up, m_renderWeaponUp, sizeof(m_renderWeaponUp));
+        valid = true;
+    }
+    ReleaseSRWLockShared(&m_weaponPoseWriteLock);
+    return valid;
+}
+
+void InputHook::CancelWeaponGrab() {
+    m_weaponGrabArmed.store(false, std::memory_order_release);
+    m_weaponGrabCancelRequested.store(true, std::memory_order_release);
+    m_weaponGrabHeld.store(false, std::memory_order_release);
 }
 
 static bool BuildFrameMatrix(const float position[3], const float forwardInput[3],
@@ -778,7 +913,68 @@ static void MultiplyMatrix(const float left[16], const float right[16],
     memcpy(output, result, sizeof(result));
 }
 
-static uint64_t HashWeaponProfileName(const char* outerName, const char* meshName) {
+bool InputHook::GetActiveWeaponPoseTuning(float& pitch, float& yaw, float& roll,
+                                          float& forward, float& right,
+                                          float& up) const {
+    if (!m_activeWeaponTrimValid.load(std::memory_order_acquire)) return false;
+    pitch = m_activeWeaponTrimPitch.load(std::memory_order_acquire);
+    yaw = m_activeWeaponTrimYaw.load(std::memory_order_acquire);
+    roll = m_activeWeaponTrimRoll.load(std::memory_order_acquire);
+    forward = m_activeWeaponOffsetForward.load(std::memory_order_acquire);
+    right = m_activeWeaponOffsetRight.load(std::memory_order_acquire);
+    up = m_activeWeaponOffsetUp.load(std::memory_order_acquire);
+    return std::isfinite(pitch) && std::isfinite(yaw) && std::isfinite(roll) &&
+        std::isfinite(forward) && std::isfinite(right) && std::isfinite(up);
+}
+
+static bool InverseTransformPoint(const float matrix[16], const float point[3],
+                                  float output[3]) {
+    const float a00 = matrix[0], a01 = matrix[1], a02 = matrix[2];
+    const float a10 = matrix[4], a11 = matrix[5], a12 = matrix[6];
+    const float a20 = matrix[8], a21 = matrix[9], a22 = matrix[10];
+    const float determinant =
+        a00 * (a11 * a22 - a12 * a21) -
+        a01 * (a10 * a22 - a12 * a20) +
+        a02 * (a10 * a21 - a11 * a20);
+    if (!std::isfinite(determinant) || fabsf(determinant) < 1.0e-6f) return false;
+    const float inverseDeterminant = 1.0f / determinant;
+    const float inverse[9] = {
+        (a11 * a22 - a12 * a21) * inverseDeterminant,
+        (a02 * a21 - a01 * a22) * inverseDeterminant,
+        (a01 * a12 - a02 * a11) * inverseDeterminant,
+        (a12 * a20 - a10 * a22) * inverseDeterminant,
+        (a00 * a22 - a02 * a20) * inverseDeterminant,
+        (a02 * a10 - a00 * a12) * inverseDeterminant,
+        (a10 * a21 - a11 * a20) * inverseDeterminant,
+        (a01 * a20 - a00 * a21) * inverseDeterminant,
+        (a00 * a11 - a01 * a10) * inverseDeterminant
+    };
+    const float delta[3] = {
+        point[0] - matrix[12], point[1] - matrix[13], point[2] - matrix[14]
+    };
+    output[0] = delta[0] * inverse[0] + delta[1] * inverse[3] +
+        delta[2] * inverse[6];
+    output[1] = delta[0] * inverse[1] + delta[1] * inverse[4] +
+        delta[2] * inverse[7];
+    output[2] = delta[0] * inverse[2] + delta[1] * inverse[5] +
+        delta[2] * inverse[8];
+    return std::isfinite(output[0]) && std::isfinite(output[1]) &&
+        std::isfinite(output[2]);
+}
+
+static void TransformPoint(const float point[3], const float matrix[16],
+                           float output[3]) {
+    output[0] = point[0] * matrix[0] + point[1] * matrix[4] +
+        point[2] * matrix[8] + matrix[12];
+    output[1] = point[0] * matrix[1] + point[1] * matrix[5] +
+        point[2] * matrix[9] + matrix[13];
+    output[2] = point[0] * matrix[2] + point[1] * matrix[6] +
+        point[2] * matrix[10] + matrix[14];
+}
+
+static uint64_t HashWeaponProfileName(const char* characterMeshName,
+                                      const char* outerName,
+                                      const char* meshName) {
     if (!meshName || !*meshName) return 0;
     uint64_t hash = 14695981039346656037ull;
     auto append = [&](const char* text) {
@@ -788,6 +984,9 @@ static uint64_t HashWeaponProfileName(const char* outerName, const char* meshNam
             hash *= 1099511628211ull;
         }
     };
+    append(characterMeshName);
+    hash ^= static_cast<unsigned char>('|');
+    hash *= 1099511628211ull;
     append(outerName);
     hash ^= static_cast<unsigned char>('|');
     hash *= 1099511628211ull;
@@ -802,22 +1001,32 @@ bool InputHook::SaveActiveAimProfile() {
     if (!profile.valid) return false;
     profile.pitch = m_aimTrimPitch;
     profile.yaw = m_aimTrimYaw;
+    profile.roll = m_aimTrimRoll;
+    profile.offsetForward = m_weaponOffsetForward;
+    profile.offsetRight = m_weaponOffsetRight;
+    profile.offsetUp = m_weaponOffsetUp;
     const bool persisted = profile.persistent &&
         config::SaveWeaponAimProfile(profile.stableKey, profile.pitch,
-                                     profile.yaw, profile.name);
+                                      profile.yaw, profile.roll,
+                                      profile.offsetForward, profile.offsetRight,
+                                      profile.offsetUp, profile.name);
     Log("[Input] Weapon aim trim saved: key=%016llX weapon=%p name=%s "
-        "pitch=%.2f yaw=%.2f storage=%s",
+        "pitch=%.2f yaw=%.2f roll=%.2f offset=(%.2f,%.2f,%.2f) storage=%s",
         static_cast<unsigned long long>(profile.stableKey),
         reinterpret_cast<void*>(profile.weapon), profile.name,
-        profile.pitch, profile.yaw, persisted ? "ini" : "session");
+        profile.pitch, profile.yaw, profile.roll, profile.offsetForward,
+        profile.offsetRight, profile.offsetUp,
+        persisted ? "ini" : "session");
     return persisted;
 }
 
 void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
+                                         const char* characterMeshName,
                                          const char* outerName,
                                          const char* meshName,
                                          uintptr_t component) {
-    const uint64_t stableKey = HashWeaponProfileName(outerName, meshName);
+    const uint64_t stableKey = HashWeaponProfileName(
+        characterMeshName, outerName, meshName);
     if (m_activeWeaponAimProfile >= 0 &&
         m_activeWeaponAimProfile < kWeaponAimProfileCapacity) {
         const auto& active = m_weaponAimProfiles[m_activeWeaponAimProfile];
@@ -861,7 +1070,10 @@ void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
         selected->persistent = stableKey != 0;
         if (selected->persistent) {
             loaded = config::LoadWeaponAimProfile(stableKey, selected->pitch,
-                                                  selected->yaw);
+                                                   selected->yaw, selected->roll,
+                                                   selected->offsetForward,
+                                                   selected->offsetRight,
+                                                   selected->offsetUp);
         }
         if (meshName && *meshName) strcpy_s(selected->name, meshName);
         else strcpy_s(selected->name, "runtime_weapon");
@@ -873,15 +1085,31 @@ void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
     m_activeWeaponAimProfile = static_cast<int>(selected - m_weaponAimProfiles);
     m_aimTrimPitch = selected->pitch;
     m_aimTrimYaw = selected->yaw;
+    m_aimTrimRoll = selected->roll;
+    m_weaponOffsetForward = selected->offsetForward;
+    m_weaponOffsetRight = selected->offsetRight;
+    m_weaponOffsetUp = selected->offsetUp;
+    m_activeWeaponTrimPitch.store(selected->pitch, std::memory_order_release);
+    m_activeWeaponTrimYaw.store(selected->yaw, std::memory_order_release);
+    m_activeWeaponTrimRoll.store(selected->roll, std::memory_order_release);
+    m_activeWeaponOffsetForward.store(
+        selected->offsetForward, std::memory_order_release);
+    m_activeWeaponOffsetRight.store(
+        selected->offsetRight, std::memory_order_release);
+    m_activeWeaponOffsetUp.store(selected->offsetUp, std::memory_order_release);
+    m_activeWeaponTrimValid.store(true, std::memory_order_release);
     config::Get().aim_pitch_degrees = selected->pitch;
     config::Get().aim_yaw_degrees = selected->yaw;
     m_aimTuningKeysDown = 0;
     memset(m_aimTuningNextRepeatMs, 0, sizeof(m_aimTuningNextRepeatMs));
     Log("[Input] Weapon aim profile active: key=%016llX weapon=%p component=%p "
-        "name=%s pitch=%.2f yaw=%.2f storage=%s loaded=%d",
+        "name=%s character=%s pitch=%.2f yaw=%.2f roll=%.2f "
+        "offset=(%.2f,%.2f,%.2f) storage=%s loaded=%d",
         static_cast<unsigned long long>(selected->stableKey),
         reinterpret_cast<void*>(weapon), reinterpret_cast<void*>(component),
-        selected->name, selected->pitch, selected->yaw,
+        selected->name, characterMeshName ? characterMeshName : "",
+        selected->pitch, selected->yaw, selected->roll,
+        selected->offsetForward, selected->offsetRight, selected->offsetUp,
         selected->persistent ? "ini" : "session", loaded);
 }
 
@@ -890,35 +1118,82 @@ void InputHook::ApplyRightHand(int eye) {
     m_componentCount = 0;
     if (!m_motionControlsEnabled.load(std::memory_order_acquire)) {
         m_weaponPoseActive.store(false, std::memory_order_release);
+        static std::atomic<bool> loggedMotionDisabled{false};
+        if (!loggedMotionDisabled.exchange(true, std::memory_order_relaxed))
+            Log("[WeaponPose] Blocked: motion controls disabled");
         return;
     }
+    auto& armIK = player::ArmIKSystem::Instance();
+    if (!m_weaponPoseActive.load(std::memory_order_acquire) && armIK.IsEnabled())
+        armIK.SetEnabled(false);
     if (camera::IsVehicleCameraActive()) {
         AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
+        if (m_weaponNativeMatrixValid && m_renderWeaponComponent >= 0x10000 &&
+            m_renderWeaponMatrixOffset > 0) {
+            SIZE_T bytesWritten = 0;
+            WriteProcessMemory(GetCurrentProcess(),
+                reinterpret_cast<void*>(m_renderWeaponComponent +
+                                        m_renderWeaponMatrixOffset),
+                m_weaponNativeMatrix, sizeof(m_weaponNativeMatrix), &bytesWritten);
+        }
         m_renderWeaponStampActive = false;
         m_renderWeaponComponent = 0;
         m_renderWeaponMatrixOffset = 0;
         ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
         m_weaponPoseActive.store(false, std::memory_order_release);
+        static std::atomic<bool> loggedVehicleBlock{false};
+        if (!loggedVehicleBlock.exchange(true, std::memory_order_relaxed))
+            Log("[WeaponPose] Blocked: vehicle camera active");
         return;
     }
     if (m_weaponCalibrationResetRequested.exchange(false, std::memory_order_acq_rel)) {
+        bool nativeRestored = false;
+        size_t preservedMounts = 0;
+        for (const auto& entry : m_weaponMountCache) {
+            if (entry.valid) ++preservedMounts;
+        }
+        AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
+        m_renderWeaponStampActive = false;
+        if (m_weaponNativeMatrixValid && m_renderWeaponComponent >= 0x10000 &&
+            m_renderWeaponMatrixOffset > 0) {
+            SIZE_T bytesWritten = 0;
+            nativeRestored = WriteProcessMemory(GetCurrentProcess(),
+                reinterpret_cast<void*>(m_renderWeaponComponent +
+                                        m_renderWeaponMatrixOffset),
+                m_weaponNativeMatrix, sizeof(m_weaponNativeMatrix), &bytesWritten) &&
+                bytesWritten == sizeof(m_weaponNativeMatrix);
+        }
+        m_renderWeaponComponent = 0;
+        m_renderWeaponMatrixOffset = 0;
+        ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
+        m_weaponPoseActive.store(false, std::memory_order_release);
         m_weaponMountValid = false;
+        m_weaponMountAbsolute = false;
+        m_weaponNativeMatrixValid = false;
         m_mountWeapon = 0;
         m_mountComponent = 0;
         m_mountIdentityGeneration = 0;
         m_weaponBarrelDirectionValid = false;
+        m_weaponGripValid = false;
         memset(m_weaponMountMatrix, 0, sizeof(m_weaponMountMatrix));
-        if (m_nativeWeaponCalibrationResetRequested.exchange(
-                false, std::memory_order_acq_rel)) {
-            memset(m_weaponMountCache, 0, sizeof(m_weaponMountCache));
-            m_weaponMountCacheCursor = 0;
-            Log("[WeaponPose] Native weapon mount cache cleared for recapture");
-        }
+        m_weaponIdentityStableSinceMs = GetTickCount64();
         m_lastDrivenWeapon = 0;
         m_lastDrivenComponent = 0;
-        Log("[WeaponPose] Pre-motion weapon mount restore requested");
+        Log("[WeaponPose] Controller target recalibrated; native mounts preserved: "
+            "count=%zu restoredCurrent=%d", preservedMounts, nativeRestored);
+        return;
     }
-    if (!m_canonicalWeaponPoseValid) return;
+    if (!m_canonicalWeaponPoseValid) {
+        static std::atomic<bool> loggedMissingCanonicalPose{false};
+        if (!loggedMissingCanonicalPose.exchange(true, std::memory_order_relaxed)) {
+            ControllerState controllers[2] = {};
+            XRInput::Instance().GetControllerSnapshot(controllers);
+            Log("[WeaponPose] Waiting for canonical controller pose: "
+                "rightValid=%d rightAimValid=%d",
+                controllers[1].valid, controllers[1].aimValid);
+        }
+        return;
+    }
 
     const auto inventory = player::ArmIKSystem::Instance().GetComponentInventory();
     const auto identity = WeaponAimSystem::Instance().GetPlayerIdentity();
@@ -943,18 +1218,26 @@ void InputHook::ApplyRightHand(int eye) {
     }
     m_lastWeaponRefreshGeneration = identity.generation;
     const player::ComponentInventoryEntry* active = nullptr;
+    const player::ComponentInventoryEntry* activeArms = nullptr;
     for (size_t index = 0; index < inventory.count; ++index) {
         const auto& entry = inventory.entries[index];
+        if (entry.role == player::ComponentRole::ProbableFirstPersonArms &&
+            entry.exactPawnOuter && entry.meshName[0] &&
+            (!activeArms || entry.updateCount > activeArms->updateCount)) {
+            activeArms = &entry;
+        }
         if (entry.role != player::ComponentRole::ProtectedWeapon ||
             !entry.exactWeaponOuter || !entry.component ||
             entry.localToWorldOffset <= 0 ||
             strstr(entry.className, "SkeletalMeshComponent") == nullptr) continue;
         if (!active || entry.updateCount > active->updateCount) active = &entry;
     }
+    const char* characterMeshName = activeArms
+        ? activeArms->meshName : "unknown_character";
     if (!active) {
         const uint64_t now = GetTickCount64();
         if (now >= m_nextWeaponComponentScanMs) {
-            m_nextWeaponComponentScanMs = now + 500;
+            m_nextWeaponComponentScanMs = now + 100;
             player::ArmIKSystem::Instance().RequestInventoryScan();
             Log("[WeaponPose] Waiting for active weapon component: weapon=%p",
                 reinterpret_cast<void*>(inventory.weapon));
@@ -967,44 +1250,52 @@ void InputHook::ApplyRightHand(int eye) {
         m_pendingWeapon != inventory.weapon ||
         m_pendingWeaponComponent != active->component;
     if (identityChanged) {
-        const bool equippedWeaponChanged = m_pendingWeapon != 0 &&
-            (m_pendingWeapon != inventory.weapon ||
-             m_pendingWeaponComponent != active->component);
+        CancelWeaponGrab();
         m_pendingWeaponIdentityGeneration = identity.generation;
         m_pendingWeaponPawn = inventory.pawn;
         m_pendingWeapon = inventory.weapon;
         m_pendingWeaponComponent = active->component;
         m_weaponIdentityStableSinceMs = now;
-        m_weaponMountValid = false;
-        m_mountIdentityGeneration = 0;
-        ActivateWeaponAimProfile(inventory.pawn, inventory.weapon, active->outerName,
+        ActivateWeaponAimProfile(inventory.pawn, inventory.weapon,
+                                 characterMeshName, active->outerName,
                                  active->meshName, active->component);
-        if (equippedWeaponChanged &&
-            m_motionControlsEnabled.exchange(false, std::memory_order_acq_rel)) {
-            m_motionReenableAtMs = now + 700;
-            player::ArmIKSystem::Instance().SetEnabled(false);
-            m_nativeWeaponCalibrationResetRequested.store(true, std::memory_order_release);
-            m_weaponCalibrationResetRequested.store(true, std::memory_order_release);
-            AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
-            m_renderWeaponStampActive = false;
-            m_renderWeaponComponent = 0;
-            m_renderWeaponMatrixOffset = 0;
-            ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
-            m_weaponPoseActive.store(false, std::memory_order_release);
-            WeaponAimSystem::Instance().InvalidateDirection();
-            Log("[WeaponPose] Weapon changed; automatic 700 ms native calibration started");
+        AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
+        if (m_weaponNativeMatrixValid && m_renderWeaponComponent >= 0x10000 &&
+            m_renderWeaponMatrixOffset > 0) {
+            SIZE_T bytesWritten = 0;
+            WriteProcessMemory(GetCurrentProcess(),
+                reinterpret_cast<void*>(m_renderWeaponComponent +
+                                        m_renderWeaponMatrixOffset),
+                m_weaponNativeMatrix, sizeof(m_weaponNativeMatrix), &bytesWritten);
         }
-        Log("[WeaponPose] Waiting for stable native mount: generation=%llu "
+        m_renderWeaponStampActive = false;
+        m_renderWeaponComponent = 0;
+        m_renderWeaponMatrixOffset = 0;
+        ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
+        m_weaponMountValid = false;
+        m_weaponMountAbsolute = false;
+        m_weaponNativeMatrixValid = false;
+        m_weaponGripValid = false;
+        m_mountIdentityGeneration = 0;
+        m_weaponPoseActive.store(false, std::memory_order_release);
+        Log("[WeaponPose] Waiting briefly for native mount: generation=%llu "
             "weapon=%p component=%p",
             static_cast<unsigned long long>(identity.generation),
             reinterpret_cast<void*>(inventory.weapon),
             reinterpret_cast<void*>(active->component));
         return;
     }
-    constexpr uint64_t kNativeMountSettleMs = 700;
+    constexpr uint64_t kNativeMountSettleMs = 100;
     if (now - m_weaponIdentityStableSinceMs < kNativeMountSettleMs) return;
-    ActivateWeaponAimProfile(inventory.pawn, inventory.weapon, active->outerName,
+    ActivateWeaponAimProfile(inventory.pawn, inventory.weapon,
+                             characterMeshName, active->outerName,
                              active->meshName, active->component);
+    uint64_t stableMountKey = 0;
+    if (m_activeWeaponAimProfile >= 0 &&
+        m_activeWeaponAimProfile < kWeaponAimProfileCapacity &&
+        m_weaponAimProfiles[m_activeWeaponAimProfile].valid) {
+        stableMountKey = m_weaponAimProfiles[m_activeWeaponAimProfile].stableKey;
+    }
 
     WeaponComponent& weapon = m_components[0];
     weapon = {};
@@ -1037,32 +1328,142 @@ void InputHook::ApplyRightHand(int eye) {
         for (const auto& entry : m_weaponMountCache) {
             if (entry.valid && entry.pawn == inventory.pawn &&
                 entry.weapon == inventory.weapon &&
-                entry.component == active->component) {
+                entry.component == active->component &&
+                entry.skeletalMesh == active->skeletalMesh) {
                 cachedMount = &entry;
                 break;
             }
         }
+        float persistedMatrix[16] = {};
+        float persistedGrip[3] = {};
+        int persistedBarrelAxis = 0;
+        float persistedBarrelSign = 1.0f;
+        float absoluteMatrix[16] = {};
+        const bool absolutePersisted = !cachedMount &&
+            config::LoadAbsoluteWeaponMount(stableMountKey, absoluteMatrix);
+        const bool persistedMount = !cachedMount && !absolutePersisted &&
+            config::LoadWeaponMountProfile(stableMountKey, persistedMatrix,
+                persistedGrip, persistedBarrelAxis, persistedBarrelSign);
         if (cachedMount) {
             memcpy(m_weaponMountMatrix, cachedMount->matrix,
                    sizeof(m_weaponMountMatrix));
+            memcpy(m_weaponNativeMatrix, cachedMount->nativeMatrix,
+                   sizeof(m_weaponNativeMatrix));
+            m_weaponNativeMatrixValid = true;
             m_weaponBarrelAxis = cachedMount->barrelAxis;
             m_weaponBarrelSign = cachedMount->barrelSign;
-            Log("[WeaponPose] Authored mount restored: weapon=%p component=%p "
+            memcpy(m_weaponGripLocal, cachedMount->gripLocal,
+                   sizeof(m_weaponGripLocal));
+            m_weaponGripValid = cachedMount->gripValid;
+            m_weaponMountAbsolute = cachedMount->absolute;
+            Log("[WeaponPose] Absolute mount restored: weapon=%p component=%p "
                 "offset=(%.1f,%.1f,%.1f)",
                 reinterpret_cast<void*>(inventory.weapon),
                 reinterpret_cast<void*>(active->component),
                 m_weaponMountMatrix[12], m_weaponMountMatrix[13],
                 m_weaponMountMatrix[14]);
+        } else if (absolutePersisted) {
+            memcpy(m_weaponMountMatrix, absoluteMatrix,
+                   sizeof(m_weaponMountMatrix));
+            memcpy(m_weaponNativeMatrix, original, sizeof(m_weaponNativeMatrix));
+            m_weaponNativeMatrixValid = true;
+            m_weaponGripValid = false;
+            m_weaponMountAbsolute = true;
+            float bestAlignment = -1.0f;
+            for (int axis = 0; axis < 3; ++axis) {
+                const float* candidate = m_weaponMountMatrix + axis * 4;
+                const float length = sqrtf(candidate[0] * candidate[0] +
+                    candidate[1] * candidate[1] + candidate[2] * candidate[2]);
+                if (length < 1.0e-5f) continue;
+                const float alignment = candidate[0] / length;
+                if (fabsf(alignment) <= bestAlignment) continue;
+                bestAlignment = fabsf(alignment);
+                m_weaponBarrelAxis = axis;
+                m_weaponBarrelSign = alignment < 0.0f ? -1.0f : 1.0f;
+            }
+            Log("[WeaponPose] Immutable absolute mount loaded: key=%016llX "
+                "weapon=%p offset=(%.2f,%.2f,%.2f)",
+                static_cast<unsigned long long>(stableMountKey),
+                reinterpret_cast<void*>(inventory.weapon),
+                m_weaponMountMatrix[12], m_weaponMountMatrix[13],
+                m_weaponMountMatrix[14]);
+        } else if (persistedMount) {
+            memcpy(m_weaponMountMatrix, persistedMatrix,
+                   sizeof(m_weaponMountMatrix));
+            memcpy(m_weaponNativeMatrix, original, sizeof(m_weaponNativeMatrix));
+            m_weaponNativeMatrixValid = true;
+            memcpy(m_weaponGripLocal, persistedGrip, sizeof(m_weaponGripLocal));
+            m_weaponGripValid = true;
+            m_weaponMountAbsolute = false;
+            m_weaponBarrelAxis = persistedBarrelAxis;
+            m_weaponBarrelSign = persistedBarrelSign;
+
+            WeaponMountCacheEntry* destination = nullptr;
+            for (auto& entry : m_weaponMountCache) {
+                if (!entry.valid) {
+                    destination = &entry;
+                    break;
+                }
+            }
+            if (!destination) {
+                destination = &m_weaponMountCache[m_weaponMountCacheCursor];
+                m_weaponMountCacheCursor =
+                    (m_weaponMountCacheCursor + 1) % kWeaponMountCacheCapacity;
+            }
+            destination->pawn = inventory.pawn;
+            destination->weapon = inventory.weapon;
+            destination->component = active->component;
+            destination->skeletalMesh = active->skeletalMesh;
+            memcpy(destination->matrix, m_weaponMountMatrix,
+                   sizeof(destination->matrix));
+            memcpy(destination->nativeMatrix, m_weaponNativeMatrix,
+                   sizeof(destination->nativeMatrix));
+            memcpy(destination->gripLocal, m_weaponGripLocal,
+                   sizeof(destination->gripLocal));
+            destination->barrelAxis = m_weaponBarrelAxis;
+            destination->barrelSign = m_weaponBarrelSign;
+            destination->gripValid = true;
+            destination->absolute = false;
+            destination->valid = true;
+            Log("[WeaponPose] Persistent mount loaded: key=%016llX "
+                "weapon=%p gripLocal=(%.1f,%.1f,%.1f) barrel=%c%c",
+                static_cast<unsigned long long>(stableMountKey),
+                reinterpret_cast<void*>(inventory.weapon),
+                m_weaponGripLocal[0], m_weaponGripLocal[1],
+                m_weaponGripLocal[2], m_weaponBarrelSign < 0.0f ? '-' : '+',
+                "XYZ"[m_weaponBarrelAxis]);
         } else {
             if (WeaponAimSystem::Instance().IsFireActive()) return;
-            float cameraFrame[16] = {};
-            float inverseCameraFrame[16] = {};
-            if (!BuildFrameMatrix(m_nativeCameraPosition, m_nativeCameraForward,
-                    m_nativeCameraUp, cameraFrame)) return;
-            InvertRigidFrame(cameraFrame, inverseCameraFrame);
-            // Map the native weapon-to-crosshair relationship onto OpenXR's
-            // standardized aim ray.
-            MultiplyMatrix(original, inverseCameraFrame, m_weaponMountMatrix);
+            player::NativeRightHandSnapshot nativeHand;
+            if (!player::ArmIKSystem::Instance().GetNativeRightHandSnapshot(nativeHand) ||
+                nativeHand.pawn != identity.pawn ||
+                nativeHand.weapon != identity.weapon ||
+                nativeHand.identityGeneration != identity.generation ||
+                nativeHand.updatedMs < m_weaponIdentityStableSinceMs ||
+                now < nativeHand.updatedMs || now - nativeHand.updatedMs > 250) {
+                static std::atomic<uint64_t> nextHandWaitLogMs{0};
+                uint64_t nextLog = nextHandWaitLogMs.load(std::memory_order_relaxed);
+                if (now >= nextLog && nextHandWaitLogMs.compare_exchange_strong(
+                        nextLog, now + 1000, std::memory_order_relaxed)) {
+                    Log("[WeaponPose] Waiting for matching native wrist: "
+                        "identity=%p/%p generation=%llu snapshot=%d/%p/%p/%llu age=%lldms",
+                        reinterpret_cast<void*>(identity.pawn),
+                        reinterpret_cast<void*>(identity.weapon),
+                        static_cast<unsigned long long>(identity.generation),
+                        nativeHand.valid, reinterpret_cast<void*>(nativeHand.pawn),
+                        reinterpret_cast<void*>(nativeHand.weapon),
+                        static_cast<unsigned long long>(nativeHand.identityGeneration),
+                        nativeHand.updatedMs && now >= nativeHand.updatedMs
+                            ? static_cast<long long>(now - nativeHand.updatedMs) : -1LL);
+                }
+                return;
+            }
+            memcpy(m_weaponNativeMatrix, original, sizeof(m_weaponNativeMatrix));
+            m_weaponNativeMatrixValid = true;
+            if (!InverseTransformPoint(original, nativeHand.worldPosition,
+                                       m_weaponGripLocal)) return;
+            m_weaponGripValid = true;
+            m_weaponMountAbsolute = false;
 
             m_weaponBarrelAxis = 0;
             m_weaponBarrelSign = 1.0f;
@@ -1082,6 +1483,13 @@ void InputHook::ApplyRightHand(int eye) {
                 m_weaponBarrelSign = alignment < 0.0f ? -1.0f : 1.0f;
             }
 
+            float cameraFrame[16] = {};
+            float inverseCameraFrame[16] = {};
+            if (!BuildFrameMatrix(m_nativeCameraPosition, m_nativeCameraForward,
+                                  m_nativeCameraUp, cameraFrame)) return;
+            InvertRigidFrame(cameraFrame, inverseCameraFrame);
+            MultiplyMatrix(original, inverseCameraFrame, m_weaponMountMatrix);
+
             WeaponMountCacheEntry* destination = nullptr;
             for (auto& entry : m_weaponMountCache) {
                 if (!entry.valid) {
@@ -1094,21 +1502,33 @@ void InputHook::ApplyRightHand(int eye) {
                 m_weaponMountCacheCursor =
                     (m_weaponMountCacheCursor + 1) % kWeaponMountCacheCapacity;
             }
-            destination->identityGeneration = identity.generation;
             destination->pawn = inventory.pawn;
             destination->weapon = inventory.weapon;
             destination->component = active->component;
+            destination->skeletalMesh = active->skeletalMesh;
             memcpy(destination->matrix, m_weaponMountMatrix,
                    sizeof(destination->matrix));
+            memcpy(destination->nativeMatrix, m_weaponNativeMatrix,
+                   sizeof(destination->nativeMatrix));
+            memcpy(destination->gripLocal, m_weaponGripLocal,
+                   sizeof(destination->gripLocal));
             destination->barrelAxis = m_weaponBarrelAxis;
             destination->barrelSign = m_weaponBarrelSign;
+            destination->gripValid = m_weaponGripValid;
+            destination->absolute = false;
             destination->valid = true;
-            Log("[WeaponPose] Authored mount captured: weapon=%p component=%p "
-                "offset=(%.1f,%.1f,%.1f)",
+            const bool mountSaved = config::SaveWeaponMountProfile(
+                stableMountKey, m_weaponMountMatrix, m_weaponGripLocal,
+                m_weaponBarrelAxis, m_weaponBarrelSign, active->meshName);
+            Log("[WeaponPose] Wrist-anchored mount captured: weapon=%p component=%p "
+                "gripLocal=(%.1f,%.1f,%.1f) barrel=%c%c alignment=%.3f "
+                "persistent=%d key=%016llX",
                 reinterpret_cast<void*>(inventory.weapon),
                 reinterpret_cast<void*>(active->component),
-                m_weaponMountMatrix[12], m_weaponMountMatrix[13],
-                m_weaponMountMatrix[14]);
+                m_weaponGripLocal[0], m_weaponGripLocal[1], m_weaponGripLocal[2],
+                m_weaponBarrelSign < 0.0f ? '-' : '+',
+                "XYZ"[m_weaponBarrelAxis], bestAlignment, mountSaved,
+                static_cast<unsigned long long>(stableMountKey));
         }
         m_mountWeapon = inventory.weapon;
         m_mountComponent = active->component;
@@ -1116,7 +1536,45 @@ void InputHook::ApplyRightHand(int eye) {
         m_weaponMountValid = true;
     }
     float driven[16] = {};
+    if (!m_weaponMountAbsolute) {
+        MultiplyMatrix(m_weaponMountMatrix, controllerFrame, driven);
+        if (!m_weaponGripValid) return;
+        float drivenGrip[3] = {};
+        TransformPoint(m_weaponGripLocal, driven, drivenGrip);
+        for (int axis = 0; axis < 3; ++axis)
+            driven[12 + axis] += m_canonicalWeaponPosition[axis] - drivenGrip[axis];
+
+        float inverseControllerFrame[16] = {};
+        float absoluteMount[16] = {};
+        InvertRigidFrame(controllerFrame, inverseControllerFrame);
+        MultiplyMatrix(driven, inverseControllerFrame, absoluteMount);
+        memcpy(m_weaponMountMatrix, absoluteMount, sizeof(m_weaponMountMatrix));
+        m_weaponMountAbsolute = true;
+        m_weaponGripValid = false;
+        const bool absoluteSaved = config::SaveAbsoluteWeaponMount(
+            stableMountKey, m_weaponMountMatrix, active->meshName);
+        for (auto& entry : m_weaponMountCache) {
+            if (!entry.valid || entry.pawn != inventory.pawn ||
+                entry.weapon != inventory.weapon ||
+                entry.component != active->component ||
+                entry.skeletalMesh != active->skeletalMesh) continue;
+            memcpy(entry.matrix, m_weaponMountMatrix, sizeof(entry.matrix));
+            entry.gripValid = false;
+            entry.absolute = true;
+            break;
+        }
+        Log("[WeaponPose] Native mount converted once to immutable absolute pose: "
+            "key=%016llX saved=%d offset=(%.2f,%.2f,%.2f)",
+            static_cast<unsigned long long>(stableMountKey), absoluteSaved,
+            m_weaponMountMatrix[12], m_weaponMountMatrix[13],
+            m_weaponMountMatrix[14]);
+    }
+
     MultiplyMatrix(m_weaponMountMatrix, controllerFrame, driven);
+    float alignedGrip[3] = {
+        m_canonicalWeaponPosition[0], m_canonicalWeaponPosition[1],
+        m_canonicalWeaponPosition[2]};
+    const float gripError = 0.0f;
     float barrelWorld[3] = {
         driven[m_weaponBarrelAxis * 4] * m_weaponBarrelSign,
         driven[m_weaponBarrelAxis * 4 + 1] * m_weaponBarrelSign,
@@ -1126,6 +1584,16 @@ void InputHook::ApplyRightHand(int eye) {
         barrelWorld[1] * barrelWorld[1] + barrelWorld[2] * barrelWorld[2]);
     if (!std::isfinite(barrelLength) || barrelLength < 1.0e-5f) return;
     for (float& value : barrelWorld) value /= barrelLength;
+    float weaponUp[3] = {
+        m_canonicalWeaponUp[0], m_canonicalWeaponUp[1], m_canonicalWeaponUp[2]};
+    const float upProjection = weaponUp[0] * barrelWorld[0] +
+        weaponUp[1] * barrelWorld[1] + weaponUp[2] * barrelWorld[2];
+    for (int axis = 0; axis < 3; ++axis)
+        weaponUp[axis] -= barrelWorld[axis] * upProjection;
+    const float weaponUpLength = sqrtf(weaponUp[0] * weaponUp[0] +
+        weaponUp[1] * weaponUp[1] + weaponUp[2] * weaponUp[2]);
+    if (!std::isfinite(weaponUpLength) || weaponUpLength < 1.0e-5f) return;
+    for (float& value : weaponUp) value /= weaponUpLength;
     float barrelLocal[3] = {
         barrelWorld[0] * controllerFrame[0] +
             barrelWorld[1] * controllerFrame[1] +
@@ -1144,6 +1612,10 @@ void InputHook::ApplyRightHand(int eye) {
     m_renderWeaponComponent = active->component;
     m_renderWeaponMatrixOffset = active->localToWorldOffset;
     memcpy(m_renderWeaponMatrix, driven, sizeof(m_renderWeaponMatrix));
+    memcpy(m_renderWeaponGripPosition, alignedGrip,
+           sizeof(m_renderWeaponGripPosition));
+    memcpy(m_renderWeaponForward, barrelWorld, sizeof(m_renderWeaponForward));
+    memcpy(m_renderWeaponUp, weaponUp, sizeof(m_renderWeaponUp));
     m_renderWeaponStampActive = true;
     m_renderWeaponStampUpdatedMs = GetTickCount64();
     memcpy(m_weaponBarrelLocalDirection, barrelLocal,
@@ -1153,6 +1625,7 @@ void InputHook::ApplyRightHand(int eye) {
     weapon.valid = true;
     m_componentCount = 1;
     m_weaponPoseActive.store(true, std::memory_order_release);
+    if (!armIK.IsEnabled()) armIK.SetEnabled(true);
     uint64_t expectedDotTime = 0;
     const uint64_t dotVisibleAt = GetTickCount64();
     if (m_dotVisibleAtMs.compare_exchange_strong(expectedDotTime, dotVisibleAt,
@@ -1161,13 +1634,13 @@ void InputHook::ApplyRightHand(int eye) {
     }
     if (m_lastDrivenWeapon != inventory.weapon ||
         m_lastDrivenComponent != active->component) {
-        Log("[WeaponPose] Shared pose active: weapon=%p component=%p updates=%llu "
-            "matrix=+0x%X scale=(%.3f,%.3f,%.3f) barrel=%c%c "
+        Log("[WeaponPose] Native-relative pose active: weapon=%p component=%p updates=%llu "
+            "matrix=+0x%X scale=(%.3f,%.3f,%.3f) gripError=%.6f barrel=%c%c "
             "local=(%.3f,%.3f,%.3f)",
             reinterpret_cast<void*>(inventory.weapon),
             reinterpret_cast<void*>(active->component),
             static_cast<unsigned long long>(active->updateCount),
-            active->localToWorldOffset, scaleX, scaleY, scaleZ,
+            active->localToWorldOffset, scaleX, scaleY, scaleZ, gripError,
             m_weaponBarrelSign < 0.0f ? '-' : '+', "XYZ"[m_weaponBarrelAxis],
             barrelLocal[0], barrelLocal[1], barrelLocal[2]);
         m_lastDrivenWeapon = inventory.weapon;
@@ -1240,6 +1713,10 @@ void InputHook::Restore() {
 }
 
 void InputHook::Shutdown() {
+    if (m_handTuningDirty) {
+        config::SaveLoaded();
+        m_handTuningDirty = false;
+    }
     if (m_aimTuningDirty) {
         SaveActiveAimProfile();
         m_aimTuningDirty = false;
