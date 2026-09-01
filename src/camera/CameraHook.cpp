@@ -39,6 +39,19 @@ static SRWLOCK s_globalsLock = SRWLOCK_INIT;
 static SRWLOCK s_cameraLock = SRWLOCK_INIT;
 static std::atomic<bool> s_cameraRefreshRequested{false};
 static std::atomic<bool> s_visibilityInventoryRefreshRequested{false};
+static std::atomic<bool> s_downedFirstPersonActive{false};
+static std::atomic<bool> s_externalViewFirstPersonActive{false};
+static std::atomic<bool> s_transientFirstPersonActionActive{false};
+static SRWLOCK s_firstPersonCameraLock = SRWLOCK_INIT;
+static bool s_firstPersonCameraValid = false;
+static uintptr_t s_firstPersonCameraPawn = 0;
+static float s_firstPersonCameraOffset[3] = {};
+static float s_firstPersonCameraWorldLocation[3] = {};
+static int32_t s_firstPersonCameraRotation[3] = {};
+static bool s_downedCameraAnchorValid = false;
+static uintptr_t s_downedCameraAnchorPawn = 0;
+static float s_downedCameraAnchorLocation[3] = {};
+static float s_downedCameraAnchorPawnLocation[3] = {};
 
 static CameraInfo GetCameraSnapshot() {
     CameraInfo camera = {};
@@ -242,6 +255,8 @@ struct PendingViewPose {
     bool active = false;
     bool xrViewsValid = false;
     bool vehicleAnchor = false;
+    bool firstPersonOverride = false;
+    bool allowFirstPersonRecovery = false;
     int eye = 0;
     float originalLocation[3] = {};
     float headLocation[3] = {};
@@ -520,6 +535,12 @@ bool IsCameraFound() { return s_cameraFound && s_viewportDrawTarget != 0; }
 bool IsVehicleCameraActive() {
     return s_vehiclePawn.load(std::memory_order_acquire) != 0;
 }
+bool IsDownedFirstPersonActive() {
+    return s_downedFirstPersonActive.load(std::memory_order_acquire);
+}
+bool IsTransientFirstPersonActionActive() {
+    return s_transientFirstPersonActionActive.load(std::memory_order_acquire);
+}
 
 static void ClearCommandPoses() {
     AcquireSRWLockExclusive(&s_commandPoseLock);
@@ -579,6 +600,159 @@ void RequestPlayerIdentityRefresh() {
 void RequestRecenter() {
     s_recenterRequested.store(true, std::memory_order_release);
     Log("[Camera] Recenter requested");
+}
+
+static bool GetPawnWorldLocation(const input::PlayerIdentitySnapshot& identity,
+                                 float output[3]) {
+    if (!identity.pawnValid || identity.pawn < 0x10000 || !output) return false;
+    const player::ComponentInventoryStatus inventory =
+        player::ArmIKSystem::Instance().GetComponentInventory();
+    const player::ComponentInventoryEntry* fallback = nullptr;
+    for (size_t index = 0; index < inventory.count; ++index) {
+        const player::ComponentInventoryEntry& entry = inventory.entries[index];
+        if (entry.outer != identity.pawn || entry.component < 0x10000 ||
+            entry.localToWorldOffset <= 0) continue;
+        if (entry.role == player::ComponentRole::PawnBody) {
+            fallback = &entry;
+            break;
+        }
+        if (!fallback && entry.role == player::ComponentRole::ProbableFirstPersonArms)
+            fallback = &entry;
+    }
+    if (!fallback) return false;
+
+    float matrix[16] = {};
+    if (!CameraRead(fallback->component + fallback->localToWorldOffset,
+                    matrix, sizeof(matrix)) ||
+        !std::isfinite(matrix[12]) || !std::isfinite(matrix[13]) ||
+        !std::isfinite(matrix[14]) || fabsf(matrix[15] - 1.0f) > 0.1f)
+        return false;
+    output[0] = matrix[12];
+    output[1] = matrix[13];
+    output[2] = matrix[14];
+    return true;
+}
+
+static bool ApplyDownedFirstPersonOverride(
+        const input::PlayerIdentitySnapshot& identity,
+        const float gameLocation[3], const int32_t gameRotation[3],
+        float outputLocation[3], int32_t outputRotation[3]) {
+    float pawnLocation[3] = {};
+    const bool pawnLocationValid = GetPawnWorldLocation(identity, pawnLocation);
+    if (!identity.pawnValid || !pawnLocationValid) {
+        s_downedFirstPersonActive.store(false, std::memory_order_release);
+        s_externalViewFirstPersonActive.store(false, std::memory_order_release);
+        s_transientFirstPersonActionActive.store(false, std::memory_order_release);
+        AcquireSRWLockExclusive(&s_firstPersonCameraLock);
+        s_downedCameraAnchorValid = false;
+        ReleaseSRWLockExclusive(&s_firstPersonCameraLock);
+        return false;
+    }
+
+    bool referenceValid = false;
+    float expectedLocation[3] = {};
+    int32_t expectedRotation[3] = {};
+    AcquireSRWLockShared(&s_firstPersonCameraLock);
+    referenceValid = s_firstPersonCameraValid &&
+        s_firstPersonCameraPawn == identity.pawn;
+    if (referenceValid) {
+        for (int axis = 0; axis < 3; ++axis)
+            expectedLocation[axis] = pawnLocation[axis] + s_firstPersonCameraOffset[axis];
+        memcpy(expectedRotation, s_firstPersonCameraRotation,
+               sizeof(expectedRotation));
+    }
+    ReleaseSRWLockShared(&s_firstPersonCameraLock);
+    if (!referenceValid) {
+        if (identity.weaponValid) {
+            AcquireSRWLockExclusive(&s_firstPersonCameraLock);
+            s_firstPersonCameraValid = true;
+            s_firstPersonCameraPawn = identity.pawn;
+            for (int axis = 0; axis < 3; ++axis)
+                s_firstPersonCameraOffset[axis] = gameLocation[axis] - pawnLocation[axis];
+            memcpy(s_firstPersonCameraWorldLocation, gameLocation,
+                   sizeof(s_firstPersonCameraWorldLocation));
+            memcpy(s_firstPersonCameraRotation, gameRotation,
+                   sizeof(s_firstPersonCameraRotation));
+            ReleaseSRWLockExclusive(&s_firstPersonCameraLock);
+        }
+        s_transientFirstPersonActionActive.store(false, std::memory_order_release);
+        return false;
+    }
+
+    const float dx = gameLocation[0] - expectedLocation[0];
+    const float dy = gameLocation[1] - expectedLocation[1];
+    const float dz = gameLocation[2] - expectedLocation[2];
+    const float cameraDisplacement = sqrtf(dx * dx + dy * dy + dz * dz);
+    auto& weaponAim = input::WeaponAimSystem::Instance();
+    const bool injured = weaponAim.IsPlayerInjured();
+    const bool phaseWalk = weaponAim.IsPhaseWalkActive();
+    bool active = s_downedFirstPersonActive.load(std::memory_order_acquire);
+    constexpr float kThirdPersonCameraDisplacementUu = 50.0f;
+    constexpr float kFirstPersonRecoveryDisplacementUu = 20.0f;
+    constexpr float kStableReferenceDisplacementUu = 10.0f;
+    if (active && !injured &&
+        !s_externalViewFirstPersonActive.load(std::memory_order_acquire) &&
+        cameraDisplacement <= kFirstPersonRecoveryDisplacementUu) {
+        active = false;
+        s_downedFirstPersonActive.store(false, std::memory_order_release);
+        AcquireSRWLockExclusive(&s_firstPersonCameraLock);
+        s_downedCameraAnchorValid = false;
+        ReleaseSRWLockExclusive(&s_firstPersonCameraLock);
+        Log("[Camera] Downed first-person override ended");
+    }
+    if (!active && (injured || cameraDisplacement >= kThirdPersonCameraDisplacementUu)) {
+        active = true;
+        AcquireSRWLockExclusive(&s_firstPersonCameraLock);
+        s_downedCameraAnchorValid = true;
+        s_downedCameraAnchorPawn = identity.pawn;
+        memcpy(s_downedCameraAnchorLocation, s_firstPersonCameraWorldLocation,
+               sizeof(s_downedCameraAnchorLocation));
+        memcpy(s_downedCameraAnchorPawnLocation, pawnLocation,
+               sizeof(s_downedCameraAnchorPawnLocation));
+        ReleaseSRWLockExclusive(&s_firstPersonCameraLock);
+        s_downedFirstPersonActive.store(true, std::memory_order_release);
+        Log("[Camera] Downed first-person override enabled (native=%d camera delta %.1f UU)",
+            injured, cameraDisplacement);
+    }
+    const bool previousTransientAction =
+        s_transientFirstPersonActionActive.load(std::memory_order_acquire);
+    const bool transientAction = phaseWalk || (!active && !identity.weaponValid &&
+        (previousTransientAction || cameraDisplacement >= 5.0f));
+    s_transientFirstPersonActionActive.store(
+        transientAction, std::memory_order_release);
+    if (transientAction != previousTransientAction) {
+        Log("[Camera] Transient first-person action %s (camera delta %.1f UU)",
+            transientAction ? "started" : "ended", cameraDisplacement);
+    }
+    if (active) {
+        AcquireSRWLockShared(&s_firstPersonCameraLock);
+        if (s_downedCameraAnchorValid && s_downedCameraAnchorPawn == identity.pawn) {
+            outputLocation[0] = s_downedCameraAnchorLocation[0] +
+                pawnLocation[0] - s_downedCameraAnchorPawnLocation[0];
+            outputLocation[1] = s_downedCameraAnchorLocation[1] +
+                pawnLocation[1] - s_downedCameraAnchorPawnLocation[1];
+            outputLocation[2] = s_downedCameraAnchorLocation[2];
+        } else {
+            memcpy(outputLocation, expectedLocation, sizeof(expectedLocation));
+        }
+        ReleaseSRWLockShared(&s_firstPersonCameraLock);
+        memcpy(outputRotation, expectedRotation, sizeof(expectedRotation));
+        return true;
+    }
+    if (identity.weaponValid &&
+        cameraDisplacement < kStableReferenceDisplacementUu) {
+        AcquireSRWLockExclusive(&s_firstPersonCameraLock);
+        s_firstPersonCameraValid = true;
+        s_firstPersonCameraPawn = identity.pawn;
+        for (int axis = 0; axis < 3; ++axis)
+            s_firstPersonCameraOffset[axis] = gameLocation[axis] - pawnLocation[axis];
+        memcpy(s_firstPersonCameraWorldLocation, gameLocation,
+               sizeof(s_firstPersonCameraWorldLocation));
+        memcpy(s_firstPersonCameraRotation, gameRotation,
+               sizeof(s_firstPersonCameraRotation));
+        ReleaseSRWLockExclusive(&s_firstPersonCameraLock);
+    }
+    return false;
 }
 
 static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, void* canvas) {
@@ -667,11 +841,21 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
 
             if (!simulatedPose) {
                 if (eye == 0) {
+                    float firstPersonLocation[3] = {};
+                    int32_t firstPersonRotation[3] = {};
+                    const input::PlayerIdentitySnapshot identity =
+                        input::WeaponAimSystem::Instance().GetPlayerIdentity();
+                    const bool downedFirstPerson = !vehicleAnchorActive &&
+                        ApplyDownedFirstPersonOverride(identity, originalLocation,
+                            rotation, firstPersonLocation,
+                            firstPersonRotation);
                     renderTicket.baseCameraValid = true;
                     memcpy(renderTicket.baseLocation,
-                           vehicleAnchorActive ? vehicleSeat : originalLocation,
+                           vehicleAnchorActive ? vehicleSeat :
+                               (downedFirstPerson ? firstPersonLocation : originalLocation),
                            sizeof(renderTicket.baseLocation));
-                    memcpy(renderTicket.baseRotation, rotation,
+                    memcpy(renderTicket.baseRotation,
+                           downedFirstPerson ? firstPersonRotation : rotation,
                            sizeof(renderTicket.baseRotation));
                     renderTicket.baseFov = config::Get().fov_degrees;
                 } else if (!renderTicket.baseCameraValid) {
@@ -1069,6 +1253,10 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
         pendingPose.xrViewsValid = realPoseValid;
         pendingPose.vehicleAnchor =
             s_vehiclePawn.load(std::memory_order_acquire) != 0;
+        pendingPose.firstPersonOverride =
+            s_downedFirstPersonActive.load(std::memory_order_acquire);
+        pendingPose.allowFirstPersonRecovery = !pendingPose.vehicleAnchor &&
+            input::WeaponAimSystem::Instance().GetPlayerIdentity().pawnValid;
         pendingPose.eye = eye;
         pendingPose.pairSerial = renderTicket.pairSerial;
         memcpy(pendingPose.originalLocation, originalLocation,
@@ -1079,7 +1267,8 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                sizeof(pendingPose.sourceLocation));
         memcpy(pendingPose.location, appliedLocation, sizeof(pendingPose.location));
         memcpy(pendingPose.rotation, appliedRotation, sizeof(pendingPose.rotation));
-        memcpy(pendingPose.baseRotation, originalRotation, sizeof(pendingPose.baseRotation));
+        memcpy(pendingPose.baseRotation, renderTicket.baseRotation,
+               sizeof(pendingPose.baseRotation));
         pendingPose.visualFov = visualFov;
         pendingPose.cullingFov = cullingFov;
         memcpy(pendingPose.roomOffsetView, roomOffsetView,
@@ -1280,11 +1469,32 @@ static bool ApplyPoseToView(uintptr_t viewAddress, const PendingViewPose& pose) 
             fabsf(origin[0] - pose.sourceLocation[0]) +
             fabsf(origin[1] - pose.sourceLocation[1]) +
             fabsf(origin[2] - pose.sourceLocation[2]);
+        const float closestOriginError = (std::min)(originError, sourceOriginError);
+        constexpr float kExternalCameraOriginErrorUu = 50.0f;
+        const bool externalCameraDetected = pose.allowFirstPersonRecovery &&
+            closestOriginError >= kExternalCameraOriginErrorUu;
+        const bool injured = input::WeaponAimSystem::Instance().IsPlayerInjured();
+        const bool externalCameraRecovered = !injured &&
+            s_externalViewFirstPersonActive.load(std::memory_order_acquire) &&
+            closestOriginError <= 20.0f;
+        if (externalCameraRecovered) {
+            s_externalViewFirstPersonActive.store(false, std::memory_order_release);
+            Log("[Camera] External FSceneView ended; normal first-person restored");
+        }
+        const bool recoverFirstPerson = pose.firstPersonOverride ||
+            (!externalCameraRecovered && externalCameraDetected);
+        if (externalCameraDetected)
+            s_externalViewFirstPersonActive.store(true, std::memory_order_release);
+        if (recoverFirstPerson &&
+            !s_downedFirstPersonActive.exchange(true, std::memory_order_acq_rel)) {
+            Log("[Camera] External FSceneView detected (origin error %.1f UU); "
+                "first-person override enabled", closestOriginError);
+        }
         const bool validProjection = projection[0] > 0.1f && projection[5] > 0.1f &&
                                      fabsf(projection[11] - 1.0f) < 0.01f &&
                                      fabsf(projection[15]) < 0.01f;
         if ((!pose.vehicleAnchor &&
-             (std::min)(originError, sourceOriginError) > 10.0f) || !validProjection)
+             closestOriginError > 10.0f && !recoverFirstPerson) || !validProjection)
             return false;
 
         // UE3 used a wide FOV only to build visibility. Restore the visual
@@ -1368,10 +1578,13 @@ static bool ApplyPoseToView(uintptr_t viewAddress, const PendingViewPose& pose) 
             }
         }
 
-        // CameraCache is no longer modified for culling, so preserve UE3's exact
-        // source basis. Reconstructing it from integer rotators loses camera
-        // adjustments and creates a small orbit when the head rotates.
-        const float* baseTranslatedView = backup.translatedView;
+        // Preserve UE3's exact source basis normally. An external/downed view
+        // needs the last first-person rotator or it keeps looking back at the pawn.
+        float firstPersonViewRotation[16] = {};
+        if (recoverFirstPerson)
+            BuildViewRotation(pose.baseRotation, firstPersonViewRotation);
+        const float* baseTranslatedView = recoverFirstPerson
+            ? firstPersonViewRotation : backup.translatedView;
         const float worldOffset[3] = {
             pose.roomOffsetView[0] * baseTranslatedView[0] +
                 pose.roomOffsetView[1] * baseTranslatedView[1] +
@@ -1400,7 +1613,7 @@ static bool ApplyPoseToView(uintptr_t viewAddress, const PendingViewPose& pose) 
         float fullView[16] = {};
         memcpy(fullView, baseTranslatedView, sizeof(fullView));
         const float* anchorOrigin = pose.vehicleAnchor
-            ? pose.headLocation : backup.origin;
+            ? pose.headLocation : (recoverFirstPerson ? pose.location : backup.origin);
         const float newOrigin[3] = {
             anchorOrigin[0] + worldOffset[0],
             anchorOrigin[1] + worldOffset[1],

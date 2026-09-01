@@ -514,6 +514,72 @@ bool WeaponAimSystem::InstallNativeAimProbe(uint64_t moduleBase, uint32_t module
     return true;
 }
 
+bool WeaponAimSystem::InstallGameplayStateProbes(
+        uintptr_t injuredFunction, uintptr_t phaseWalkFunction,
+        uint64_t moduleBase, uint32_t moduleSize) {
+    struct Probe {
+        const char* name;
+        uintptr_t function;
+        uintptr_t* target;
+        GameplayStateFn hook;
+        GameplayStateFn* original;
+    };
+    Probe probes[] = {
+        {"IsInjured", injuredFunction, &m_isInjuredTarget,
+         &HookedIsInjured, &m_originalIsInjured},
+        {"PhaseWalk", phaseWalkFunction, &m_phaseWalkVisibilityTarget,
+         &HookedPhaseWalkVisibility, &m_originalPhaseWalkVisibility}
+    };
+    bool installedAny = false;
+    for (Probe& probe : probes) {
+        if (*probe.target && *probe.original) {
+            installedAny = true;
+            continue;
+        }
+        uintptr_t target = 0;
+        if (probe.function < 0x10000 ||
+            !ReadMem(probe.function + 0xF0, &target, sizeof(target)) ||
+            target < moduleBase || target >= moduleBase + moduleSize) {
+            Log("[WeaponAim] %s native state target unavailable: function=%p target=%p",
+                probe.name, reinterpret_cast<void*>(probe.function),
+                reinterpret_cast<void*>(target));
+            continue;
+        }
+        MEMORY_BASIC_INFORMATION memory = {};
+        if (!VirtualQuery(reinterpret_cast<void*>(target), &memory, sizeof(memory)) ||
+            memory.State != MEM_COMMIT ||
+            !(memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+            Log("[WeaponAim] %s native state target is not executable: %p",
+                probe.name, reinterpret_cast<void*>(target));
+            continue;
+        }
+        const MH_STATUS createStatus = MH_CreateHook(
+            reinterpret_cast<void*>(target), probe.hook,
+            reinterpret_cast<void**>(probe.original));
+        if (createStatus != MH_OK) {
+            Log("[WeaponAim] %s native state hook creation failed: %s",
+                probe.name, MH_StatusToString(createStatus));
+            *probe.original = nullptr;
+            continue;
+        }
+        const MH_STATUS enableStatus = MH_EnableHook(reinterpret_cast<void*>(target));
+        if (enableStatus != MH_OK) {
+            MH_RemoveHook(reinterpret_cast<void*>(target));
+            *probe.original = nullptr;
+            Log("[WeaponAim] %s native state hook enable failed: %s",
+                probe.name, MH_StatusToString(enableStatus));
+            continue;
+        }
+        *probe.target = target;
+        installedAny = true;
+        Log("[WeaponAim] %s native state probe installed at %p (RVA 0x%llX)",
+            probe.name, reinterpret_cast<void*>(target),
+            static_cast<unsigned long long>(target - moduleBase));
+    }
+    return installedAny;
+}
+
 bool WeaponAimSystem::InstallScriptInvokeProbe(uintptr_t function,
                                                 uint64_t moduleBase,
                                                 uint32_t moduleSize) {
@@ -706,6 +772,45 @@ void __fastcall WeaponAimSystem::HookedScriptInvoke(void* object, void* frame,
         desired[0], desired[1], desired[2], finiteTargetUsed, overrideEnabled, written);
 }
 
+void __fastcall WeaponAimSystem::HookedIsInjured(
+        void* object, void* frame, void* result) {
+    auto& system = Instance();
+    if (system.m_originalIsInjured)
+        system.m_originalIsInjured(object, frame, result);
+    if (reinterpret_cast<uintptr_t>(object) !=
+        system.m_localPawn.load(std::memory_order_acquire)) return;
+    uint32_t rawResult = 0;
+    if (!result || !ReadDirect(reinterpret_cast<uintptr_t>(result),
+                               &rawResult, sizeof(rawResult))) return;
+    const bool injured = rawResult != 0;
+    const bool previous = system.m_playerInjured.exchange(
+        injured, std::memory_order_acq_rel);
+    if (injured != previous)
+        Log("[WeaponAim] Native injured state %s", injured ? "started" : "ended");
+}
+
+void __fastcall WeaponAimSystem::HookedPhaseWalkVisibility(
+        void* object, void* frame, void* result) {
+    auto& system = Instance();
+    if (system.m_originalPhaseWalkVisibility)
+        system.m_originalPhaseWalkVisibility(object, frame, result);
+    if (reinterpret_cast<uintptr_t>(object) !=
+        system.m_localPawn.load(std::memory_order_acquire)) return;
+    uint32_t rawResult = 0;
+    const bool resultReadable = result && ReadDirect(
+        reinterpret_cast<uintptr_t>(result), &rawResult, sizeof(rawResult));
+    const bool missingWeapon =
+        !system.m_weaponIdentityValid.load(std::memory_order_acquire);
+    if (missingWeapon) {
+        const bool previous = system.m_phaseWalkActive.exchange(
+            true, std::memory_order_acq_rel);
+        if (!previous)
+            Log("[WeaponAim] Native Phasewalk state started "
+                "(resultReadable=%d result=%u weaponMissing=%d)",
+                resultReadable, rawResult, missingWeapon);
+    }
+}
+
 void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAddress,
                                  uint64_t moduleBase, uint32_t moduleSize) {
     const auto& globals = *static_cast<const camera::UE3Globals*>(globalsAddress);
@@ -723,6 +828,10 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
     size_t totalAimCandidateCount = 0;
     uintptr_t getAdjustedAim = 0;
     uint64_t aimNameToken = 0;
+    uint64_t isInjuredNameToken = 0;
+    uint64_t phaseWalkVisibilityNameToken = 0;
+    uintptr_t isInjuredFunction = 0;
+    uintptr_t phaseWalkVisibilityFunction = 0;
 
     for (int32_t index = 0; index < objects.count; ++index) {
         uintptr_t object = 0;
@@ -743,6 +852,20 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
                 if (aimCandidateCount < _countof(aimCandidates)) {
                     aimCandidates[aimCandidateCount++] = {object, owner, nameToken};
                 }
+            }
+        }
+        if (strcmp(className, "Function") == 0 &&
+            (strcmp(objectName, "IsInjured") == 0 ||
+             strcmp(objectName, "ShouldLocalPlayerSeeMePhaseWalk") == 0)) {
+            uint64_t nameToken = 0;
+            if (!ReadMem(object + 0x48, &nameToken, sizeof(nameToken)) || !nameToken)
+                continue;
+            if (strcmp(objectName, "IsInjured") == 0) {
+                isInjuredNameToken = nameToken;
+                isInjuredFunction = object;
+            } else {
+                phaseWalkVisibilityNameToken = nameToken;
+                phaseWalkVisibilityFunction = object;
             }
         }
     }
@@ -853,6 +976,9 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
         m_localPawn.load(std::memory_order_acquire) != (pawnValid ? pawn : 0) ||
         m_localWeapon.load(std::memory_order_acquire) != (weaponValid ? weapon : 0);
     m_getAdjustedAimName.store(aimNameToken, std::memory_order_release);
+    m_isInjuredName.store(isInjuredNameToken, std::memory_order_release);
+    m_phaseWalkVisibilityName.store(
+        phaseWalkVisibilityNameToken, std::memory_order_release);
     m_getAdjustedAimFunction.store(getAdjustedAim, std::memory_order_release);
     m_getAdjustedAimOwnerClass.store(aimOwner, std::memory_order_release);
     m_localController.store(controllerAddress, std::memory_order_release);
@@ -885,7 +1011,17 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
         reinterpret_cast<void*>(pawn), pawnName, pawnClassName,
         reinterpret_cast<void*>(weapon), weaponName, weaponClassName,
         pawnOffset, controllerOffset, weaponOffset, ownerOffset);
+    Log("[WeaponAim] Gameplay state probes: IsInjured=0x%llX PhaseWalk=0x%llX",
+        static_cast<unsigned long long>(isInjuredNameToken),
+        static_cast<unsigned long long>(phaseWalkVisibilityNameToken));
 
+    if (!m_hookInstalled.load(std::memory_order_acquire)) {
+        const uintptr_t processEvent = FindProcessEvent(
+            controllerAddress, moduleBase, moduleSize);
+        if (processEvent) Install(processEvent);
+    }
+    InstallGameplayStateProbes(isInjuredFunction, phaseWalkVisibilityFunction,
+                               moduleBase, moduleSize);
     InstallNativeAimProbe(moduleBase, moduleSize);
     if (!m_scriptInvokeInstalled.load(std::memory_order_acquire)) {
         for (size_t index = 0; index < aimCandidateCount; ++index) {
@@ -905,6 +1041,13 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
 int32_t __fastcall WeaponAimSystem::HookedProcessEvent(
         void* object, uint64_t functionName, void* params, void* result) {
     auto& system = Instance();
+    const uintptr_t localPawn = system.m_localPawn.load(std::memory_order_acquire);
+    const bool isLocalPawn = localPawn >= 0x10000 &&
+        reinterpret_cast<uintptr_t>(object) == localPawn;
+    const bool isInjuredQuery = isLocalPawn && functionName != 0 &&
+        functionName == system.m_isInjuredName.load(std::memory_order_acquire);
+    const bool isPhaseWalkQuery = isLocalPawn && functionName != 0 &&
+        functionName == system.m_phaseWalkVisibilityName.load(std::memory_order_acquire);
     const bool isLocalAdjustedAim =
         functionName != 0 &&
         functionName == system.m_getAdjustedAimName.load(std::memory_order_acquire) &&
@@ -915,6 +1058,24 @@ int32_t __fastcall WeaponAimSystem::HookedProcessEvent(
 
     const int32_t status = system.m_originalProcessEvent ?
         system.m_originalProcessEvent(object, functionName, params, result) : 0;
+
+    if (isInjuredQuery || isPhaseWalkQuery) {
+        uint32_t rawResult = 0;
+        const bool resultReadable = result && ReadDirect(
+            reinterpret_cast<uintptr_t>(result), &rawResult, sizeof(rawResult));
+        if (resultReadable && isInjuredQuery) {
+            const bool injured = rawResult != 0;
+            const bool previous = system.m_playerInjured.exchange(
+                injured, std::memory_order_acq_rel);
+            if (injured != previous)
+                Log("[WeaponAim] Native injured state %s", injured ? "started" : "ended");
+        }
+        if (resultReadable && isPhaseWalkQuery && rawResult != 0) {
+            const bool previous = system.m_phaseWalkActive.exchange(
+                true, std::memory_order_acq_rel);
+            if (!previous) Log("[WeaponAim] Native Phasewalk state started");
+        }
+    }
 
     if (!isLocalAdjustedAim) return status;
 
@@ -1088,6 +1249,15 @@ bool WeaponAimSystem::IsVehicleTerminalUiActive() const {
         strcmp(className, "WillowWeaponPawn") == 0;
 }
 
+bool WeaponAimSystem::IsPhaseWalkActive() {
+    if (!m_phaseWalkActive.load(std::memory_order_acquire)) return false;
+    const PlayerIdentitySnapshot identity = GetPlayerIdentity();
+    if (identity.pawnValid && !identity.weaponValid) return true;
+    if (m_phaseWalkActive.exchange(false, std::memory_order_acq_rel))
+        Log("[WeaponAim] Native Phasewalk state ended");
+    return false;
+}
+
 bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_t pawn) {
     if (controller < 0x10000 || pawn < 0x10000) return false;
     int32_t pawnOffset = -1;
@@ -1189,6 +1359,8 @@ void WeaponAimSystem::Shutdown() {
     m_aimUpdatedMs.store(0, std::memory_order_release);
     m_fireActive.store(false, std::memory_order_release);
     m_vehicleSecondaryFireActive.store(false, std::memory_order_release);
+    m_playerInjured.store(false, std::memory_order_release);
+    m_phaseWalkActive.store(false, std::memory_order_release);
     SetBallisticOverrideEnabled(false);
     if (m_nativeAimTarget) {
         MH_DisableHook(reinterpret_cast<void*>(m_nativeAimTarget));
@@ -1203,6 +1375,18 @@ void WeaponAimSystem::Shutdown() {
     }
     m_scriptInvokeTarget = 0;
     m_originalScriptInvoke = nullptr;
+    if (m_isInjuredTarget) {
+        MH_DisableHook(reinterpret_cast<void*>(m_isInjuredTarget));
+        MH_RemoveHook(reinterpret_cast<void*>(m_isInjuredTarget));
+    }
+    m_isInjuredTarget = 0;
+    m_originalIsInjured = nullptr;
+    if (m_phaseWalkVisibilityTarget) {
+        MH_DisableHook(reinterpret_cast<void*>(m_phaseWalkVisibilityTarget));
+        MH_RemoveHook(reinterpret_cast<void*>(m_phaseWalkVisibilityTarget));
+    }
+    m_phaseWalkVisibilityTarget = 0;
+    m_originalPhaseWalkVisibility = nullptr;
     if (m_processEventTarget && m_hookInstalled.exchange(false, std::memory_order_acq_rel)) {
         MH_DisableHook(reinterpret_cast<void*>(m_processEventTarget));
         MH_RemoveHook(reinterpret_cast<void*>(m_processEventTarget));
@@ -1211,6 +1395,8 @@ void WeaponAimSystem::Shutdown() {
     m_originalProcessEvent = nullptr;
     AcquireSRWLockExclusive(&m_identityLock);
     m_getAdjustedAimName.store(0, std::memory_order_release);
+    m_isInjuredName.store(0, std::memory_order_release);
+    m_phaseWalkVisibilityName.store(0, std::memory_order_release);
     m_getAdjustedAimFunction.store(0, std::memory_order_release);
     m_getAdjustedAimOwnerClass.store(0, std::memory_order_release);
     m_localController.store(0, std::memory_order_release);

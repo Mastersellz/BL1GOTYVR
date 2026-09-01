@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cwctype>
+#include <d3d11_4.h>
 
 namespace bl1gotyvr { namespace xr {
 
@@ -458,6 +459,21 @@ bool OpenXRContext::CreateSession() {
     if (featureLevel < reqs.minFeatureLevel) {
         Log("[OpenXR] ERROR: game D3D11 feature level is below runtime requirement");
         return false;
+    }
+
+    if (m_isSteamRuntime) {
+        ID3D11Multithread* multithread = nullptr;
+        const HRESULT multithreadResult = m_context->QueryInterface(
+            __uuidof(ID3D11Multithread), reinterpret_cast<void**>(&multithread));
+        if (FAILED(multithreadResult) || !multithread) {
+            Log("[SteamVR] ERROR: ID3D11Multithread unavailable: 0x%08X",
+                multithreadResult);
+            return false;
+        }
+        const BOOL wasProtected = multithread->SetMultithreadProtected(TRUE);
+        multithread->Release();
+        Log("[SteamVR] D3D11 immediate-context protection enabled (previous=%d)",
+            wasProtected ? 1 : 0);
     }
 
     IDXGIDevice* dxgiDevice = nullptr;

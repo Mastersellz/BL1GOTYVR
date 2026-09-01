@@ -15,6 +15,8 @@ void StartScanner();
 bool InstallViewportDrawHook(uintptr_t target);
 bool IsCameraFound();
 bool IsVehicleCameraActive();
+bool IsDownedFirstPersonActive();
+bool IsTransientFirstPersonActionActive();
 bool IsNativeMultiviewActive();
 bool ConsumeCompletedNativeMultiviewFrame(CompletedNativeMultiviewFrame& frame);
 bool ConsumeRenderPoseAcknowledgement(uint64_t pairSerial, int eye);

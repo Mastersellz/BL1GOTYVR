@@ -41,6 +41,10 @@ public:
     uint64_t GetOverrideCount() const { return m_overrideCount.load(std::memory_order_relaxed); }
     PlayerIdentitySnapshot GetPlayerIdentity();
     bool IsVehicleTerminalUiActive() const;
+    bool IsPlayerInjured() const {
+        return m_playerInjured.load(std::memory_order_acquire);
+    }
+    bool IsPhaseWalkActive();
     bool RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_t pawn);
 
 private:
@@ -49,15 +53,22 @@ private:
     using ProcessEventFn = int32_t(__fastcall*)(void*, uint64_t, void*, void*);
     using GetAimRotationFn = void(__fastcall*)(void*, void*, void*);
     using ScriptInvokeFn = void(__fastcall*)(void*, void*, void*);
+    using GameplayStateFn = void(__fastcall*)(void*, void*, void*);
 
     static int32_t __fastcall HookedProcessEvent(void* object, uint64_t functionName,
                                                   void* params, void* result);
     bool Install(uintptr_t target);
     bool InstallNativeAimProbe(uint64_t moduleBase, uint32_t moduleSize);
+    bool InstallGameplayStateProbes(uintptr_t injuredFunction,
+                                    uintptr_t phaseWalkFunction,
+                                    uint64_t moduleBase, uint32_t moduleSize);
     bool InstallScriptInvokeProbe(uintptr_t function, uint64_t moduleBase,
                                   uint32_t moduleSize);
     static void __fastcall HookedGetAimRotation(void* object, void* frame, void* result);
     static void __fastcall HookedScriptInvoke(void* object, void* frame, void* result);
+    static void __fastcall HookedIsInjured(void* object, void* frame, void* result);
+    static void __fastcall HookedPhaseWalkVisibility(
+        void* object, void* frame, void* result);
     uintptr_t FindProcessEvent(uint64_t controllerAddress, uint64_t moduleBase,
                                uint32_t moduleSize);
     bool FindPawnAimRotation(uint64_t controllerAddress);
@@ -65,6 +76,8 @@ private:
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_hookInstalled{false};
     std::atomic<uint64_t> m_getAdjustedAimName{0};
+    std::atomic<uint64_t> m_isInjuredName{0};
+    std::atomic<uint64_t> m_phaseWalkVisibilityName{0};
     std::atomic<uintptr_t> m_getAdjustedAimFunction{0};
     std::atomic<uintptr_t> m_getAdjustedAimOwnerClass{0};
     std::atomic<uintptr_t> m_localController{0};
@@ -96,6 +109,8 @@ private:
     std::atomic<uintptr_t> m_pawnAimRotationAddr{0};
     std::atomic<bool> m_fireActive{false};
     std::atomic<bool> m_vehicleSecondaryFireActive{false};
+    std::atomic<bool> m_playerInjured{false};
+    std::atomic<bool> m_phaseWalkActive{false};
     std::atomic<uint64_t> m_nativeAimCalls{0};
     std::atomic<uint64_t> m_processEventAimCalls{0};
     std::atomic<uint64_t> m_scriptInvokeAimCalls{0};
@@ -106,6 +121,10 @@ private:
     uintptr_t m_scriptInvokeTarget = 0;
     ScriptInvokeFn m_originalScriptInvoke = nullptr;
     std::atomic<bool> m_scriptInvokeInstalled{false};
+    uintptr_t m_isInjuredTarget = 0;
+    GameplayStateFn m_originalIsInjured = nullptr;
+    uintptr_t m_phaseWalkVisibilityTarget = 0;
+    GameplayStateFn m_originalPhaseWalkVisibility = nullptr;
 };
 
 }} // namespace bl1gotyvr::input

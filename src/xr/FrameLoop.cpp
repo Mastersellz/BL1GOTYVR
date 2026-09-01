@@ -2069,19 +2069,22 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
 
     auto& weaponAim = input::WeaponAimSystem::Instance();
     const bool explicitVehicleTerminalUi = weaponAim.IsVehicleTerminalUiActive();
+    const bool phaseWalkActive = weaponAim.IsPhaseWalkActive();
     const input::PlayerIdentitySnapshot identity = weaponAim.GetPlayerIdentity();
     const bool missingWeaponTerminalCandidate = identity.pawnValid &&
-        !identity.weaponValid && !camera::IsVehicleCameraActive();
+        !identity.weaponValid && !camera::IsVehicleCameraActive() &&
+        !camera::IsDownedFirstPersonActive() &&
+        !camera::IsTransientFirstPersonActionActive() && !phaseWalkActive;
     if (explicitVehicleTerminalUi) {
-        m_terminalMissingWeaponPresents = 12;
+        m_terminalMissingWeaponPresents = 90;
     } else if (missingWeaponTerminalCandidate) {
-        if (m_terminalMissingWeaponPresents < 12)
+        if (m_terminalMissingWeaponPresents < 90)
             ++m_terminalMissingWeaponPresents;
     } else {
         m_terminalMissingWeaponPresents = 0;
     }
     const bool vehicleTerminalUi = explicitVehicleTerminalUi ||
-        m_terminalMissingWeaponPresents >= 12;
+        m_terminalMissingWeaponPresents >= 90;
     if (vehicleTerminalUi) {
         if (!m_theaterFallbackActive) {
             m_theaterFallbackActive = true;
