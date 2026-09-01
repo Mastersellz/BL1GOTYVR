@@ -1064,6 +1064,26 @@ PlayerIdentitySnapshot WeaponAimSystem::GetPlayerIdentity() {
     return snapshot;
 }
 
+bool WeaponAimSystem::IsVehicleTerminalUiActive() const {
+    const uintptr_t controller = m_localController.load(std::memory_order_acquire);
+    int32_t pawnOffset = -1;
+    AcquireSRWLockShared(&m_identityLock);
+    pawnOffset = m_pawnPropertyOffset;
+    ReleaseSRWLockShared(&m_identityLock);
+    if (controller < 0x10000 || pawnOffset <= 0) return false;
+
+    uintptr_t livePawn = 0;
+    if (!ReadMem(controller + static_cast<uintptr_t>(pawnOffset),
+                 &livePawn, sizeof(livePawn)) || livePawn < 0x10000) return false;
+    const camera::UE3Globals globals = camera::GetUE3GlobalsSnapshot();
+    TArray64 names = {};
+    char className[128] = {};
+    return globals.gNamesValid &&
+        ReadMem(globals.gNamesAddress, &names, sizeof(names)) &&
+        ReadClassName(globals, names, livePawn, className, sizeof(className)) &&
+        strcmp(className, "WillowWeaponPawn") == 0;
+}
+
 bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_t pawn) {
     if (controller < 0x10000 || pawn < 0x10000) return false;
     int32_t pawnOffset = -1;

@@ -40,6 +40,7 @@ public:
     bool IsHookActive() const { return m_hookInstalled.load(std::memory_order_acquire); }
     uint64_t GetOverrideCount() const { return m_overrideCount.load(std::memory_order_relaxed); }
     PlayerIdentitySnapshot GetPlayerIdentity();
+    bool IsVehicleTerminalUiActive() const;
     bool RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_t pawn);
 
 private:

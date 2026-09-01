@@ -125,6 +125,9 @@ private:
     std::atomic<float> m_renderAspect{1.0f};
     uint64_t m_frameCount = 0;
     uint32_t m_missingTicketPresents = 0;
+    uint32_t m_theaterRecoveryTickets = 0;
+    uint32_t m_terminalMissingWeaponPresents = 0;
+    bool m_theaterFallbackActive = false;
     bool m_hasSubmittedStereoProjection = false;
     uint64_t m_lastNativeMultiviewGeneration = 0;
     bool m_submittingNativeEyes = false;

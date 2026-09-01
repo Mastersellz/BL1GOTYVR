@@ -38,6 +38,9 @@ void FrameLoop::Initialize() {
     m_desktopDuplicationUnavailable = false;
     m_frameCount = 0;
     m_missingTicketPresents = 0;
+    m_theaterRecoveryTickets = 0;
+    m_terminalMissingWeaponPresents = 0;
+    m_theaterFallbackActive = false;
     m_hasSubmittedStereoProjection = false;
     AcquireSRWLockExclusive(&m_steamSubmissionLock);
     m_steamSubmittedViewsValid = false;
@@ -195,6 +198,9 @@ bool FrameLoop::PrepareForOpenXRRecovery() {
     m_poseSeeded = false;
     m_hasSubmittedStereoProjection = false;
     m_missingTicketPresents = 0;
+    m_theaterRecoveryTickets = 0;
+    m_terminalMissingWeaponPresents = 0;
+    m_theaterFallbackActive = false;
     m_submissionViewsValid = false;
     AcquireSRWLockExclusive(&m_steamSubmissionLock);
     m_steamSubmittedViewsValid = false;
@@ -2048,7 +2054,6 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         input::InputHook::Instance().UpdateState(xr.GetPredictedDisplayTime());
     StereoRenderTicket renderedTicket = {};
     const bool hasRenderedTicket = ConsumeRenderedTicket(renderedTicket);
-    if (hasRenderedTicket) m_missingTicketPresents = 0;
 
     if (hasRenderedTicket && !camera::ConsumeRenderPoseAcknowledgement(
             renderedTicket.pairSerial, renderedTicket.eye)) {
@@ -2062,11 +2067,65 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         }
     }
 
+    auto& weaponAim = input::WeaponAimSystem::Instance();
+    const bool explicitVehicleTerminalUi = weaponAim.IsVehicleTerminalUiActive();
+    const input::PlayerIdentitySnapshot identity = weaponAim.GetPlayerIdentity();
+    const bool missingWeaponTerminalCandidate = identity.pawnValid &&
+        !identity.weaponValid && !camera::IsVehicleCameraActive();
+    if (explicitVehicleTerminalUi) {
+        m_terminalMissingWeaponPresents = 12;
+    } else if (missingWeaponTerminalCandidate) {
+        if (m_terminalMissingWeaponPresents < 12)
+            ++m_terminalMissingWeaponPresents;
+    } else {
+        m_terminalMissingWeaponPresents = 0;
+    }
+    const bool vehicleTerminalUi = explicitVehicleTerminalUi ||
+        m_terminalMissingWeaponPresents >= 12;
+    if (vehicleTerminalUi) {
+        if (!m_theaterFallbackActive) {
+            m_theaterFallbackActive = true;
+            m_missingTicketPresents = 0;
+            Log("[FrameLoop] Vehicle terminal UI detected; stable eye-1 flat submission latched "
+                "(explicit=%d)", explicitVehicleTerminalUi ? 1 : 0);
+        }
+        m_theaterRecoveryTickets = 0;
+        // UE3's final AER pass owns the freshest mono UI. Updating the quad
+        // from both passes can alternate terminal content at headset rate.
+        if (!hasRenderedTicket || renderedTicket.eye == 1)
+            TrySubmitTheaterFrame(device, context, swapChain);
+        ++m_frameCount;
+        g_currentEye = -1;
+        return;
+    }
+
+    constexpr uint32_t kTheaterExitStableTickets = 30;
+    if (hasRenderedTicket && m_theaterFallbackActive) {
+        ++m_theaterRecoveryTickets;
+        const bool stablePairBoundary =
+            m_theaterRecoveryTickets >= kTheaterExitStableTickets &&
+            renderedTicket.eye == 1;
+        if (!stablePairBoundary) {
+            TrySubmitTheaterFrame(device, context, swapChain);
+            ++m_frameCount;
+            g_currentEye = -1;
+            return;
+        }
+        Log("[FrameLoop] Theater fallback ended after %u stable render tickets",
+            m_theaterRecoveryTickets);
+        m_theaterFallbackActive = false;
+        m_theaterRecoveryTickets = 0;
+        m_missingTicketPresents = 0;
+    } else if (hasRenderedTicket) {
+        m_missingTicketPresents = 0;
+    }
+
     // Seed one pose before the first pair. After that, a missing camera tag
     // leaves the last complete pair with the compositor instead of submitting
     // a zero-layer frame that flashes the environment or black.
     if (!hasRenderedTicket) {
         ++m_missingTicketPresents;
+        m_theaterRecoveryTickets = 0;
         xr.PollSessionEvents();
         if (!m_poseSeeded && xr.WaitForFrame() && xr.BeginFrame()) {
             input::InputHook::Instance().UpdateState(xr.GetPredictedDisplayTime());
@@ -2078,6 +2137,12 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         if (m_poseSeeded && m_hasSubmittedStereoProjection &&
             m_missingTicketPresents >= kTheaterEntryDelay) {
             const bool submitted = TrySubmitTheaterFrame(device, context, swapChain);
+            if (submitted && !m_theaterFallbackActive) {
+                m_theaterFallbackActive = true;
+                m_theaterRecoveryTickets = 0;
+                ResetStereoPair();
+                Log("[FrameLoop] Theater fallback latched until stereo stabilizes");
+            }
             if (submitted && (m_missingTicketPresents == kTheaterEntryDelay ||
                               m_missingTicketPresents % 300 == 0)) {
                 Log("[FrameLoop] Loading/cinematic theater submitted "
