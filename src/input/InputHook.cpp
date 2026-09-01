@@ -1051,6 +1051,8 @@ void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
         }
     }
     bool loaded = false;
+    bool inheritedBrickProfile = false;
+    uint64_t inheritedBrickKey = 0;
     if (!selected) {
         for (auto& profile : m_weaponAimProfiles) {
             if (!profile.valid) {
@@ -1074,6 +1076,21 @@ void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
                                                    selected->offsetForward,
                                                    selected->offsetRight,
                                                    selected->offsetUp);
+            if (!loaded && characterMeshName &&
+                strcmp(characterMeshName, "hands_brick") != 0) {
+                inheritedBrickKey = HashWeaponProfileName(
+                    "hands_brick", outerName, meshName);
+                inheritedBrickProfile = config::LoadWeaponAimProfile(
+                    inheritedBrickKey, selected->pitch, selected->yaw,
+                    selected->roll, selected->offsetForward,
+                    selected->offsetRight, selected->offsetUp);
+                if (inheritedBrickProfile) {
+                    loaded = config::SaveWeaponAimProfile(
+                        stableKey, selected->pitch, selected->yaw, selected->roll,
+                        selected->offsetForward, selected->offsetRight,
+                        selected->offsetUp, meshName);
+                }
+            }
         }
         if (meshName && *meshName) strcpy_s(selected->name, meshName);
         else strcpy_s(selected->name, "runtime_weapon");
@@ -1104,13 +1121,14 @@ void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
     memset(m_aimTuningNextRepeatMs, 0, sizeof(m_aimTuningNextRepeatMs));
     Log("[Input] Weapon aim profile active: key=%016llX weapon=%p component=%p "
         "name=%s character=%s pitch=%.2f yaw=%.2f roll=%.2f "
-        "offset=(%.2f,%.2f,%.2f) storage=%s loaded=%d",
+        "offset=(%.2f,%.2f,%.2f) storage=%s loaded=%d inheritedBrick=%d source=%016llX",
         static_cast<unsigned long long>(selected->stableKey),
         reinterpret_cast<void*>(weapon), reinterpret_cast<void*>(component),
         selected->name, characterMeshName ? characterMeshName : "",
         selected->pitch, selected->yaw, selected->roll,
         selected->offsetForward, selected->offsetRight, selected->offsetUp,
-        selected->persistent ? "ini" : "session", loaded);
+        selected->persistent ? "ini" : "session", loaded,
+        inheritedBrickProfile, static_cast<unsigned long long>(inheritedBrickKey));
 }
 
 void InputHook::ApplyRightHand(int eye) {

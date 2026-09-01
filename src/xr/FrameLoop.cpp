@@ -2133,9 +2133,8 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
             xr.EndFrame(false);
             StartWaitWorker();
         }
-        constexpr uint32_t kTheaterEntryDelay = 30;
-        if (m_poseSeeded && m_hasSubmittedStereoProjection &&
-            m_missingTicketPresents >= kTheaterEntryDelay) {
+        constexpr uint32_t kTheaterEntryDelay = 2;
+        if (m_poseSeeded && m_missingTicketPresents >= kTheaterEntryDelay) {
             const bool submitted = TrySubmitTheaterFrame(device, context, swapChain);
             if (submitted && !m_theaterFallbackActive) {
                 m_theaterFallbackActive = true;
@@ -2145,8 +2144,10 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
             }
             if (submitted && (m_missingTicketPresents == kTheaterEntryDelay ||
                               m_missingTicketPresents % 300 == 0)) {
-                Log("[FrameLoop] Loading/cinematic theater submitted "
-                    "(missing tickets=%u)", m_missingTicketPresents);
+                Log("[FrameLoop] Startup/loading theater submitted "
+                    "(missing tickets=%u stereoPreviouslySubmitted=%d)",
+                    m_missingTicketPresents,
+                    m_hasSubmittedStereoProjection ? 1 : 0);
             }
         }
         ++m_frameCount;
