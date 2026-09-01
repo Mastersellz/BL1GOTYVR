@@ -1709,8 +1709,9 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
     }
     best.lastPoseHash = poseHash;
     best.lastObservedUpdate = observedUpdate;
-    best.valid = best.validationObservations >= 8 &&
-        (best.validationChanges >= 4 || best.validationUpdates >= 6);
+    best.valid = observedUpdate >= 6 ||
+        (best.validationObservations >= 8 &&
+         (best.validationChanges >= 4 || best.validationUpdates >= 6));
     *m_rig = best;
     ReleaseSRWLockExclusive(&m_rigLock);
     Log("[ArmIK] Rig candidate: validated=%d observations=%u changes=%u updates=%u "

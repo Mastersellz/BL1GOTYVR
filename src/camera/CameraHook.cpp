@@ -2075,6 +2075,14 @@ static void UpdateVehicleLifecycleFast(const CameraInfo& camera) {
 
     if (strstr(pawnClass, "WillowPlayerPawn") != nullptr) {
         if (!activeVehicle) {
+            const input::PlayerIdentitySnapshot before =
+                input::WeaponAimSystem::Instance().GetPlayerIdentity();
+            input::WeaponAimSystem::Instance().RefreshIdentityFromLivePawn(
+                camera.controllerAddress, livePawn);
+            const input::PlayerIdentitySnapshot after =
+                input::WeaponAimSystem::Instance().GetPlayerIdentity();
+            if (after.generation != before.generation)
+                player::ArmIKSystem::Instance().RequestInventoryScan();
             const uint64_t recoveryUntil = s_vehicleExitRecoveryUntilMs.load(
                 std::memory_order_acquire);
             if (recoveryUntil && GetTickCount64() < recoveryUntil &&

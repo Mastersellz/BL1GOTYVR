@@ -849,22 +849,21 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
     const bool identityChanged =
         m_pawnIdentityValid.load(std::memory_order_acquire) != pawnValid ||
         m_weaponIdentityValid.load(std::memory_order_acquire) != weaponValid ||
-        m_localController.load(std::memory_order_acquire) !=
-            (pawnValid ? controllerAddress : 0) ||
+        m_localController.load(std::memory_order_acquire) != controllerAddress ||
         m_localPawn.load(std::memory_order_acquire) != (pawnValid ? pawn : 0) ||
         m_localWeapon.load(std::memory_order_acquire) != (weaponValid ? weapon : 0);
     m_getAdjustedAimName.store(aimNameToken, std::memory_order_release);
     m_getAdjustedAimFunction.store(getAdjustedAim, std::memory_order_release);
     m_getAdjustedAimOwnerClass.store(aimOwner, std::memory_order_release);
-    m_localController.store(pawnValid ? controllerAddress : 0, std::memory_order_release);
+    m_localController.store(controllerAddress, std::memory_order_release);
     m_localPawn.store(pawnValid ? pawn : 0, std::memory_order_release);
     m_localWeapon.store(weaponValid ? weapon : 0, std::memory_order_release);
     m_pawnIdentityValid.store(pawnValid, std::memory_order_release);
     m_weaponIdentityValid.store(weaponValid, std::memory_order_release);
-    m_pawnPropertyOffset = pawnValid ? pawnOffset : -1;
-    m_controllerPropertyOffset = pawnValid ? controllerOffset : -1;
-    m_weaponPropertyOffset = weaponOffsetsValid ? weaponOffset : -1;
-    m_ownerPropertyOffset = weaponOffsetsValid ? ownerOffset : -1;
+    if (pawnOffset > 0) m_pawnPropertyOffset = pawnOffset;
+    if (controllerOffset > 0) m_controllerPropertyOffset = controllerOffset;
+    if (weaponOffset > 0) m_weaponPropertyOffset = weaponOffset;
+    if (ownerOffset > 0) m_ownerPropertyOffset = ownerOffset;
     const uint64_t identityGeneration = identityChanged
         ? m_identityGeneration.fetch_add(1, std::memory_order_acq_rel) + 1
         : m_identityGeneration.load(std::memory_order_acquire);
@@ -888,7 +887,12 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
         pawnOffset, controllerOffset, weaponOffset, ownerOffset);
 
     InstallNativeAimProbe(moduleBase, moduleSize);
-    if (getAdjustedAim && weaponValid) {
+    if (!m_scriptInvokeInstalled.load(std::memory_order_acquire)) {
+        for (size_t index = 0; index < aimCandidateCount; ++index) {
+            if (InstallScriptInvokeProbe(
+                    aimCandidates[index].function, moduleBase, moduleSize)) break;
+        }
+    } else if (getAdjustedAim && weaponValid) {
         InstallScriptInvokeProbe(getAdjustedAim, moduleBase, moduleSize);
     }
     Log("[WeaponAim] Ballistic path: script=%d override=%d aimFunction=%p",
@@ -1096,8 +1100,12 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
     weaponOffset = m_weaponPropertyOffset;
     ownerOffset = m_ownerPropertyOffset;
     ReleaseSRWLockShared(&m_identityLock);
-    if (pawnOffset <= 0 || controllerOffset <= 0 || weaponOffset <= 0 || ownerOffset <= 0)
-        return false;
+    // Reflected and runtime-validated for this fixed BL1 GOTY Enhanced build.
+    // They let live identity publish immediately while the async scanner catches up.
+    if (pawnOffset <= 0) pawnOffset = 0x260;
+    if (controllerOffset <= 0) controllerOffset = 0x26C;
+    if (weaponOffset <= 0) weaponOffset = 0x584;
+    if (ownerOffset <= 0) ownerOffset = 0xD4;
 
     uintptr_t publishedPawn = 0;
     uintptr_t publishedController = 0;
@@ -1106,30 +1114,38 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
     if (!ReadMem(controller + static_cast<uintptr_t>(pawnOffset),
                  &publishedPawn, sizeof(publishedPawn)) || publishedPawn != pawn ||
         !ReadMem(pawn + static_cast<uintptr_t>(controllerOffset),
-                 &publishedController, sizeof(publishedController)) ||
-        publishedController != controller ||
-        !ReadMem(pawn + static_cast<uintptr_t>(weaponOffset), &weapon, sizeof(weapon)) ||
-        weapon < 0x10000 ||
-        !ReadMem(weapon + static_cast<uintptr_t>(ownerOffset), &owner, sizeof(owner)) ||
-        owner != pawn) return false;
+                  &publishedController, sizeof(publishedController)) ||
+        publishedController != controller) return false;
 
     const camera::UE3Globals globals = camera::GetUE3GlobalsSnapshot();
     TArray64 names = {};
+    uintptr_t pawnClass = 0;
     uintptr_t weaponClass = 0;
+    char pawnName[128] = {};
+    char pawnClassName[128] = {};
     char weaponName[128] = {};
     char weaponClassName[128] = {};
     if (!globals.gNamesValid ||
         !ReadMem(globals.gNamesAddress, &names, sizeof(names)) ||
-        !ValidateRuntimeObject(globals, names, weapon, "Weapon", weaponClass,
-                               weaponName, sizeof(weaponName), weaponClassName,
-                               sizeof(weaponClassName))) return false;
+        !ValidateRuntimeObject(globals, names, pawn, "Pawn", pawnClass,
+                               pawnName, sizeof(pawnName), pawnClassName,
+                               sizeof(pawnClassName))) return false;
+    const bool weaponValid =
+        ReadMem(pawn + static_cast<uintptr_t>(weaponOffset), &weapon, sizeof(weapon)) &&
+        weapon >= 0x10000 &&
+        ReadMem(weapon + static_cast<uintptr_t>(ownerOffset), &owner, sizeof(owner)) &&
+        owner == pawn &&
+        ValidateRuntimeObject(globals, names, weapon, "Weapon", weaponClass,
+                              weaponName, sizeof(weaponName), weaponClassName,
+                              sizeof(weaponClassName));
+    if (!weaponValid) weapon = 0;
 
     bool changed = false;
     uintptr_t selectedAimFunction = 0;
     uintptr_t selectedAimOwner = 0;
     uint64_t selectedAimName = 0;
     int selectedAimOwnerDistance = 65;
-    const bool selectedAimCompatible = SelectCachedAimFunction(
+    const bool selectedAimCompatible = weaponValid && SelectCachedAimFunction(
         weaponClass, selectedAimFunction, selectedAimOwner,
         selectedAimName, selectedAimOwnerDistance);
     AcquireSRWLockExclusive(&m_identityLock);
@@ -1137,12 +1153,16 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
         m_localPawn.load(std::memory_order_acquire) != pawn ||
         m_localWeapon.load(std::memory_order_acquire) != weapon ||
         !m_pawnIdentityValid.load(std::memory_order_acquire) ||
-        !m_weaponIdentityValid.load(std::memory_order_acquire);
+        m_weaponIdentityValid.load(std::memory_order_acquire) != weaponValid;
     m_localController.store(controller, std::memory_order_release);
     m_localPawn.store(pawn, std::memory_order_release);
     m_localWeapon.store(weapon, std::memory_order_release);
     m_pawnIdentityValid.store(true, std::memory_order_release);
-    m_weaponIdentityValid.store(true, std::memory_order_release);
+    m_weaponIdentityValid.store(weaponValid, std::memory_order_release);
+    m_pawnPropertyOffset = pawnOffset;
+    m_controllerPropertyOffset = controllerOffset;
+    m_weaponPropertyOffset = weaponOffset;
+    m_ownerPropertyOffset = ownerOffset;
     m_getAdjustedAimName.store(selectedAimCompatible ? selectedAimName : 0,
                                std::memory_order_release);
     m_getAdjustedAimFunction.store(selectedAimCompatible ? selectedAimFunction : 0,
@@ -1153,13 +1173,15 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
     if (changed) m_scriptInvokeAimCalls.store(0, std::memory_order_release);
     const uint64_t generation = m_identityGeneration.load(std::memory_order_acquire);
     ReleaseSRWLockExclusive(&m_identityLock);
-    Log("[WeaponAim] Fast identity refreshed: controller=%p pawn=%p weapon=%p(%s/%s) "
-        "generation=%llu aimCompatible=%d ownerDistance=%d",
-        reinterpret_cast<void*>(controller),
-        reinterpret_cast<void*>(pawn), reinterpret_cast<void*>(weapon), weaponName,
-        weaponClassName, static_cast<unsigned long long>(generation),
-        selectedAimCompatible, selectedAimOwnerDistance);
-    return true;
+    if (changed) {
+        Log("[WeaponAim] Fast identity refreshed: controller=%p pawn=%p(%s/%s) "
+            "weapon=%p(%s/%s) generation=%llu aimCompatible=%d ownerDistance=%d",
+            reinterpret_cast<void*>(controller), reinterpret_cast<void*>(pawn),
+            pawnName, pawnClassName, reinterpret_cast<void*>(weapon), weaponName,
+            weaponClassName, static_cast<unsigned long long>(generation),
+            selectedAimCompatible, selectedAimOwnerDistance);
+    }
+    return weaponValid;
 }
 
 void WeaponAimSystem::Shutdown() {
