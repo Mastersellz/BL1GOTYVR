@@ -930,6 +930,10 @@ void ArmIKSystem::RequestRescan() {
     m_inventory = {};
     m_inventory.generation = nextInventoryGeneration;
     ReleaseSRWLockExclusive(&m_inventoryLock);
+    AcquireSRWLockExclusive(&m_observedWeaponCacheLock);
+    m_observedWeaponCacheKey = 0;
+    m_observedWeaponCache = {};
+    ReleaseSRWLockExclusive(&m_observedWeaponCacheLock);
     m_scanEpoch.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&m_scanResetLock);
     Log("[ArmIK] Rig rescan requested");
@@ -979,6 +983,88 @@ bool ArmIKSystem::FindObservedVehicleComponent(uintptr_t vehicle,
         return component >= 0x10000;
     }
     return false;
+}
+
+bool ArmIKSystem::FindObservedWeaponComponent(
+        uintptr_t weapon, ComponentInventoryEntry& output) const {
+    output = {};
+    if (weapon < 0x10000) return false;
+    AcquireSRWLockShared(&m_observedWeaponCacheLock);
+    if (m_observedWeaponCacheKey == weapon &&
+        m_observedWeaponCache.component >= 0x10000) {
+        output = m_observedWeaponCache;
+        ReleaseSRWLockShared(&m_observedWeaponCacheLock);
+        return true;
+    }
+    ReleaseSRWLockShared(&m_observedWeaponCacheLock);
+    const camera::UE3Globals globals = camera::GetUE3GlobalsSnapshot();
+    if (!globals.gNamesValid || globals.gObjectNameOffset < 8 ||
+        globals.gObjectClassOffset < 0) return false;
+
+    bool found = false;
+    for (size_t index = 0; index < m_observedComponents.size(); ++index) {
+        const uintptr_t component = m_observedComponents[index].load(
+            std::memory_order_acquire);
+        if (component < 0x10000 || !OuterChainContains(globals, component, weapon))
+            continue;
+
+        ComponentInventoryEntry candidate;
+        if (!ReadClassName(globals, component, candidate.className,
+                           sizeof(candidate.className)) ||
+            strstr(candidate.className, "SkeletalMeshComponent") == nullptr)
+            continue;
+        float localToWorld[16] = {};
+        constexpr int kPrimitiveLocalToWorldOffset = 0xA0;
+        if (!ReadMemory(component + kPrimitiveLocalToWorldOffset,
+                        localToWorld, sizeof(localToWorld)) ||
+            !ValidateMatrix(localToWorld)) continue;
+
+        candidate.role = ComponentRole::ProtectedWeapon;
+        candidate.component = component;
+        candidate.localToWorldOffset = kPrimitiveLocalToWorldOffset;
+        candidate.updateCount = m_observedComponentUpdates[index].load(
+            std::memory_order_acquire);
+        candidate.exactWeaponOuter = true;
+        candidate.conservativeWeaponEvidence = true;
+        ReadMemory(component + globals.gObjectClassOffset,
+                   &candidate.classObject, sizeof(candidate.classObject));
+        ReadMemory(component + globals.gObjectNameOffset,
+                   &candidate.objectNameToken, sizeof(candidate.objectNameToken));
+        ReadObjectName(globals, component, candidate.objectName,
+                       sizeof(candidate.objectName));
+        ReadMemory(component + globals.gObjectNameOffset - 8,
+                   &candidate.outer, sizeof(candidate.outer));
+        if (candidate.outer)
+            ReadObjectName(globals, candidate.outer, candidate.outerName,
+                           sizeof(candidate.outerName));
+
+        for (int pointerOffset = 0x80; pointerOffset <= 0x700; pointerOffset += 4) {
+            uintptr_t mesh = 0;
+            char meshClass[128] = {};
+            if (!ReadMemory(component + pointerOffset, &mesh, sizeof(mesh)) || !mesh ||
+                !ReadClassName(globals, mesh, meshClass, sizeof(meshClass))) continue;
+            const std::string meshClassLower = Lower(meshClass);
+            if (meshClassLower.find("skeletalmesh") == std::string::npos ||
+                meshClassLower.find("component") != std::string::npos) continue;
+            candidate.skeletalMesh = mesh;
+            candidate.skeletalMeshOffset = pointerOffset;
+            ReadObjectName(globals, mesh, candidate.meshName,
+                           sizeof(candidate.meshName));
+            break;
+        }
+        if (!candidate.skeletalMesh) continue;
+        if (!found || candidate.updateCount > output.updateCount) {
+            output = candidate;
+            found = true;
+        }
+    }
+    if (found) {
+        AcquireSRWLockExclusive(&m_observedWeaponCacheLock);
+        m_observedWeaponCacheKey = weapon;
+        m_observedWeaponCache = output;
+        ReleaseSRWLockExclusive(&m_observedWeaponCacheLock);
+    }
+    return found;
 }
 
 DWORD WINAPI ArmIKSystem::DiscoveryThreadProc(void* context) {

@@ -124,6 +124,8 @@ public:
     bool GetNativeRightHandSnapshot(NativeRightHandSnapshot& snapshot) const;
     ComponentInventoryStatus GetComponentInventory() const;
     bool FindObservedVehicleComponent(uintptr_t vehicle, uintptr_t& component) const;
+    bool FindObservedWeaponComponent(uintptr_t weapon,
+                                     ComponentInventoryEntry& entry) const;
 
 private:
     ArmIKSystem() = default;
@@ -191,6 +193,9 @@ private:
     mutable SRWLOCK m_targetLock = SRWLOCK_INIT;
     mutable SRWLOCK m_inventoryLock = SRWLOCK_INIT;
     ComponentInventoryStatus m_inventory;
+    mutable SRWLOCK m_observedWeaponCacheLock = SRWLOCK_INIT;
+    mutable uintptr_t m_observedWeaponCacheKey = 0;
+    mutable ComponentInventoryEntry m_observedWeaponCache;
     RoomScaleBody m_roomScaleBody;
     uint64_t m_lastRoomScaleUpdateMs = 0;
     uint64_t m_roomScaleCalibrationStartedMs = 0;

@@ -1965,6 +1965,20 @@ static DWORD WINAPI ScannerThread(LPVOID) {
             const bool armIkEnabled = player::ArmIKSystem::Instance().IsEnabled();
             s_vehicleArmIkWasEnabled.store(armIkEnabled, std::memory_order_release);
             if (armIkEnabled) player::ArmIKSystem::Instance().SetEnabled(false);
+            const CameraInfo current = GetCameraSnapshot();
+            const uintptr_t vehicle = s_vehiclePawn.load(std::memory_order_acquire);
+            if (current.found && current.controllerAddress && vehicle) {
+                if (input::WeaponAimSystem::Instance().RefreshIdentityFromLivePawn(
+                        current.controllerAddress, vehicle)) {
+                    Log("[VehicleCamera] Ballistic identity refreshed on entry");
+                } else {
+                    input::WeaponAimSystem::Instance().Discover(
+                        &s_globals, current.controllerAddress,
+                        reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll),
+                        modInfo.SizeOfImage);
+                    Log("[VehicleCamera] Ballistic identity fallback scan completed");
+                }
+            }
         }
         if (s_visibilityInventoryRefreshRequested.exchange(
                 false, std::memory_order_acq_rel)) {
@@ -2127,8 +2141,11 @@ static void UpdateVehicleLifecycleFast(const CameraInfo& camera) {
         s_vehicleArmIkWasEnabled.store(armIkEnabled, std::memory_order_release);
         s_vehiclePawn.store(livePawn, std::memory_order_release);
         s_vehicleExitCandidateSinceMs.store(0, std::memory_order_release);
-        Log("[VehicleCamera] Fast vehicle state entered: vehicle=%p",
-            reinterpret_cast<void*>(livePawn));
+        const bool ballisticReady =
+            input::WeaponAimSystem::Instance().RefreshIdentityFromLivePawn(
+                camera.controllerAddress, livePawn);
+        Log("[VehicleCamera] Fast vehicle state entered: vehicle=%p ballistic=%d",
+            reinterpret_cast<void*>(livePawn), ballisticReady);
     }
 
     uintptr_t component = 0;

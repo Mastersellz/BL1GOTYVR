@@ -1195,18 +1195,21 @@ void InputHook::ApplyRightHand(int eye) {
         return;
     }
 
-    const auto inventory = player::ArmIKSystem::Instance().GetComponentInventory();
+    auto inventory = player::ArmIKSystem::Instance().GetComponentInventory();
     const auto identity = WeaponAimSystem::Instance().GetPlayerIdentity();
-    const bool identityMatches = identity.pawnValid && identity.weaponValid &&
+    bool identityMatches = identity.pawnValid && identity.weaponValid &&
         inventory.pawnIdentityValid && inventory.weaponIdentityValid &&
         identity.controller == inventory.controller && identity.pawn == inventory.pawn &&
         identity.weapon == inventory.weapon;
     if (!identityMatches) {
-        if (identity.generation != m_lastWeaponRefreshGeneration) {
+        const bool identityGenerationChanged =
+            identity.generation != m_lastWeaponRefreshGeneration;
+        if (identityGenerationChanged) {
             m_lastWeaponRefreshGeneration = identity.generation;
-            camera::RequestPlayerIdentityRefresh();
+            if (!identity.pawnValid || !identity.weaponValid)
+                camera::RequestPlayerIdentityRefresh();
             player::ArmIKSystem::Instance().RequestInventoryScan();
-            Log("[WeaponPose] Identity mismatch; visual write deferred: "
+            Log("[WeaponPose] Identity mismatch; inventory refresh requested: "
                 "identity=%p/%p inventory=%p/%p generation=%llu",
                 reinterpret_cast<void*>(identity.pawn),
                 reinterpret_cast<void*>(identity.weapon),
@@ -1214,7 +1217,47 @@ void InputHook::ApplyRightHand(int eye) {
                 reinterpret_cast<void*>(inventory.weapon),
                 static_cast<unsigned long long>(identity.generation));
         }
-        return;
+        player::ComponentInventoryEntry observedWeapon;
+        if (identity.pawnValid && identity.weaponValid &&
+            player::ArmIKSystem::Instance().FindObservedWeaponComponent(
+                identity.weapon, observedWeapon)) {
+            player::ComponentInventoryStatus fastInventory;
+            fastInventory.controller = identity.controller;
+            fastInventory.pawn = identity.pawn;
+            fastInventory.weapon = identity.weapon;
+            fastInventory.pawnIdentityValid = true;
+            fastInventory.weaponIdentityValid = true;
+            bool preservedArms = false;
+            if (inventory.pawn == identity.pawn) {
+                for (size_t index = 0; index < inventory.count; ++index) {
+                    const auto& entry = inventory.entries[index];
+                    if (!entry.exactPawnOuter ||
+                        entry.role == player::ComponentRole::ProtectedWeapon) continue;
+                    if (fastInventory.count < fastInventory.entries.size())
+                        fastInventory.entries[fastInventory.count++] = entry;
+                    preservedArms = preservedArms ||
+                        entry.role == player::ComponentRole::ProbableFirstPersonArms;
+                }
+            }
+            if (preservedArms && fastInventory.count < fastInventory.entries.size()) {
+                fastInventory.entries[fastInventory.count++] = observedWeapon;
+                fastInventory.weaponComponentCount = 1;
+                inventory = fastInventory;
+                identityMatches = true;
+                if (identityGenerationChanged) {
+                    Log("[WeaponPose] Observed weapon component resolved immediately: "
+                        "weapon=%p component=%p updates=%llu",
+                        reinterpret_cast<void*>(identity.weapon),
+                        reinterpret_cast<void*>(observedWeapon.component),
+                        static_cast<unsigned long long>(observedWeapon.updateCount));
+                }
+            }
+        }
+        if (!identityMatches) {
+            if (identityGenerationChanged)
+                Log("[WeaponPose] Visual write deferred until the new component is observed");
+            return;
+        }
     }
     m_lastWeaponRefreshGeneration = identity.generation;
     const player::ComponentInventoryEntry* active = nullptr;
@@ -1278,15 +1321,12 @@ void InputHook::ApplyRightHand(int eye) {
         m_weaponGripValid = false;
         m_mountIdentityGeneration = 0;
         m_weaponPoseActive.store(false, std::memory_order_release);
-        Log("[WeaponPose] Waiting briefly for native mount: generation=%llu "
+        Log("[WeaponPose] Weapon identity switched: generation=%llu "
             "weapon=%p component=%p",
             static_cast<unsigned long long>(identity.generation),
             reinterpret_cast<void*>(inventory.weapon),
             reinterpret_cast<void*>(active->component));
-        return;
     }
-    constexpr uint64_t kNativeMountSettleMs = 100;
-    if (now - m_weaponIdentityStableSinceMs < kNativeMountSettleMs) return;
     ActivateWeaponAimProfile(inventory.pawn, inventory.weapon,
                              characterMeshName, active->outerName,
                              active->meshName, active->component);
@@ -1296,6 +1336,22 @@ void InputHook::ApplyRightHand(int eye) {
         m_weaponAimProfiles[m_activeWeaponAimProfile].valid) {
         stableMountKey = m_weaponAimProfiles[m_activeWeaponAimProfile].stableKey;
     }
+    bool reusableMountAvailable = false;
+    for (const auto& entry : m_weaponMountCache) {
+        if (entry.valid && entry.pawn == inventory.pawn &&
+            entry.weapon == inventory.weapon && entry.component == active->component &&
+            entry.skeletalMesh == active->skeletalMesh) {
+            reusableMountAvailable = true;
+            break;
+        }
+    }
+    float persistedAbsoluteMount[16] = {};
+    if (!reusableMountAvailable && stableMountKey)
+        reusableMountAvailable = config::LoadAbsoluteWeaponMount(
+            stableMountKey, persistedAbsoluteMount);
+    constexpr uint64_t kNativeMountSettleMs = 100;
+    if (!reusableMountAvailable &&
+        now - m_weaponIdentityStableSinceMs < kNativeMountSettleMs) return;
 
     WeaponComponent& weapon = m_components[0];
     weapon = {};

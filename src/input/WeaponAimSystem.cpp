@@ -43,6 +43,17 @@ struct TArray64 {
     int32_t capacity = 0;
 };
 
+struct AimFunctionCandidate {
+    uintptr_t function = 0;
+    uintptr_t owner = 0;
+    uint64_t nameToken = 0;
+};
+
+static AimFunctionCandidate s_aimFunctionCandidates[128] = {};
+static size_t s_aimFunctionCandidateCount = 0;
+static bool s_aimFunctionCacheValid = false;
+static SRWLOCK s_aimFunctionCacheLock = SRWLOCK_INIT;
+
 bool ReadMem(uintptr_t address, void* output, size_t size) {
     SIZE_T read = 0;
     return address >= 0x10000 && ReadProcessMemory(GetCurrentProcess(),
@@ -134,6 +145,40 @@ int ClassDistance(uintptr_t derivedClass, uintptr_t targetClass) {
         current = superClass;
     }
     return -1;
+}
+
+bool SelectCachedAimFunction(uintptr_t weaponClass, uintptr_t& function,
+                             uintptr_t& owner, uint64_t& nameToken,
+                             int& ownerDistance) {
+    function = 0;
+    owner = 0;
+    nameToken = 0;
+    ownerDistance = 65;
+    bool ambiguous = false;
+    AcquireSRWLockShared(&s_aimFunctionCacheLock);
+    if (s_aimFunctionCacheValid) {
+        for (size_t index = 0; index < s_aimFunctionCandidateCount; ++index) {
+            const auto& candidate = s_aimFunctionCandidates[index];
+            const int distance = ClassDistance(weaponClass, candidate.owner);
+            if (distance < 0 || distance > ownerDistance) continue;
+            if (distance < ownerDistance) {
+                ownerDistance = distance;
+                function = candidate.function;
+                owner = candidate.owner;
+                nameToken = candidate.nameToken;
+                ambiguous = false;
+            } else if (candidate.function != function) {
+                ambiguous = true;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&s_aimFunctionCacheLock);
+    if (ambiguous) {
+        function = 0;
+        owner = 0;
+        nameToken = 0;
+    }
+    return function != 0 && nameToken != 0;
 }
 
 bool ClassDerivesFrom(const camera::UE3Globals& globals, const TArray64& names,
@@ -673,11 +718,6 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
         !ReadMem(globals.gObjectsAddress, &objects, sizeof(objects)))
         return;
 
-    struct AimFunctionCandidate {
-        uintptr_t function = 0;
-        uintptr_t owner = 0;
-        uint64_t nameToken = 0;
-    };
     AimFunctionCandidate aimCandidates[128] = {};
     size_t aimCandidateCount = 0;
     size_t totalAimCandidateCount = 0;
@@ -774,20 +814,17 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
     uintptr_t aimOwner = 0;
     bool aimSelectionAmbiguous = false;
     const bool aimCandidatesTruncated = totalAimCandidateCount > aimCandidateCount;
+    AcquireSRWLockExclusive(&s_aimFunctionCacheLock);
+    s_aimFunctionCandidateCount = aimCandidatesTruncated ? 0 : aimCandidateCount;
+    if (!aimCandidatesTruncated && aimCandidateCount)
+        memcpy(s_aimFunctionCandidates, aimCandidates,
+               aimCandidateCount * sizeof(AimFunctionCandidate));
+    s_aimFunctionCacheValid = !aimCandidatesTruncated && aimCandidateCount != 0;
+    ReleaseSRWLockExclusive(&s_aimFunctionCacheLock);
     if (weaponValid && !aimCandidatesTruncated) {
-        for (size_t index = 0; index < aimCandidateCount; ++index) {
-            const int distance = ClassDistance(weaponClass, aimCandidates[index].owner);
-            if (distance < 0 || distance > bestAimOwnerDistance) continue;
-            if (distance < bestAimOwnerDistance) {
-                bestAimOwnerDistance = distance;
-                getAdjustedAim = aimCandidates[index].function;
-                aimOwner = aimCandidates[index].owner;
-                aimNameToken = aimCandidates[index].nameToken;
-                aimSelectionAmbiguous = false;
-            } else if (aimCandidates[index].function != getAdjustedAim) {
-                aimSelectionAmbiguous = true;
-            }
-        }
+        if (!SelectCachedAimFunction(weaponClass, getAdjustedAim, aimOwner,
+                                     aimNameToken, bestAimOwnerDistance))
+            aimSelectionAmbiguous = true;
     }
     if (aimSelectionAmbiguous) {
         getAdjustedAim = 0;
@@ -1068,12 +1105,13 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
                                sizeof(weaponClassName))) return false;
 
     bool changed = false;
-    const uintptr_t selectedAimFunction =
-        m_getAdjustedAimFunction.load(std::memory_order_acquire);
-    const uintptr_t selectedAimOwner =
-        m_getAdjustedAimOwnerClass.load(std::memory_order_acquire);
-    const bool selectedAimCompatible = selectedAimFunction == 0 ||
-        ClassDistance(weaponClass, selectedAimOwner) >= 0;
+    uintptr_t selectedAimFunction = 0;
+    uintptr_t selectedAimOwner = 0;
+    uint64_t selectedAimName = 0;
+    int selectedAimOwnerDistance = 65;
+    const bool selectedAimCompatible = SelectCachedAimFunction(
+        weaponClass, selectedAimFunction, selectedAimOwner,
+        selectedAimName, selectedAimOwnerDistance);
     AcquireSRWLockExclusive(&m_identityLock);
     changed = m_localController.load(std::memory_order_acquire) != controller ||
         m_localPawn.load(std::memory_order_acquire) != pawn ||
@@ -1085,20 +1123,22 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
     m_localWeapon.store(weapon, std::memory_order_release);
     m_pawnIdentityValid.store(true, std::memory_order_release);
     m_weaponIdentityValid.store(true, std::memory_order_release);
+    m_getAdjustedAimName.store(selectedAimCompatible ? selectedAimName : 0,
+                               std::memory_order_release);
+    m_getAdjustedAimFunction.store(selectedAimCompatible ? selectedAimFunction : 0,
+                                   std::memory_order_release);
+    m_getAdjustedAimOwnerClass.store(selectedAimCompatible ? selectedAimOwner : 0,
+                                     std::memory_order_release);
     if (changed) m_identityGeneration.fetch_add(1, std::memory_order_acq_rel);
     if (changed) m_scriptInvokeAimCalls.store(0, std::memory_order_release);
-    if (!selectedAimCompatible) {
-        m_getAdjustedAimName.store(0, std::memory_order_release);
-        m_getAdjustedAimFunction.store(0, std::memory_order_release);
-        m_getAdjustedAimOwnerClass.store(0, std::memory_order_release);
-    }
     const uint64_t generation = m_identityGeneration.load(std::memory_order_acquire);
     ReleaseSRWLockExclusive(&m_identityLock);
-    Log("[WeaponAim] Fast foot identity restored: controller=%p pawn=%p weapon=%p(%s/%s) "
-        "generation=%llu aimCompatible=%d", reinterpret_cast<void*>(controller),
+    Log("[WeaponAim] Fast identity refreshed: controller=%p pawn=%p weapon=%p(%s/%s) "
+        "generation=%llu aimCompatible=%d ownerDistance=%d",
+        reinterpret_cast<void*>(controller),
         reinterpret_cast<void*>(pawn), reinterpret_cast<void*>(weapon), weaponName,
         weaponClassName, static_cast<unsigned long long>(generation),
-        selectedAimCompatible);
+        selectedAimCompatible, selectedAimOwnerDistance);
     return true;
 }
 
