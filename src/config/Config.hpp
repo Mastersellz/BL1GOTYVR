@@ -41,6 +41,7 @@ float hud_horizontal_offset = 0.0f;
     float snap_turn_angle = 30.0f;
     float smooth_turn_speed = 90.0f;
     float locomotion_deadzone = 0.2f;
+    bool hmd_directed_locomotion = false;
 
     /* Room-scale body tracking */
     bool room_scale_enabled = true;
@@ -61,6 +62,7 @@ float hud_horizontal_offset = 0.0f;
     float aim_pitch_degrees = 0.0f;
     float aim_yaw_degrees = 0.0f;
     float aim_convergence_m = 20.0f;
+    bool dot_enabled = true;
     float dot_distance_m = 5.0f;
     float weapon_offset_forward = 0.0f;
     float weapon_offset_right = 0.0f;
@@ -82,6 +84,7 @@ float hud_horizontal_offset = 0.0f;
     float right_hand_rotation_pitch = 0.0f;
     float right_hand_rotation_yaw = 0.0f;
     float right_hand_rotation_roll = 0.0f;
+    float arm_reach_scale = 1.35f;
 
     /* Legacy visual-only aim dot offsets in normalized eye UV */
     float dot_horizontal_offset = 0.0f;

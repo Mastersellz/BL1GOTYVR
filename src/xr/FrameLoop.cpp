@@ -4,6 +4,7 @@
 #include "../core/globals.hpp"
 #include "../core/CommandSystem.hpp"
 #include "../input/InputHook.hpp"
+#include "../player/ArmIKSystem.hpp"
 #include "../input/WeaponAimSystem.hpp"
 #include "../d3d11/D3D11Hooks.hpp"
 #include "../camera/CameraHook.hpp"
@@ -1076,7 +1077,9 @@ bool FrameLoop::AcquireRenderTicket(StereoRenderTicket& ticket) {
     const bool currentPoseValid = openXR.GetPoseSnapshot(
         currentHeadPosition, currentHeadRotation, currentViews);
     input::ControllerState controllers[2] = {};
-    input::XRInput::Instance().GetControllerSnapshot(controllers);
+    uint64_t controllerGeneration = 0;
+    input::XRInput::Instance().GetControllerSnapshot(
+        controllers, &controllerGeneration);
 
     AcquireSRWLockExclusive(&m_stereoPairLock);
     if (m_nextRenderEye == 0) {
@@ -1093,6 +1096,9 @@ bool FrameLoop::AcquireRenderTicket(StereoRenderTicket& ticket) {
                sizeof(m_activePair.headPosition));
         memcpy(m_activePair.headRotation, currentHeadRotation,
                sizeof(m_activePair.headRotation));
+        m_activePair.controllers[0] = controllers[0];
+        m_activePair.controllers[1] = controllers[1];
+        m_activePair.controllerGeneration = controllerGeneration;
         m_activePair.views[0] = currentViews[0];
         m_activePair.views[1] = currentViews[1];
         // The OpenXR aim pose is the immutable laser, reticle and ballistic ray.
@@ -2074,7 +2080,8 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     const bool missingWeaponTerminalCandidate = identity.pawnValid &&
         !identity.weaponValid && !camera::IsVehicleCameraActive() &&
         !camera::IsDownedFirstPersonActive() &&
-        !camera::IsTransientFirstPersonActionActive() && !phaseWalkActive;
+        !camera::IsTransientFirstPersonActionActive() && !phaseWalkActive &&
+        !player::ArmIKSystem::Instance().IsBrickBerserkActive();
     if (explicitVehicleTerminalUi) {
         m_terminalMissingWeaponPresents = 90;
     } else if (missingWeaponTerminalCandidate) {

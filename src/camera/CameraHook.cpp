@@ -245,6 +245,10 @@ static bool s_poseReferenceValid = false;
 static bool s_poseReferenceSimulated = false;
 static float s_poseReferencePosition[3] = {};
 static float s_poseReferenceRotation[4] = {};
+static std::atomic<float> s_relativeHeadYawRadians{0.0f};
+static std::atomic<bool> s_relativeHeadYawValid{false};
+static std::atomic<int32_t> s_physicalMeleeYawAnchor{0};
+static std::atomic<bool> s_physicalMeleeYawAnchorValid{false};
 static std::atomic<bool> s_recenterRequested{true};
 static std::atomic<bool> s_gamePitchReferenceValid{false};
 static std::atomic<int32_t> s_gamePitchReference{0};
@@ -532,6 +536,12 @@ static void xr_to_ue(const float v[3], float out[3]) {
 }
 
 bool IsCameraFound() { return s_cameraFound && s_viewportDrawTarget != 0; }
+
+bool GetRelativeHeadYaw(float& yawRadians) {
+    if (!s_relativeHeadYawValid.load(std::memory_order_acquire)) return false;
+    yawRadians = s_relativeHeadYawRadians.load(std::memory_order_acquire);
+    return std::isfinite(yawRadians);
+}
 bool IsVehicleCameraActive() {
     return s_vehiclePawn.load(std::memory_order_acquire) != 0;
 }
@@ -598,6 +608,8 @@ void RequestPlayerIdentityRefresh() {
 
 // Request camera recenter (call from input handler or command system)
 void RequestRecenter() {
+    s_relativeHeadYawValid.store(false, std::memory_order_release);
+    s_physicalMeleeYawAnchorValid.store(false, std::memory_order_release);
     s_recenterRequested.store(true, std::memory_order_release);
     Log("[Camera] Recenter requested");
 }
@@ -819,6 +831,18 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                 Log("[Camera] Game pitch locked at %d Unis", originalRotation[0]);
             }
             rotation[0] = s_gamePitchReference.load(std::memory_order_relaxed);
+            const bool suppressPhysicalMeleeCamera =
+                input::InputHook::Instance().IsPhysicalMeleeAnimationSuppressed();
+            if (suppressPhysicalMeleeCamera &&
+                s_physicalMeleeYawAnchorValid.load(std::memory_order_acquire)) {
+                const int32_t anchoredYaw = s_physicalMeleeYawAnchor.load(
+                    std::memory_order_acquire);
+                rotation[1] = anchoredYaw;
+                interactionRotation[1] = anchoredYaw;
+            } else if (!suppressPhysicalMeleeCamera) {
+                s_physicalMeleeYawAnchor.store(rotation[1], std::memory_order_release);
+                s_physicalMeleeYawAnchorValid.store(true, std::memory_order_release);
+            }
 
             float vehicleSeat[3] = {};
             int32_t vehicleRotation[3] = {};
@@ -928,6 +952,9 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                 relativeHeadForwardUe[1] * relativeHeadForwardUe[1]);
             constexpr float kRadiansToUnis = 65536.0f / 6.2831853071795864769f;
             const float headPitch = atan2f(relativeHeadForwardUe[2], headHorizontal);
+            s_relativeHeadYawRadians.store(atan2f(relativeHeadForwardUe[1],
+                relativeHeadForwardUe[0]), std::memory_order_release);
+            s_relativeHeadYawValid.store(true, std::memory_order_release);
             interactionRotation[0] = s_gamePitchReference.load(
                 std::memory_order_relaxed) +
                 static_cast<int32_t>(lroundf(headPitch * kRadiansToUnis));
@@ -966,7 +993,8 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                 renderTicket.armTargetGeneration =
                     player::ArmIKSystem::Instance().UpdateTargets(
                         armCameraLocation, gamePitch, gameYaw, headPosition,
-                        headRotation, s_poseReferencePosition, s_poseReferenceRotation);
+                        headRotation, s_poseReferencePosition, s_poseReferenceRotation,
+                        renderTicket.controllers, renderTicket.controllerGeneration);
             }
             if (!renderTicket.rightAimValid) {
                 input::ControllerState controllers[2] = {};

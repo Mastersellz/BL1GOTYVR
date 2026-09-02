@@ -69,6 +69,7 @@ void InputHook::Install() {
     memset(m_aimTuningNextRepeatMs, 0, sizeof(m_aimTuningNextRepeatMs));
     m_handTuningHand = 1;
     m_handTuningDirty = false;
+    m_handTuningLastChangedMs = 0;
     m_aimTuningDirty = false;
     m_activeWeaponTrimPitch.store(0.0f, std::memory_order_release);
     m_activeWeaponTrimYaw.store(0.0f, std::memory_order_release);
@@ -194,48 +195,46 @@ void InputHook::ReleaseAllInput() {
     }
 }
 
-void InputHook::ResetPhysicalMelee() {
-    memset(m_meleePreviousTip, 0, sizeof(m_meleePreviousTip));
-    m_meleeFilteredSpeed = 0.0f;
-    m_meleeTravel = 0.0f;
-    m_meleePreviousSampleMs = 0;
-    m_meleeBelowThresholdSinceMs = 0;
-    m_physicalMeleePulseUntilMs = 0;
-    m_physicalMeleeCooldownUntilMs = 0;
-    m_meleeTipValid = false;
-    m_physicalMeleeReady = true;
+void InputHook::ResetPhysicalMelee(int hand) {
+    const int first = hand >= 0 ? hand : 0;
+    const int last = hand >= 0 ? hand : 1;
+    for (int index = first; index <= last; ++index)
+        m_melee[index] = {};
 }
 
-bool InputHook::UpdatePhysicalMelee(const ControllerState& left, uint64_t nowMs) {
-    if (!left.aimValid ||
+bool InputHook::UpdatePhysicalMelee(const ControllerState& controller, int hand,
+                                    uint64_t nowMs, bool fistMode) {
+    if (hand < 0 || hand > 1) return false;
+    if (!controller.aimValid ||
         !m_motionControlsEnabled.load(std::memory_order_acquire)) {
-        ResetPhysicalMelee();
+        ResetPhysicalMelee(hand);
         return false;
     }
+    PhysicalMeleeTracker& tracker = m_melee[hand];
 
     float headPosition[3] = {};
     float headRotation[4] = {};
     XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
     if (!xr::OpenXRContext::Instance().GetPoseSnapshot(
             headPosition, headRotation, views)) {
-        ResetPhysicalMelee();
+        ResetPhysicalMelee(hand);
         return false;
     }
 
     constexpr float kLocalForward[3] = {0.0f, 0.0f, -1.0f};
     float controllerForward[3] = {};
     float headForward[3] = {};
-    RotateMeleeVector(left.aimRotation, kLocalForward, controllerForward);
+    RotateMeleeVector(controller.aimRotation, kLocalForward, controllerForward);
     RotateMeleeVector(headRotation, kLocalForward, headForward);
-    constexpr float kWeaponLengthMeters = 0.45f;
+    const float weaponLengthMeters = fistMode ? 0.12f : 0.45f;
     float tip[3] = {
-        left.aimPosition[0] + controllerForward[0] * kWeaponLengthMeters,
-        left.aimPosition[1] + controllerForward[1] * kWeaponLengthMeters,
-        left.aimPosition[2] + controllerForward[2] * kWeaponLengthMeters};
+        controller.aimPosition[0] + controllerForward[0] * weaponLengthMeters,
+        controller.aimPosition[1] + controllerForward[1] * weaponLengthMeters,
+        controller.aimPosition[2] + controllerForward[2] * weaponLengthMeters};
     const float headToController[3] = {
-        left.aimPosition[0] - headPosition[0],
-        left.aimPosition[1] - headPosition[1],
-        left.aimPosition[2] - headPosition[2]};
+        controller.aimPosition[0] - headPosition[0],
+        controller.aimPosition[1] - headPosition[1],
+        controller.aimPosition[2] - headPosition[2]};
     const float frontDistance = headToController[0] * headForward[0] +
         headToController[1] * headForward[1] +
         headToController[2] * headForward[2];
@@ -246,74 +245,75 @@ bool InputHook::UpdatePhysicalMelee(const ControllerState& left, uint64_t nowMs)
     if (!std::isfinite(tip[0]) || !std::isfinite(tip[1]) ||
         !std::isfinite(tip[2]) || !std::isfinite(frontDistance) ||
         !std::isfinite(controllerDistanceSq)) {
-        ResetPhysicalMelee();
+        ResetPhysicalMelee(hand);
         return false;
     }
 
     auto seedTip = [&]() {
-        memcpy(m_meleePreviousTip, tip, sizeof(m_meleePreviousTip));
-        m_meleePreviousSampleMs = nowMs;
-        m_meleeTipValid = true;
+        memcpy(tracker.previousTip, tip, sizeof(tracker.previousTip));
+        tracker.previousSampleMs = nowMs;
+        tracker.tipValid = true;
     };
     const bool inFront = frontDistance >= 0.08f && controllerDistanceSq <= 2.25f;
     if (!inFront) {
         seedTip();
-        m_meleeFilteredSpeed = 0.0f;
-        m_meleeTravel = 0.0f;
-        m_meleeBelowThresholdSinceMs = nowMs;
-        if (!m_physicalMeleeReady && nowMs >= m_physicalMeleeCooldownUntilMs)
-            m_physicalMeleeReady = true;
-        return nowMs < m_physicalMeleePulseUntilMs;
+        tracker.filteredSpeed = 0.0f;
+        tracker.travel = 0.0f;
+        tracker.belowThresholdSinceMs = nowMs;
+        if (!tracker.ready && nowMs >= tracker.cooldownUntilMs)
+            tracker.ready = true;
+        return nowMs < tracker.pulseUntilMs;
     }
-    if (!m_meleeTipValid || !m_meleePreviousSampleMs) {
+    if (!tracker.tipValid || !tracker.previousSampleMs) {
         seedTip();
         return false;
     }
 
-    const uint64_t elapsedMs = nowMs - m_meleePreviousSampleMs;
+    const uint64_t elapsedMs = nowMs - tracker.previousSampleMs;
     const float delta[3] = {
-        tip[0] - m_meleePreviousTip[0], tip[1] - m_meleePreviousTip[1],
-        tip[2] - m_meleePreviousTip[2]};
+        tip[0] - tracker.previousTip[0], tip[1] - tracker.previousTip[1],
+        tip[2] - tracker.previousTip[2]};
     const float distance = sqrtf(delta[0] * delta[0] + delta[1] * delta[1] +
                                  delta[2] * delta[2]);
     if (elapsedMs < 2 || elapsedMs > 100 || !std::isfinite(distance) ||
         distance > 0.80f) {
         seedTip();
-        m_meleeFilteredSpeed = 0.0f;
-        m_meleeTravel = 0.0f;
-        return nowMs < m_physicalMeleePulseUntilMs;
+        tracker.filteredSpeed = 0.0f;
+        tracker.travel = 0.0f;
+        return nowMs < tracker.pulseUntilMs;
     }
     seedTip();
 
     const float speed = distance * 1000.0f / static_cast<float>(elapsedMs);
-    m_meleeFilteredSpeed += (speed - m_meleeFilteredSpeed) * 0.45f;
+    tracker.filteredSpeed += (speed - tracker.filteredSpeed) * 0.45f;
     constexpr float kRearmSpeedMps = 0.65f;
-    if (m_meleeFilteredSpeed <= kRearmSpeedMps) {
-        m_meleeTravel = 0.0f;
-        if (!m_meleeBelowThresholdSinceMs) m_meleeBelowThresholdSinceMs = nowMs;
-        if (!m_physicalMeleeReady && nowMs >= m_physicalMeleeCooldownUntilMs &&
-            nowMs - m_meleeBelowThresholdSinceMs >= 120) {
-            m_physicalMeleeReady = true;
+    if (tracker.filteredSpeed <= kRearmSpeedMps) {
+        tracker.travel = 0.0f;
+        if (!tracker.belowThresholdSinceMs) tracker.belowThresholdSinceMs = nowMs;
+        if (!tracker.ready && nowMs >= tracker.cooldownUntilMs &&
+            nowMs - tracker.belowThresholdSinceMs >= 120) {
+            tracker.ready = true;
         }
     } else {
-        m_meleeBelowThresholdSinceMs = 0;
-        if (m_physicalMeleeReady) m_meleeTravel += distance;
+        tracker.belowThresholdSinceMs = 0;
+        if (tracker.ready) tracker.travel += distance;
     }
 
     constexpr float kTriggerSpeedMps = 1.75f;
     constexpr float kTriggerTravelMeters = 0.10f;
-    if (m_physicalMeleeReady && nowMs >= m_physicalMeleeCooldownUntilMs &&
-        m_meleeFilteredSpeed >= kTriggerSpeedMps &&
-        m_meleeTravel >= kTriggerTravelMeters) {
-        const float measuredTravel = m_meleeTravel;
-        m_physicalMeleeReady = false;
-        m_meleeTravel = 0.0f;
-        m_physicalMeleePulseUntilMs = nowMs + 90;
-        m_physicalMeleeCooldownUntilMs = nowMs + 500;
-        Log("[Input] Left-arm VR melee triggered: speed=%.2fm/s travel=%.3fm front=%.2fm",
-            m_meleeFilteredSpeed, measuredTravel, frontDistance);
+    if (tracker.ready && nowMs >= tracker.cooldownUntilMs &&
+        tracker.filteredSpeed >= kTriggerSpeedMps &&
+        tracker.travel >= kTriggerTravelMeters) {
+        const float measuredTravel = tracker.travel;
+        tracker.ready = false;
+        tracker.travel = 0.0f;
+        tracker.pulseUntilMs = nowMs + 90;
+        tracker.cooldownUntilMs = nowMs + (fistMode ? 300 : 500);
+        Log("[Input] %s VR %s triggered: speed=%.2fm/s travel=%.3fm front=%.2fm",
+            hand == 0 ? "Left" : "Right", fistMode ? "Berserk punch" : "melee",
+            tracker.filteredSpeed, measuredTravel, frontDistance);
     }
-    return nowMs < m_physicalMeleePulseUntilMs;
+    return nowMs < tracker.pulseUntilMs;
 }
 
 void InputHook::ProcessTurn() {
@@ -425,17 +425,50 @@ void InputHook::UpdateState(XrTime displayTime) {
     } else if (leftTriggerPressed) {
         m_weaponGrabLatched = m_weaponGrabArmed.load(std::memory_order_acquire);
         if (m_weaponGrabLatched)
-            Log("[Input] Left trigger latched as two-hand weapon grab");
+            Log("[Input] Left trigger latched on weapon contact");
     }
     const bool weaponGrabHeld = m_leftTriggerDown && m_weaponGrabLatched;
     m_weaponGrabHeld.store(weaponGrabHeld, std::memory_order_release);
-    const bool adsActive = m_leftTriggerDown && !weaponGrabHeld;
+    constexpr bool adsActive = false;
     const bool vehicleSecondaryFire = vehicleMode && m_rightGripDown;
     WeaponAimSystem::Instance().SetVehicleSecondaryFireActive(vehicleSecondaryFire);
     WeaponAimSystem::Instance().SetFireActive(
         m_rightTriggerDown || vehicleSecondaryFire);
 
-    const bool physicalMeleePulse = UpdatePhysicalMelee(left, now);
+    const bool berserkPunchMode =
+        player::ArmIKSystem::Instance().IsBrickBerserkActive();
+    if (berserkPunchMode != m_berserkPunchMode) {
+        m_berserkPunchMode = berserkPunchMode;
+        ResetPhysicalMelee();
+        if (berserkPunchMode &&
+            !player::ArmIKSystem::Instance().IsEnabled())
+            player::ArmIKSystem::Instance().SetEnabled(true);
+        Log("[Input] Brick physical-punch mode %s",
+            berserkPunchMode ? "enabled" : "disabled");
+    }
+    const bool leftPunchPulse = berserkPunchMode &&
+        UpdatePhysicalMelee(left, 0, now, true);
+    const bool rightPunchPulse = berserkPunchMode &&
+        UpdatePhysicalMelee(right, 1, now, true);
+    if (leftPunchPulse || rightPunchPulse)
+        m_physicalMeleeAnimationSuppressUntilMs.store(
+            now + 700, std::memory_order_release);
+    bool physicalMeleePulse = false;
+    if (!berserkPunchMode) {
+        const bool leftArmed = m_leftTriggerDown && !weaponGrabHeld;
+        const bool leftMeleePulse = leftArmed &&
+            UpdatePhysicalMelee(left, 0, now, true);
+        if (!leftArmed) ResetPhysicalMelee(0);
+        const bool rightWeaponPulse =
+            m_weaponPoseActive.load(std::memory_order_acquire) &&
+            UpdatePhysicalMelee(right, 1, now, false);
+        if (!m_weaponPoseActive.load(std::memory_order_acquire))
+            ResetPhysicalMelee(1);
+        physicalMeleePulse = leftMeleePulse || rightWeaponPulse;
+        if (physicalMeleePulse)
+            m_physicalMeleeAnimationSuppressUntilMs.store(
+                now + 700, std::memory_order_release);
+    }
     const bool yDown = left.buttonY;
     if (yDown && !m_yWasDown) {
         m_yPressMs = now;
@@ -529,25 +562,53 @@ void InputHook::UpdateState(XrTime displayTime) {
     if (m_leftGripDown) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
     if (m_rightGripDown && !vehicleMode) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
     if (left.thumbstickClick && !suppressStickClicks) buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
-    if ((right.thumbstickClick || physicalMeleePulse) && !suppressStickClicks)
+    if (right.thumbstickClick && !suppressStickClicks)
         buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
     if (left.menuButton) buttons |= XINPUT_GAMEPAD_START;
     if (echoHeld) buttons |= XINPUT_GAMEPAD_BACK;
 
     const bool suppressMove = chordDirection != 0;
+    float moveX = left.thumbstickX;
+    float moveY = left.thumbstickY;
+    if (cfg.hmd_directed_locomotion) {
+        float headYaw = 0.0f;
+        if (camera::GetRelativeHeadYaw(headYaw)) {
+            const float sine = sinf(headYaw);
+            const float cosine = cosf(headYaw);
+            const float bodyRight = moveY * sine + moveX * cosine;
+            const float bodyForward = moveY * cosine - moveX * sine;
+            moveX = bodyRight;
+            moveY = bodyForward;
+        }
+    }
     if (m_xinputActive) {
         VrGamepadState state = {};
-        state.moveX = suppressMove ? 0.0f : left.thumbstickX;
-        state.moveY = suppressMove ? 0.0f : left.thumbstickY;
+        state.moveX = suppressMove ? 0.0f : moveX;
+        state.moveY = suppressMove ? 0.0f : moveY;
         state.turnX = right.thumbstickX;
         state.turnY = right.thumbstickY;
-        state.leftTrigger = adsActive
-            ? (std::max)(left.trigger, 0.55f) : 0.0f;
-        state.rightTrigger = m_rightTriggerDown
-            ? (std::max)(right.trigger, 0.55f) : 0.0f;
+        state.leftTrigger = 0.0f;
+        state.rightTrigger = berserkPunchMode ? 0.0f :
+            (m_rightTriggerDown ? (std::max)(right.trigger, 0.55f) : 0.0f);
         state.buttons = buttons;
         state.active = true;
         XInputBridge::Instance().Publish(state);
+        auto setMouse = [&](DWORD downFlag, DWORD upFlag, bool down, int& previous) {
+            if (down && !previous) mouse_event(downFlag, 0, 0, 0, 0);
+            else if (!down && previous) mouse_event(upFlag, 0, 0, 0, 0);
+            previous = down ? 1 : 0;
+        };
+        setMouse(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+            berserkPunchMode && rightPunchPulse, m_prevTrigger);
+        setMouse(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+            berserkPunchMode && leftPunchPulse, m_prevButtonA);
+        if (physicalMeleePulse && !m_prevMelee) PressKey('V');
+        else if (!physicalMeleePulse && m_prevMelee) ReleaseKey('V');
+        m_prevMelee = physicalMeleePulse ? 1 : 0;
+        const bool sprintHeld = left.thumbstickClick && !suppressStickClicks;
+        if (sprintHeld && !m_prevSprint) PressKey(VK_LSHIFT);
+        else if (!sprintHeld && m_prevSprint) ReleaseKey(VK_LSHIFT);
+        m_prevSprint = sprintHeld ? 1 : 0;
         if (vehicleSecondaryFire && !m_prevVehicleAltFire)
             mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
         else if (!vehicleSecondaryFire && m_prevVehicleAltFire)
@@ -566,9 +627,10 @@ void InputHook::UpdateState(XrTime displayTime) {
         };
 
         setMouse(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-            m_rightTriggerDown, m_prevTrigger);
+            berserkPunchMode ? rightPunchPulse : m_rightTriggerDown, m_prevTrigger);
         setMouse(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-            adsActive || vehicleSecondaryFire, m_prevButtonA);
+            berserkPunchMode ? leftPunchPulse : (adsActive || vehicleSecondaryFire),
+            m_prevButtonA);
         setKey(VK_SPACE, right.buttonA, m_prevJump);
         setKey('C', bTapPulse, m_prevCrouch);
         setKey('E', left.buttonX, m_prevUse);
@@ -590,23 +652,37 @@ void InputHook::UpdateState(XrTime displayTime) {
         m_prevWeaponCycle = yTapPulse ? 1 : 0;
 
         const float deadzone = cfg.locomotion_deadzone;
-        setKey('W', !suppressMove && left.thumbstickY > deadzone, m_prevW);
-        setKey('S', !suppressMove && left.thumbstickY < -deadzone, m_prevS);
-        setKey('A', !suppressMove && left.thumbstickX < -deadzone, m_prevA);
-        setKey('D', !suppressMove && left.thumbstickX > deadzone, m_prevD);
+        setKey('W', !suppressMove && moveY > deadzone, m_prevW);
+        setKey('S', !suppressMove && moveY < -deadzone, m_prevS);
+        setKey('A', !suppressMove && moveX < -deadzone, m_prevA);
+        setKey('D', !suppressMove && moveX > deadzone, m_prevD);
         ProcessTurn();
     }
 
 }
 
 void InputHook::PollAimTuningKeys() {
+    const uint64_t now = GetTickCount64();
+    if (m_handTuningDirty && m_handTuningLastChangedMs != 0 &&
+        now - m_handTuningLastChangedMs >= 350) {
+        if (config::SaveLoaded()) {
+            m_handTuningDirty = false;
+            m_handTuningLastChangedMs = 0;
+            Log("[Input] Left-hand calibration saved after tuning pause");
+        } else {
+            m_handTuningLastChangedMs = now;
+        }
+    }
     const bool ctrlDown =
         (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
         (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
     if (!ctrlDown) {
         if (m_handTuningDirty) {
-            config::SaveLoaded();
-            m_handTuningDirty = false;
+            if (config::SaveLoaded()) {
+                m_handTuningDirty = false;
+                m_handTuningLastChangedMs = 0;
+                Log("[Input] Left-hand calibration saved on key release");
+            }
         }
         if (m_aimTuningDirty) {
             SaveActiveAimProfile();
@@ -617,7 +693,6 @@ void InputHook::PollAimTuningKeys() {
         return;
     }
 
-    const uint64_t now = GetTickCount64();
     auto pressed = [&](int numpadKey, uint32_t bit, int index,
                        bool allowRepeat = true) {
         const bool down = (GetAsyncKeyState(numpadKey) & 0x8000) != 0;
@@ -728,6 +803,7 @@ void InputHook::PollAimTuningKeys() {
         m_aimTuningDirty = true;
     } else {
         m_handTuningDirty = true;
+        m_handTuningLastChangedMs = now;
     }
     Log("[Input] Calibration live: target=%s pitch=%.2f yaw=%.2f roll=%.2f "
         "offset=(%.2f,%.2f,%.2f)",
@@ -810,6 +886,7 @@ void InputHook::RequestMotionCalibrationReset() {
 }
 
 bool InputHook::IsAimDotVisible() const {
+    if (!config::Get().dot_enabled) return false;
     const uint64_t visibleAt = m_dotVisibleAtMs.load(std::memory_order_acquire);
     if (visibleAt == 0 || GetTickCount64() < visibleAt ||
         !m_motionControlsEnabled.load(std::memory_order_acquire)) return false;
@@ -820,7 +897,9 @@ bool InputHook::GetWeaponBarrelLocalDirection(float direction[3]) {
     if (!direction) return false;
     bool valid = false;
     AcquireSRWLockShared(&m_weaponPoseWriteLock);
-    if (m_weaponBarrelDirectionValid && m_renderWeaponStampActive) {
+    if (m_weaponBarrelDirectionValid && m_renderWeaponComponent >= 0x10000 &&
+        m_renderWeaponStampUpdatedMs != 0 &&
+        GetTickCount64() - m_renderWeaponStampUpdatedMs <= 250) {
         memcpy(direction, m_weaponBarrelLocalDirection,
                sizeof(m_weaponBarrelLocalDirection));
         valid = true;
@@ -836,7 +915,9 @@ bool InputHook::GetDrivenWeaponFrame(float position[3], float forward[3],
     bool valid = false;
     AcquireSRWLockShared(&m_weaponPoseWriteLock);
     const uint64_t now = GetTickCount64();
-    if (m_renderWeaponStampActive && m_renderWeaponComponent >= 0x10000 &&
+    // Attachment-driven weapons do not need a direct matrix stamp, but their
+    // cached frame is still the authoritative grip/barrel frame.
+    if (m_renderWeaponComponent >= 0x10000 &&
         m_renderWeaponStampUpdatedMs && now >= m_renderWeaponStampUpdatedMs &&
         now - m_renderWeaponStampUpdatedMs <= 250) {
         memcpy(position, m_renderWeaponGripPosition,
@@ -1142,11 +1223,13 @@ void InputHook::ApplyRightHand(int eye) {
         return;
     }
     auto& armIK = player::ArmIKSystem::Instance();
-    if (!m_weaponPoseActive.load(std::memory_order_acquire) && armIK.IsEnabled())
+    if (!m_weaponPoseActive.load(std::memory_order_acquire) && armIK.IsEnabled() &&
+        !armIK.IsBrickBerserkActive())
         armIK.SetEnabled(false);
     if (camera::IsVehicleCameraActive()) {
         AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
-        if (m_weaponNativeMatrixValid && m_renderWeaponComponent >= 0x10000 &&
+        if (m_renderWeaponStampActive && m_weaponNativeMatrixValid &&
+            m_renderWeaponComponent >= 0x10000 &&
             m_renderWeaponMatrixOffset > 0) {
             SIZE_T bytesWritten = 0;
             WriteProcessMemory(GetCurrentProcess(),
@@ -1171,8 +1254,10 @@ void InputHook::ApplyRightHand(int eye) {
             if (entry.valid) ++preservedMounts;
         }
         AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
+        const bool directStampActive = m_renderWeaponStampActive;
         m_renderWeaponStampActive = false;
-        if (m_weaponNativeMatrixValid && m_renderWeaponComponent >= 0x10000 &&
+        if (directStampActive && m_weaponNativeMatrixValid &&
+            m_renderWeaponComponent >= 0x10000 &&
             m_renderWeaponMatrixOffset > 0) {
             SIZE_T bytesWritten = 0;
             nativeRestored = WriteProcessMemory(GetCurrentProcess(),
@@ -1187,6 +1272,7 @@ void InputHook::ApplyRightHand(int eye) {
         m_weaponPoseActive.store(false, std::memory_order_release);
         m_weaponMountValid = false;
         m_weaponMountAbsolute = false;
+        m_weaponAttachmentDriven = false;
         m_weaponNativeMatrixValid = false;
         m_mountWeapon = 0;
         m_mountComponent = 0;
@@ -1321,7 +1407,8 @@ void InputHook::ApplyRightHand(int eye) {
                                  characterMeshName, active->outerName,
                                  active->meshName, active->component);
         AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
-        if (m_weaponNativeMatrixValid && m_renderWeaponComponent >= 0x10000 &&
+        if (m_renderWeaponStampActive && m_weaponNativeMatrixValid &&
+            m_renderWeaponComponent >= 0x10000 &&
             m_renderWeaponMatrixOffset > 0) {
             SIZE_T bytesWritten = 0;
             WriteProcessMemory(GetCurrentProcess(),
@@ -1335,6 +1422,7 @@ void InputHook::ApplyRightHand(int eye) {
         ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
         m_weaponMountValid = false;
         m_weaponMountAbsolute = false;
+        m_weaponAttachmentDriven = false;
         m_weaponNativeMatrixValid = false;
         m_weaponGripValid = false;
         m_mountIdentityGeneration = 0;
@@ -1679,9 +1767,15 @@ void InputHook::ApplyRightHand(int eye) {
             barrelWorld[1] * controllerFrame[9] +
             barrelWorld[2] * controllerFrame[10]
     };
-    SIZE_T bytesWritten = 0;
-    if (!WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(matrixAddress),
-            driven, sizeof(driven), &bytesWritten) || bytesWritten != sizeof(driven)) return;
+    const player::ArmRigStatus rigStatus = armIK.GetStatus();
+    if (rigStatus.poseHookInstalled && rigStatus.rigValid)
+        m_weaponAttachmentDriven = true;
+    if (!m_weaponAttachmentDriven) {
+        SIZE_T bytesWritten = 0;
+        if (!WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(matrixAddress),
+                driven, sizeof(driven), &bytesWritten) ||
+            bytesWritten != sizeof(driven)) return;
+    }
     AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
     m_renderWeaponComponent = active->component;
     m_renderWeaponMatrixOffset = active->localToWorldOffset;
@@ -1690,7 +1784,7 @@ void InputHook::ApplyRightHand(int eye) {
            sizeof(m_renderWeaponGripPosition));
     memcpy(m_renderWeaponForward, barrelWorld, sizeof(m_renderWeaponForward));
     memcpy(m_renderWeaponUp, weaponUp, sizeof(m_renderWeaponUp));
-    m_renderWeaponStampActive = true;
+    m_renderWeaponStampActive = !m_weaponAttachmentDriven;
     m_renderWeaponStampUpdatedMs = GetTickCount64();
     memcpy(m_weaponBarrelLocalDirection, barrelLocal,
            sizeof(m_weaponBarrelLocalDirection));
@@ -1708,9 +1802,10 @@ void InputHook::ApplyRightHand(int eye) {
     }
     if (m_lastDrivenWeapon != inventory.weapon ||
         m_lastDrivenComponent != active->component) {
-        Log("[WeaponPose] Native-relative pose active: weapon=%p component=%p updates=%llu "
+        Log("[WeaponPose] %s pose active: weapon=%p component=%p updates=%llu "
             "matrix=+0x%X scale=(%.3f,%.3f,%.3f) gripError=%.6f barrel=%c%c "
             "local=(%.3f,%.3f,%.3f)",
+            m_weaponAttachmentDriven ? "IK-attachment" : "direct-component",
             reinterpret_cast<void*>(inventory.weapon),
             reinterpret_cast<void*>(active->component),
             static_cast<unsigned long long>(active->updateCount),
@@ -1762,6 +1857,28 @@ bool InputHook::ReapplyWeaponPose() {
     if (m_renderWeaponStampActive && m_renderWeaponComponent >= 0x10000 &&
         m_renderWeaponMatrixOffset > 0 &&
         GetTickCount64() - m_renderWeaponStampUpdatedMs <= 250) {
+        float currentMatrix[16] = {};
+        SIZE_T bytesRead = 0;
+        if (ReadProcessMemory(GetCurrentProcess(),
+                reinterpret_cast<void*>(m_renderWeaponComponent +
+                                        m_renderWeaponMatrixOffset),
+                currentMatrix, sizeof(currentMatrix), &bytesRead) &&
+            bytesRead == sizeof(currentMatrix)) {
+            const float dx = currentMatrix[12] - m_renderWeaponMatrix[12];
+            const float dy = currentMatrix[13] - m_renderWeaponMatrix[13];
+            const float dz = currentMatrix[14] - m_renderWeaponMatrix[14];
+            const float drift = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (std::isfinite(drift) && drift > 0.05f) {
+                static std::atomic<uint64_t> driftCount{0};
+                const uint64_t count = driftCount.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+                if (count <= 3 || count % 600 == 0) {
+                    Log("[WeaponPose] Native pre-render drift corrected: "
+                        "count=%llu distance=%.3f UU delta=(%.3f,%.3f,%.3f)",
+                        static_cast<unsigned long long>(count), drift, dx, dy, dz);
+                }
+            }
+        }
         SIZE_T bytesWritten = 0;
         written = WriteProcessMemory(GetCurrentProcess(),
             reinterpret_cast<void*>(m_renderWeaponComponent +

@@ -15,6 +15,8 @@ constexpr int kSameFrameCheck = 202;
 constexpr int kReverseEyesCheck = 203;
 constexpr int kRollCheck = 204;
 constexpr int kLoggingCheck = 205;
+constexpr int kDotCheck = 206;
+constexpr int kHmdDirectionCheck = 207;
 constexpr int kLowPreset = 210;
 constexpr int kMediumPreset = 211;
 constexpr int kHighPreset = 212;
@@ -32,7 +34,7 @@ struct Field {
     bool integer;
 };
 
-constexpr std::array<Field, 12> kFields = {{
+constexpr std::array<Field, 13> kFields = {{
     {101, "Render width", "Display", "Width", "2048", 640.0f, 7680.0f, true},
     {102, "Render height", "Display", "Height", "2048", 480.0f, 4320.0f, true},
     {103, "Resolution scale", "Display", "ResolutionScale", "1.00", 0.5f, 2.0f, false},
@@ -45,21 +47,21 @@ constexpr std::array<Field, 12> kFields = {{
     {110, "Rotation scale", "Tracking", "RotationScale", "1.00", 0.0f, 5.0f, false},
     {111, "Aim target distance (m)", "Dot", "ConvergenceDistance", "20.0", 1.0f, 100.0f, false},
     {112, "OpenXR refresh rate (Hz, 0=default)", "OpenXR", "RefreshRateHz", "72.0", 0.0f, 240.0f, false},
+    {113, "Arm reach scale", "Hands", "ArmReachScale", "1.35", 1.0f, 1.6f, false},
 }};
 
 struct RenderPreset {
     int id;
     const char* width;
     const char* height;
-    const char* scale;
 };
 
 constexpr std::array<RenderPreset, 5> kRenderPresets = {{
-    {kLowPreset, "1536", "1536", "0.75"},
-    {kMediumPreset, "2048", "2048", "1.00"},
-    {kHighPreset, "2560", "2560", "1.25"},
-    {kUltraPreset, "3072", "3072", "1.40"},
-    {kMegaUltraPreset, "4096", "4096", "1.50"},
+    {kLowPreset, "1536", "1536"},
+    {kMediumPreset, "2048", "2048"},
+    {kHighPreset, "2560", "2560"},
+    {kUltraPreset, "3072", "3072"},
+    {kMegaUltraPreset, "4096", "4096"},
 }};
 
 std::string ExeDirectory() {
@@ -80,6 +82,8 @@ void SetDefaults(HWND window) {
     CheckDlgButton(window, kReverseEyesCheck, BST_UNCHECKED);
     CheckDlgButton(window, kRollCheck, BST_UNCHECKED);
     CheckDlgButton(window, kLoggingCheck, BST_CHECKED);
+    CheckDlgButton(window, kDotCheck, BST_CHECKED);
+    CheckDlgButton(window, kHmdDirectionCheck, BST_UNCHECKED);
 }
 
 void ApplyRenderPreset(HWND window, int id) {
@@ -87,7 +91,6 @@ void ApplyRenderPreset(HWND window, int id) {
         if (preset.id != id) continue;
         SetDlgItemTextA(window, 101, preset.width);
         SetDlgItemTextA(window, 102, preset.height);
-        SetDlgItemTextA(window, 103, preset.scale);
         return;
     }
 }
@@ -108,6 +111,11 @@ void LoadSettings(HWND window) {
         GetPrivateProfileIntA("Tracking", "RollEnabled", 1, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(window, kLoggingCheck,
         GetPrivateProfileIntA("Debug", "Logging", 1, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(window, kDotCheck,
+        GetPrivateProfileIntA("Dot", "Enabled", 1, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(window, kHmdDirectionCheck,
+        GetPrivateProfileIntA("Input", "HmdDirectedLocomotion", 0, path.c_str())
+            ? BST_CHECKED : BST_UNCHECKED);
 }
 
 bool ReadField(HWND window, const Field& field, std::string& text, int& integerValue) {
@@ -162,6 +170,34 @@ bool UpdateGameResolution(int width, int height) {
     return false;
 }
 
+bool DisableGameWeaponBob() {
+    char documents[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathA(nullptr, CSIDL_PERSONAL, nullptr,
+                                SHGFP_TYPE_CURRENT, documents))) {
+        return false;
+    }
+    const std::array<std::string, 2> candidates = {
+        std::string(documents) + "\\My Games\\Borderlands Game of the Year\\WillowGame\\Config\\WillowGame.ini",
+        std::string(documents) + "\\My Games\\Borderlands Game of the Year Enhanced\\WillowGame\\Config\\WillowGame.ini"
+    };
+    for (const auto& path : candidates) {
+        std::ifstream input(path);
+        if (!input) continue;
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(input, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(line);
+        }
+        if (!ReplaceIniValue(lines, "bWeaponBob", 0)) continue;
+        std::ofstream output(path, std::ios::trunc);
+        if (!output) return false;
+        for (const auto& outputLine : lines) output << outputLine << "\n";
+        return true;
+    }
+    return false;
+}
+
 void SaveSettings(HWND window) {
     const std::string path = ConfigPath();
     int width = 0;
@@ -188,11 +224,17 @@ void SaveSettings(HWND window) {
         IsDlgButtonChecked(window, kRollCheck) == BST_CHECKED ? "1" : "0", path.c_str());
     WritePrivateProfileStringA("Debug", "Logging",
         IsDlgButtonChecked(window, kLoggingCheck) == BST_CHECKED ? "1" : "0", path.c_str());
+    WritePrivateProfileStringA("Dot", "Enabled",
+        IsDlgButtonChecked(window, kDotCheck) == BST_CHECKED ? "1" : "0", path.c_str());
+    WritePrivateProfileStringA("Input", "HmdDirectedLocomotion",
+        IsDlgButtonChecked(window, kHmdDirectionCheck) == BST_CHECKED ? "1" : "0",
+        path.c_str());
 
     const bool gameIniUpdated = UpdateGameResolution(width, height);
-    const char* message = gameIniUpdated
-        ? "Settings saved. Restart the game after changing a render preset, resolution, or resolution scale."
-        : "Settings saved. Optical settings apply live. WillowEngine.ini was not found; set the resolution in-game and restart.";
+    const bool weaponBobDisabled = DisableGameWeaponBob();
+    const char* message = gameIniUpdated && weaponBobDisabled
+        ? "Settings saved. Native weapon bob is disabled. Restart the game after changing display settings."
+        : "Settings saved. A game INI was not found; verify resolution and bWeaponBob=false before restarting.";
     MessageBoxA(window, message, "BL1 GOTY VR Config", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -244,15 +286,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 502);
         CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 532);
         CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 532);
+        CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 562);
+        CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 562);
 
         CreateWindowExA(0, "BUTTON", "Save settings", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                        154, 574, 110, 34, window,
+                        154, 604, 110, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveButton)), nullptr, nullptr);
         CreateWindowExA(0, "BUTTON", "Defaults", WS_CHILD | WS_VISIBLE,
-                        278, 574, 100, 34, window,
+                        278, 604, 100, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultsButton)), nullptr, nullptr);
         CreateLabel(window, "Convergence 10 = recommended; 0 = parallel. Applies live after Save.",
-                    66, 624, 430);
+                    66, 654, 430);
         LoadSettings(window);
         return 0;
     }
@@ -284,7 +328,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
 
     HWND window = CreateWindowExA(0, windowClass.lpszClassName, "Borderlands GOTY Enhanced VR Config",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 550, 700, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 550, 730, nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
     ShowWindow(window, showCommand);
     UpdateWindow(window);

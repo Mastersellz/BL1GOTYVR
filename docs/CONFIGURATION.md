@@ -29,21 +29,25 @@ Save; resolution and OpenXR refresh-rate changes require restarting the game.
 | Reverse eyes | On/off | Swaps captured left and right textures |
 | Camera roll | On/off | Enabled by default so roll orientation remains consistent with positional tracking |
 | Debug logging | On/off | Enables runtime diagnostic logging |
+| Aim dot | On/off | Shows or hides the controller-driven aiming dot |
+| HMD-directed movement | On/off | Rotates left-stick locomotion by current HMD yaw instead of body/game forward |
+| Arm reach scale | 1.00 to 1.60 | Allows the IK arm segments to stretch toward the tracked hands; `1.35` matches a roughly 75 cm reach on the current rigs |
 | Hide player body and arms | On/off | Experimental `Visibility/HidePlayerBodyAndArms` gate; off by default and only writes after runtime identity and reflected-schema validation |
 
 ## Render Presets
 
 The configurator includes square render presets for common performance targets.
-Selecting a preset fills the width, height, and OpenXR resolution scale fields;
-click `Save settings` and restart the game to apply it.
+Selecting a preset fills only the width and height fields. The manually selected
+OpenXR resolution scale is preserved. Click `Save settings` and restart the game
+to apply the new game resolution.
 
-| Preset | Game resolution | OpenXR scale |
-|---|---:|---:|
-| Low | 1536x1536 | 0.75 |
-| Medium | 2048x2048 | 1.00 |
-| High | 2560x2560 | 1.25 |
-| Ultra | 3072x3072 | 1.40 |
-| Mega Ultra | 4096x4096 | 1.50 |
+| Preset | Game resolution |
+|---|---:|
+| Low | 1536x1536 |
+| Medium | 2048x2048 |
+| High | 2560x2560 |
+| Ultra | 3072x3072 |
+| Mega Ultra | 4096x4096 |
 
 The DLL spoofs the primary display, monitor work area, system metrics, and game
 client rectangle to the selected square resolution before UE3 builds its
@@ -53,6 +57,21 @@ clamping.
 The configurator also updates `ResX` and `ResY` in the game's
 `WillowEngine.ini` when it can locate that file. Otherwise, set the same
 resolution in the game's video options.
+
+Saving also sets `bWeaponBob=false` in `WillowGame.ini`, matching the official
+Borderlands 2 VR configuration. This removes the native forward/backward walk
+bob from the weapon and first-person arms so their motion comes from the tracked
+controllers instead.
+
+Physical melee uses the game's native hit authority while the IK suppresses its
+viewmodel animation. With any character, hold the left trigger and swing the
+left fist, or swing the right-hand weapon. During Brick's Berserk action skill,
+either fist attacks directly without a trigger. Ordinary motion remains below
+guarded speed, travel, front-of-head, and cooldown thresholds.
+
+The left trigger does not activate ADS. Press it while the left hand is already
+touching the active weapon to hold that contact point as a two-hand grip. Press
+it with the hand away from the weapon to arm the left-hand physical melee.
 
 ## Runtime Diagnostics
 

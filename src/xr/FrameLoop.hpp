@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <atomic>
 
+#include "../input/XRInput.hpp"
+
 namespace bl1gotyvr { namespace xr {
 
 struct StereoRenderTicket {
@@ -19,6 +21,8 @@ struct StereoRenderTicket {
     float baseFov = 0.0f;
     float headPosition[3] = {};
     float headRotation[4] = {};
+    input::ControllerState controllers[2] = {};
+    uint64_t controllerGeneration = 0;
     bool rightAimValid = false;
     float rightAimPosition[3] = {};
     float rightAimRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};

@@ -94,6 +94,9 @@ void Load(const char* path) {
         ReadFloat("Input", "SmoothTurnSpeed", s_settings.smooth_turn_speed, path), 10.0f, 360.0f);
     s_settings.locomotion_deadzone = std::clamp(
         ReadFloat("Input", "LocomotionDeadzone", s_settings.locomotion_deadzone, path), 0.0f, 0.5f);
+    s_settings.hmd_directed_locomotion = GetPrivateProfileIntA(
+        "Input", "HmdDirectedLocomotion",
+        s_settings.hmd_directed_locomotion ? 1 : 0, path) != 0;
     s_settings.room_scale_enabled = GetPrivateProfileIntA(
         "RoomScale", "Enabled", s_settings.room_scale_enabled, path) != 0;
     s_settings.room_scale_allow_horizontal = GetPrivateProfileIntA(
@@ -137,6 +140,8 @@ void Load(const char* path) {
     s_settings.aim_convergence_m = std::clamp(
         ReadFloat("Dot", "ConvergenceDistance", s_settings.aim_convergence_m, path),
         1.0f, 100.0f);
+    s_settings.dot_enabled = GetPrivateProfileIntA(
+        "Dot", "Enabled", s_settings.dot_enabled ? 1 : 0, path) != 0;
     s_settings.dot_distance_m = std::clamp(
         ReadFloat("Dot", "DistanceMeters", s_settings.dot_distance_m, path),
         0.5f, 20.0f);
@@ -177,6 +182,8 @@ void Load(const char* path) {
         ReadFloat("Hands", "RightYaw", s_settings.right_hand_rotation_yaw, path), -180.0f, 180.0f);
     s_settings.right_hand_rotation_roll = std::clamp(
         ReadFloat("Hands", "RightRoll", s_settings.right_hand_rotation_roll, path), -180.0f, 180.0f);
+    s_settings.arm_reach_scale = std::clamp(
+        ReadFloat("Hands", "ArmReachScale", s_settings.arm_reach_scale, path), 1.0f, 1.6f);
 
     s_settings.dot_horizontal_offset = std::clamp(
         ReadFloat("Dot", "HorizontalOffset", s_settings.dot_horizontal_offset, path), -0.25f, 0.25f);
@@ -265,6 +272,8 @@ void Save(const char* path) {
     WriteFloat("Input", "SnapTurnAngle", s_settings.snap_turn_angle, path);
     WriteFloat("Input", "SmoothTurnSpeed", s_settings.smooth_turn_speed, path);
     WriteFloat("Input", "LocomotionDeadzone", s_settings.locomotion_deadzone, path);
+    WritePrivateProfileStringA("Input", "HmdDirectedLocomotion",
+        s_settings.hmd_directed_locomotion ? "1" : "0", path);
     WritePrivateProfileStringA("RoomScale", "Enabled",
         s_settings.room_scale_enabled ? "1" : "0", path);
     WritePrivateProfileStringA("RoomScale", "AllowHorizontal",
@@ -292,6 +301,8 @@ void Save(const char* path) {
     WriteFloat("Weapon", "AimPitch", s_settings.aim_pitch_degrees, path);
     WriteFloat("Weapon", "AimYaw", s_settings.aim_yaw_degrees, path);
     WriteFloat("Dot", "ConvergenceDistance", s_settings.aim_convergence_m, path);
+    WritePrivateProfileStringA("Dot", "Enabled",
+        s_settings.dot_enabled ? "1" : "0", path);
     WriteFloat("Dot", "DistanceMeters", s_settings.dot_distance_m, path);
     WriteFloat("Weapon", "OffsetForward", s_settings.weapon_offset_forward, path);
     WriteFloat("Weapon", "OffsetRight", s_settings.weapon_offset_right, path);
@@ -311,6 +322,7 @@ void Save(const char* path) {
     WriteFloat("Hands", "RightPitch", s_settings.right_hand_rotation_pitch, path);
     WriteFloat("Hands", "RightYaw", s_settings.right_hand_rotation_yaw, path);
     WriteFloat("Hands", "RightRoll", s_settings.right_hand_rotation_roll, path);
+    WriteFloat("Hands", "ArmReachScale", s_settings.arm_reach_scale, path);
     WriteFloat("Dot", "HorizontalOffset", s_settings.dot_horizontal_offset, path);
     WriteFloat("Dot", "VerticalOffset", s_settings.dot_vertical_offset, path);
     WritePrivateProfileStringA("Visibility", "HidePlayerBodyAndArms",

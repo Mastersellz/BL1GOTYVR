@@ -71,6 +71,10 @@ public:
     bool IsMotionControlsEnabled() const {
         return m_motionControlsEnabled.load(std::memory_order_acquire);
     }
+    bool IsPhysicalMeleeAnimationSuppressed() const {
+        return GetTickCount64() <
+            m_physicalMeleeAnimationSuppressUntilMs.load(std::memory_order_acquire);
+    }
     bool IsWeaponPoseActive() const {
         return m_weaponPoseActive.load(std::memory_order_acquire);
     }
@@ -98,8 +102,9 @@ private:
 
     void ProcessTurn();
     void PollAimTuningKeys();
-    bool UpdatePhysicalMelee(const ControllerState& left, uint64_t nowMs);
-    void ResetPhysicalMelee();
+    bool UpdatePhysicalMelee(const ControllerState& controller, int hand,
+                             uint64_t nowMs, bool fistMode);
+    void ResetPhysicalMelee(int hand = -1);
     void ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
                                   const char* characterMeshName,
                                   const char* outerName, const char* meshName,
@@ -141,16 +146,21 @@ private:
     uint64_t m_bPressMs = 0;
     uint64_t m_bTapPulseUntilMs = 0;
 
-    /* Physical melee swing detector */
-    float m_meleePreviousTip[3] = {};
-    float m_meleeFilteredSpeed = 0.0f;
-    float m_meleeTravel = 0.0f;
-    uint64_t m_meleePreviousSampleMs = 0;
-    uint64_t m_meleeBelowThresholdSinceMs = 0;
-    uint64_t m_physicalMeleePulseUntilMs = 0;
-    uint64_t m_physicalMeleeCooldownUntilMs = 0;
-    bool m_meleeTipValid = false;
-    bool m_physicalMeleeReady = true;
+    /* Physical melee swing detectors, one per tracked hand. */
+    struct PhysicalMeleeTracker {
+        float previousTip[3] = {};
+        float filteredSpeed = 0.0f;
+        float travel = 0.0f;
+        uint64_t previousSampleMs = 0;
+        uint64_t belowThresholdSinceMs = 0;
+        uint64_t pulseUntilMs = 0;
+        uint64_t cooldownUntilMs = 0;
+        bool tipValid = false;
+        bool ready = true;
+    };
+    PhysicalMeleeTracker m_melee[2] = {};
+    bool m_berserkPunchMode = false;
+    std::atomic<uint64_t> m_physicalMeleeAnimationSuppressUntilMs{0};
 
     /* Turn system */
     float m_snapTurnAccum = 0;
@@ -180,6 +190,7 @@ private:
     uint64_t m_mountIdentityGeneration = 0;
     bool m_weaponMountValid = false;
     bool m_weaponMountAbsolute = false;
+    bool m_weaponAttachmentDriven = false;
     int m_weaponBarrelAxis = 0;
     float m_weaponBarrelSign = 1.0f;
     static constexpr int kWeaponMountCacheCapacity = 16;
@@ -220,6 +231,7 @@ private:
     bool m_weaponTuningPositionMode = false;
     int m_handTuningHand = 1;
     bool m_handTuningDirty = false;
+    uint64_t m_handTuningLastChangedMs = 0;
     bool m_aimTuningDirty = false;
     float m_aimTrimPitch = 0.0f;
     float m_aimTrimYaw = 0.0f;

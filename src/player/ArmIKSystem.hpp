@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "RoomScaleBody.hpp"
+#include "../input/XRInput.hpp"
 
 namespace bl1gotyvr::player {
 
@@ -98,6 +99,7 @@ public:
     bool IsVisibilityEnabled() const { return m_visibilityEnabled.load(); }
     void SetSimulationEnabled(bool enabled);
     bool IsSimulationEnabled() const { return m_simulationEnabled.load(); }
+    bool IsBrickBerserkActive() const;
     void RequestRescan();
     void RequestInventoryScan();
     void RequestCalibrationReset();
@@ -113,7 +115,9 @@ public:
                            const float headTrackingPosition[3],
                            const float headTrackingRotation[4],
                            const float trackingReferencePosition[3],
-                           const float trackingReferenceRotation[4]);
+                           const float trackingReferenceRotation[4],
+                           const input::ControllerState controllers[2],
+                           uint64_t controllerGeneration);
     bool GetWorldHandTarget(uint64_t targetGeneration, int hand,
                             float position[3], float forward[3], float up[3]) const;
     void SetRenderContext(uint64_t renderGeneration, uint64_t targetGeneration);
