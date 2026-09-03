@@ -17,6 +17,7 @@ constexpr int kRollCheck = 204;
 constexpr int kLoggingCheck = 205;
 constexpr int kDotCheck = 206;
 constexpr int kHmdDirectionCheck = 207;
+constexpr int kPhysicalCrouchCheck = 208;
 constexpr int kLowPreset = 210;
 constexpr int kMediumPreset = 211;
 constexpr int kHighPreset = 212;
@@ -84,6 +85,7 @@ void SetDefaults(HWND window) {
     CheckDlgButton(window, kLoggingCheck, BST_CHECKED);
     CheckDlgButton(window, kDotCheck, BST_CHECKED);
     CheckDlgButton(window, kHmdDirectionCheck, BST_UNCHECKED);
+    CheckDlgButton(window, kPhysicalCrouchCheck, BST_CHECKED);
 }
 
 void ApplyRenderPreset(HWND window, int id) {
@@ -115,6 +117,9 @@ void LoadSettings(HWND window) {
         GetPrivateProfileIntA("Dot", "Enabled", 1, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(window, kHmdDirectionCheck,
         GetPrivateProfileIntA("Input", "HmdDirectedLocomotion", 0, path.c_str())
+            ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(window, kPhysicalCrouchCheck,
+        GetPrivateProfileIntA("Input", "PhysicalCrouch", 1, path.c_str())
             ? BST_CHECKED : BST_UNCHECKED);
 }
 
@@ -229,6 +234,9 @@ void SaveSettings(HWND window) {
     WritePrivateProfileStringA("Input", "HmdDirectedLocomotion",
         IsDlgButtonChecked(window, kHmdDirectionCheck) == BST_CHECKED ? "1" : "0",
         path.c_str());
+    WritePrivateProfileStringA("Input", "PhysicalCrouch",
+        IsDlgButtonChecked(window, kPhysicalCrouchCheck) == BST_CHECKED ? "1" : "0",
+        path.c_str());
 
     const bool gameIniUpdated = UpdateGameResolution(width, height);
     const bool weaponBobDisabled = DisableGameWeaponBob();
@@ -288,6 +296,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 532);
         CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 562);
         CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 562);
+        CreateCheckbox(window, "Physical crouch", kPhysicalCrouchCheck, 274, 586);
 
         CreateWindowExA(0, "BUTTON", "Save settings", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
                         154, 604, 110, 34, window,

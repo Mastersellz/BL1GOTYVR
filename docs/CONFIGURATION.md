@@ -31,6 +31,7 @@ Save; resolution and OpenXR refresh-rate changes require restarting the game.
 | Debug logging | On/off | Enables runtime diagnostic logging |
 | Aim dot | On/off | Shows or hides the controller-driven aiming dot |
 | HMD-directed movement | On/off | Rotates left-stick locomotion by current HMD yaw instead of body/game forward |
+| Physical crouch | On/off | Toggles the game's crouch when tracked head height crosses the calibrated posture threshold |
 | Arm reach scale | 1.00 to 1.60 | Allows the IK arm segments to stretch toward the tracked hands; `1.35` matches a roughly 75 cm reach on the current rigs |
 | Hide player body and arms | On/off | Experimental `Visibility/HidePlayerBodyAndArms` gate; off by default and only writes after runtime identity and reflected-schema validation |
 

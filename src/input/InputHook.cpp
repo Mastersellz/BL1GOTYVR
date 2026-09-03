@@ -183,6 +183,8 @@ void InputHook::ReleaseAllInput() {
     m_recenterChordLatched = false;
     m_yPressMs = m_yTapPulseUntilMs = 0;
     m_bPressMs = m_bTapPulseUntilMs = 0;
+    m_physicalCrouchPulseUntilMs = 0;
+    m_physicalCrouchGameState = false;
     m_weaponGrabArmed.store(false, std::memory_order_release);
     m_weaponGrabHeld.store(false, std::memory_order_release);
     m_weaponGrabCancelRequested.store(false, std::memory_order_release);
@@ -541,6 +543,26 @@ void InputHook::UpdateState(XrTime displayTime) {
     }
     m_bWasDown = bDown;
     const bool bTapPulse = !bDown && now < m_bTapPulseUntilMs;
+    bool physicalCrouchPulse = false;
+    if (vehicleMode) {
+        m_physicalCrouchGameState = false;
+        m_physicalCrouchPulseUntilMs = 0;
+    } else {
+        const bool physicalCrouchDesired = cfg.physical_crouch_enabled &&
+            cfg.room_scale_enabled &&
+            m_motionControlsEnabled.load(std::memory_order_acquire) &&
+            player::ArmIKSystem::Instance().GetPhysicalPoseIntent() !=
+                player::PhysicalPose::Standing;
+        if (physicalCrouchDesired != m_physicalCrouchGameState) {
+            m_physicalCrouchGameState = physicalCrouchDesired;
+            m_physicalCrouchPulseUntilMs = now + 100;
+            Log("[Input] Physical crouch %s",
+                physicalCrouchDesired ? "entered" : "exited");
+        }
+        physicalCrouchPulse = now < m_physicalCrouchPulseUntilMs;
+    }
+    const bool crouchPulse = physicalCrouchPulse ||
+        (!cfg.physical_crouch_enabled && bTapPulse);
 
     const bool bothSticksClicked = left.thumbstickClick && right.thumbstickClick;
     if (bothSticksClicked && !m_recenterChordLatched) {
@@ -556,7 +578,7 @@ void InputHook::UpdateState(XrTime displayTime) {
 
     WORD buttons = chordDirection;
     if (right.buttonA) buttons |= XINPUT_GAMEPAD_A;
-    if (bTapPulse) buttons |= XINPUT_GAMEPAD_B;
+    if (crouchPulse) buttons |= XINPUT_GAMEPAD_B;
     if (left.buttonX) buttons |= XINPUT_GAMEPAD_X;
     if (yTapPulse) buttons |= XINPUT_GAMEPAD_Y;
     if (m_leftGripDown) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
@@ -632,7 +654,7 @@ void InputHook::UpdateState(XrTime displayTime) {
             berserkPunchMode ? leftPunchPulse : (adsActive || vehicleSecondaryFire),
             m_prevButtonA);
         setKey(VK_SPACE, right.buttonA, m_prevJump);
-        setKey('C', bTapPulse, m_prevCrouch);
+        setKey('C', crouchPulse, m_prevCrouch);
         setKey('E', left.buttonX, m_prevUse);
         setKey('R', left.buttonX, m_prevReload);
         setKey('F', m_leftGripDown, m_prevGrip);

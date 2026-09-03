@@ -97,6 +97,9 @@ void Load(const char* path) {
     s_settings.hmd_directed_locomotion = GetPrivateProfileIntA(
         "Input", "HmdDirectedLocomotion",
         s_settings.hmd_directed_locomotion ? 1 : 0, path) != 0;
+    s_settings.physical_crouch_enabled = GetPrivateProfileIntA(
+        "Input", "PhysicalCrouch",
+        s_settings.physical_crouch_enabled ? 1 : 0, path) != 0;
     s_settings.room_scale_enabled = GetPrivateProfileIntA(
         "RoomScale", "Enabled", s_settings.room_scale_enabled, path) != 0;
     s_settings.room_scale_allow_horizontal = GetPrivateProfileIntA(
@@ -274,6 +277,8 @@ void Save(const char* path) {
     WriteFloat("Input", "LocomotionDeadzone", s_settings.locomotion_deadzone, path);
     WritePrivateProfileStringA("Input", "HmdDirectedLocomotion",
         s_settings.hmd_directed_locomotion ? "1" : "0", path);
+    WritePrivateProfileStringA("Input", "PhysicalCrouch",
+        s_settings.physical_crouch_enabled ? "1" : "0", path);
     WritePrivateProfileStringA("RoomScale", "Enabled",
         s_settings.room_scale_enabled ? "1" : "0", path);
     WritePrivateProfileStringA("RoomScale", "AllowHorizontal",

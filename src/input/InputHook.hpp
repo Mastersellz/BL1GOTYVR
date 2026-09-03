@@ -145,6 +145,8 @@ private:
     uint64_t m_yTapPulseUntilMs = 0;
     uint64_t m_bPressMs = 0;
     uint64_t m_bTapPulseUntilMs = 0;
+    uint64_t m_physicalCrouchPulseUntilMs = 0;
+    bool m_physicalCrouchGameState = false;
 
     /* Physical melee swing detectors, one per tracked hand. */
     struct PhysicalMeleeTracker {

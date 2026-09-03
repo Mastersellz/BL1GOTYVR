@@ -42,6 +42,7 @@ float hud_horizontal_offset = 0.0f;
     float smooth_turn_speed = 90.0f;
     float locomotion_deadzone = 0.2f;
     bool hmd_directed_locomotion = false;
+    bool physical_crouch_enabled = true;
 
     /* Room-scale body tracking */
     bool room_scale_enabled = true;
