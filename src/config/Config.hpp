@@ -85,7 +85,7 @@ float hud_horizontal_offset = 0.0f;
     float right_hand_rotation_pitch = 0.0f;
     float right_hand_rotation_yaw = 0.0f;
     float right_hand_rotation_roll = 0.0f;
-    float arm_reach_scale = 1.35f;
+    float arm_reach_scale = 1.60f;
 
     /* Legacy visual-only aim dot offsets in normalized eye UV */
     float dot_horizontal_offset = 0.0f;
@@ -94,7 +94,7 @@ float hud_horizontal_offset = 0.0f;
     /* Player visibility */
     bool hide_player_body_and_arms = false;
     bool vanilla_hands_filter = true;
-    float vanilla_hands_cut_threshold = 74.0f;
+    float vanilla_hands_cut_threshold = 70.0f;
 
     /* Debug */
     bool debug_force_no_hud_layer = false;  /* Skip HUD layer submission for VDXR testing */

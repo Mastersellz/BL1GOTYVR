@@ -13,10 +13,12 @@
 #include <dxgi.h>
 #include <dxgi1_4.h>
 #include <Windows.h>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <unordered_map>
 #include <vector>
 
 #pragma comment(lib, "d3d11.lib")
@@ -39,6 +41,8 @@ using PSSetShaderResourcesFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UI
                                                           ID3D11ShaderResourceView* const*);
 using IASetIndexBufferFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*,
                                                      DXGI_FORMAT, UINT);
+using IASetVertexBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT,
+    ID3D11Buffer* const*, const UINT*, const UINT*);
 using CreateDeviceFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
     const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**, D3D_FEATURE_LEVEL*,
     ID3D11DeviceContext**);
@@ -53,6 +57,7 @@ static ResolveSubresourceFn oResolveSubresource = nullptr;
 static OMSetRenderTargetsFn oOMSetRenderTargets = nullptr;
 static PSSetShaderResourcesFn oPSSetShaderResources = nullptr;
 static IASetIndexBufferFn oIASetIndexBuffer = nullptr;
+static IASetVertexBuffersFn oIASetVertexBuffers = nullptr;
 static CreateDeviceFn oCreateDevice = nullptr;
 static CreateDeviceAndSwapChainFn oCreateDeviceAndSwapChain = nullptr;
 static std::atomic<bool> s_deviceCompatibilityInstalled{false};
@@ -106,6 +111,7 @@ static uint64_t              s_consumedPostTonemapGeneration = 0;
 static SRWLOCK               s_captureLock = SRWLOCK_INIT;
 static thread_local bool     s_insidePresent = false;
 static ID3D11Buffer*         s_handOnlyIndexBuffer = nullptr;
+static ID3D11Buffer*         s_handOnlyVertexBuffer = nullptr;
 static ID3D11Device*         s_handOnlyDevice = nullptr;
 static ID3D11Buffer*         s_targetVertexBuffer = nullptr;
 static ID3D11Buffer*         s_targetIndexBuffer = nullptr;
@@ -113,7 +119,8 @@ static uintptr_t             s_targetComponent = 0;
 static uintptr_t             s_targetSkeletalMesh = 0;
 static ID3D11Buffer*         s_replacedSourceIndexBuffer = nullptr;
 static std::atomic<bool>     s_vanillaHandsFilterEnabled{false};
-static std::atomic<float>    s_vanillaHandsCutThreshold{74.0f};
+static std::atomic<bool>     s_handGeometryHooksReady{false};
+static std::atomic<float>    s_vanillaHandsCutThreshold{70.0f};
 static std::atomic<bool>     s_handOnlyBufferAttempted{false};
 
 static constexpr UINT kHandsVertexStride = 32;
@@ -126,11 +133,12 @@ struct HandBufferSignature {
 };
 
 static constexpr HandBufferSignature kHandBufferSignatures[] = {
-    {"Lilith",   2805 * kHandsVertexStride, 11760 * sizeof(uint16_t), 74.0f},
-    {"Brick",    4264 * kHandsVertexStride, 20763 * sizeof(uint16_t), 74.0f},
-    {"Mordecai", 3318 * kHandsVertexStride, 16347 * sizeof(uint16_t), 74.0f},
-    {"Roland",   2561 * kHandsVertexStride, 13116 * sizeof(uint16_t), 74.0f},
+    {"Lilith",   2805 * kHandsVertexStride, 11760 * sizeof(uint16_t), 70.0f},
+    {"Brick",    4264 * kHandsVertexStride, 20763 * sizeof(uint16_t), 70.0f},
+    {"Mordecai", 3318 * kHandsVertexStride, 16347 * sizeof(uint16_t), 70.0f},
+    {"Roland",   2561 * kHandsVertexStride, 13116 * sizeof(uint16_t), 70.0f},
 };
+static const HandBufferSignature* s_targetHandSignature = nullptr;
 static SRWLOCK               s_handFilterLock = SRWLOCK_INIT;
 static ID3D11Buffer*         s_pendingHandVertexBuffer = nullptr;
 static ID3D11Buffer*         s_pendingHandIndexBuffer = nullptr;
@@ -633,9 +641,14 @@ static void ResetHandViewmodelIdentity() {
     }
     s_targetComponent = 0;
     s_targetSkeletalMesh = 0;
+    s_targetHandSignature = nullptr;
     if (s_handOnlyIndexBuffer) {
         s_handOnlyIndexBuffer->Release();
         s_handOnlyIndexBuffer = nullptr;
+    }
+    if (s_handOnlyVertexBuffer) {
+        s_handOnlyVertexBuffer->Release();
+        s_handOnlyVertexBuffer = nullptr;
     }
     s_handOnlyBufferAttempted = false;
     ReleaseSRWLockExclusive(&s_handFilterLock);
@@ -682,7 +695,9 @@ static bool ReadBuffer(ID3D11DeviceContext* context, ID3D11Buffer* source,
 
 static ID3D11Buffer* CreateHandOnlyIndexBuffer(
         ID3D11DeviceContext* context, ID3D11Buffer* vertexBuffer,
-        ID3D11Buffer* indexBuffer, const HandBufferSignature& signature) {
+        ID3D11Buffer* indexBuffer, const HandBufferSignature& signature,
+        ID3D11Buffer** cappedVertexBuffer) {
+    if (cappedVertexBuffer) *cappedVertexBuffer = nullptr;
     std::vector<uint8_t> vertexBytes;
     std::vector<uint8_t> indexBytes;
     if (!ReadBuffer(context, vertexBuffer, vertexBytes) ||
@@ -697,28 +712,47 @@ static ID3D11Buffer* CreateHandOnlyIndexBuffer(
         return nullptr;
     std::vector<uint16_t> filtered(indexCount);
     memcpy(filtered.data(), indexBytes.data(), indexBytes.size());
+    const size_t triangleCount = indexCount / 3;
+    std::vector<uint8_t> keepTriangle(triangleCount, 0);
+    struct RemovedTriangle {
+        size_t start = 0;
+        float cutDistance = 1.0e9f;
+    };
+    std::vector<RemovedTriangle> removedTriangles;
     size_t keptTriangles = 0;
     const float positionThreshold = s_vanillaHandsCutThreshold.load(
         std::memory_order_acquire);
+    size_t boundaryTriangles = 0;
     for (size_t start = 0; start < indexCount; start += 3) {
-        bool keep = true;
+        bool valid = true;
+        int handSideCorners = 0;
+        float triangleAbsX = 0.0f;
         for (size_t corner = 0; corner < 3; ++corner) {
             const uint16_t vertex = filtered[start + corner];
             float x = 0.0f;
             if (vertex >= vertexCount) {
-                keep = false;
+                valid = false;
                 break;
             }
             memcpy(&x, vertexBytes.data() + static_cast<size_t>(vertex) *
                 kHandsVertexStride, sizeof(x));
-            if (!std::isfinite(x) || std::fabs(x) < positionThreshold) {
-                keep = false;
+            if (!std::isfinite(x)) {
+                valid = false;
                 break;
             }
+            triangleAbsX += std::fabs(x);
+            if (std::fabs(x) >= positionThreshold) ++handSideCorners;
         }
+        const bool keep = valid && handSideCorners == 3;
+        keepTriangle[start / 3] = keep ? 1 : 0;
+        if (valid && handSideCorners > 0 && handSideCorners < 3)
+            ++boundaryTriangles;
         if (keep) {
             ++keptTriangles;
         } else {
+            removedTriangles.push_back({start, valid
+                ? std::fabs(triangleAbsX / 3.0f - positionThreshold)
+                : 1.0e9f});
             filtered[start + 1] = filtered[start];
             filtered[start + 2] = filtered[start];
         }
@@ -729,9 +763,184 @@ static ID3D11Buffer* CreateHandOnlyIndexBuffer(
         return nullptr;
     }
 
+    std::sort(removedTriangles.begin(), removedTriangles.end(),
+        [](const RemovedTriangle& a, const RemovedTriangle& b) {
+            return a.cutDistance < b.cutDistance;
+        });
+
+    struct EdgeUse {
+        uint16_t first = 0;
+        uint16_t second = 0;
+        bool kept = false;
+        bool removed = false;
+    };
+    std::unordered_map<uint32_t, EdgeUse> edgeUses;
+    edgeUses.reserve(indexCount);
+    for (size_t triangle = 0; triangle < triangleCount; ++triangle) {
+        const size_t start = triangle * 3;
+        const uint16_t corners[3] = {
+            reinterpret_cast<const uint16_t*>(indexBytes.data())[start],
+            reinterpret_cast<const uint16_t*>(indexBytes.data())[start + 1],
+            reinterpret_cast<const uint16_t*>(indexBytes.data())[start + 2]};
+        for (int edge = 0; edge < 3; ++edge) {
+            const uint16_t a = corners[edge];
+            const uint16_t b = corners[(edge + 1) % 3];
+            if (a >= vertexCount || b >= vertexCount || a == b) continue;
+            const uint16_t low = (std::min)(a, b);
+            const uint16_t high = (std::max)(a, b);
+            const uint32_t key = (static_cast<uint32_t>(low) << 16) | high;
+            EdgeUse& use = edgeUses[key];
+            use.first = low;
+            use.second = high;
+            if (keepTriangle[triangle]) use.kept = true;
+            else use.removed = true;
+        }
+    }
+
+    struct CapVertex {
+        uint16_t index = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        float angle = 0.0f;
+    };
+    std::vector<uint16_t> boundaryIndices[2];
+    for (const auto& item : edgeUses) {
+        const EdgeUse& edge = item.second;
+        if (!edge.kept || !edge.removed) continue;
+        const uint16_t vertices[2] = {edge.first, edge.second};
+        for (uint16_t vertex : vertices) {
+            float x = 0.0f;
+            memcpy(&x, vertexBytes.data() + static_cast<size_t>(vertex) *
+                kHandsVertexStride, sizeof(x));
+            if (!std::isfinite(x)) continue;
+            boundaryIndices[x < 0.0f ? 0 : 1].push_back(vertex);
+        }
+    }
+
+    size_t capTriangles = 0;
+    size_t removedSlot = 0;
+    size_t cappedRings = 0;
+    std::vector<uint8_t> cappedVertexBytes = vertexBytes;
+    for (int handSide = 0; handSide < 2; ++handSide) {
+        auto& indices = boundaryIndices[handSide];
+        std::sort(indices.begin(), indices.end());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+        if (indices.size() < 3) continue;
+
+        std::vector<CapVertex> ring;
+        ring.reserve(indices.size());
+        float centerX = 0.0f;
+        float centerY = 0.0f;
+        float centerZ = 0.0f;
+        for (uint16_t index : indices) {
+            const uint8_t* vertex = vertexBytes.data() +
+                static_cast<size_t>(index) * kHandsVertexStride;
+            CapVertex point;
+            point.index = index;
+            memcpy(&point.x, vertex, sizeof(float));
+            memcpy(&point.y, vertex + sizeof(float), sizeof(float));
+            memcpy(&point.z, vertex + sizeof(float) * 2, sizeof(float));
+            if (!std::isfinite(point.y) || !std::isfinite(point.z)) continue;
+            centerX += point.x;
+            centerY += point.y;
+            centerZ += point.z;
+            ring.push_back(point);
+        }
+        if (ring.size() < 3) continue;
+        centerX /= static_cast<float>(ring.size());
+        centerY /= static_cast<float>(ring.size());
+        centerZ /= static_cast<float>(ring.size());
+        constexpr float kCapInsetUe = 8.0f;
+        centerX += handSide == 0 ? -kCapInsetUe : kCapInsetUe;
+        for (CapVertex& point : ring)
+            point.angle = atan2f(point.z - centerZ, point.y - centerY);
+        std::sort(ring.begin(), ring.end(), [](const CapVertex& a,
+                                               const CapVertex& b) {
+            return a.angle < b.angle;
+        });
+
+        std::vector<CapVertex> uniqueRing;
+        uniqueRing.reserve(ring.size());
+        for (const CapVertex& point : ring) {
+            if (!uniqueRing.empty()) {
+                const CapVertex& previous = uniqueRing.back();
+                const float dx = point.x - previous.x;
+                const float dy = point.y - previous.y;
+                const float dz = point.z - previous.z;
+                if (dx*dx + dy*dy + dz*dz < 0.0001f) continue;
+            }
+            uniqueRing.push_back(point);
+        }
+        if (uniqueRing.size() < 3) continue;
+
+        const size_t centerIndex = cappedVertexBytes.size() / kHandsVertexStride;
+        if (centerIndex > UINT16_MAX) continue;
+        size_t templatePoint = 0;
+        float nearestDistance = 1.0e30f;
+        for (size_t index = 0; index < uniqueRing.size(); ++index) {
+            const float dx = uniqueRing[index].x - centerX;
+            const float dy = uniqueRing[index].y - centerY;
+            const float dz = uniqueRing[index].z - centerZ;
+            const float distance = dx*dx + dy*dy + dz*dz;
+            if (distance < nearestDistance) {
+                nearestDistance = distance;
+                templatePoint = index;
+            }
+        }
+        const uint8_t* templateVertex = vertexBytes.data() +
+            static_cast<size_t>(uniqueRing[templatePoint].index) * kHandsVertexStride;
+        cappedVertexBytes.insert(cappedVertexBytes.end(), templateVertex,
+                                 templateVertex + kHandsVertexStride);
+        uint8_t* centerVertex = cappedVertexBytes.data() +
+            centerIndex * kHandsVertexStride;
+        memcpy(centerVertex, &centerX, sizeof(float));
+        memcpy(centerVertex + sizeof(float), &centerY, sizeof(float));
+        memcpy(centerVertex + sizeof(float) * 2, &centerZ, sizeof(float));
+        const uint16_t root = static_cast<uint16_t>(centerIndex);
+        for (size_t index = 0; index < uniqueRing.size(); ++index) {
+            if (removedSlot + 1 >= removedTriangles.size()) break;
+            const uint16_t a = uniqueRing[index].index;
+            const uint16_t b = uniqueRing[(index + 1) % uniqueRing.size()].index;
+            const uint16_t first = handSide == 0 ? a : b;
+            const uint16_t second = handSide == 0 ? b : a;
+            const size_t front = removedTriangles[removedSlot++].start;
+            filtered[front] = root;
+            filtered[front + 1] = first;
+            filtered[front + 2] = second;
+            const size_t back = removedTriangles[removedSlot++].start;
+            filtered[back] = root;
+            filtered[back + 1] = second;
+            filtered[back + 2] = first;
+            capTriangles += 2;
+        }
+        ++cappedRings;
+    }
+    const float capSlotDistance = removedSlot > 0
+        ? removedTriangles[removedSlot - 1].cutDistance : 0.0f;
     ID3D11Device* device = nullptr;
     context->GetDevice(&device);
     if (!device) return nullptr;
+    ID3D11Buffer* replacementVertexBuffer = nullptr;
+    D3D11_BUFFER_DESC sourceVertexDesc = {};
+    vertexBuffer->GetDesc(&sourceVertexDesc);
+    D3D11_BUFFER_DESC cappedVertexDesc = sourceVertexDesc;
+    cappedVertexDesc.ByteWidth = static_cast<UINT>(cappedVertexBytes.size());
+    cappedVertexDesc.Usage = D3D11_USAGE_IMMUTABLE;
+    cappedVertexDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    cappedVertexDesc.CPUAccessFlags = 0;
+    cappedVertexDesc.MiscFlags = 0;
+    cappedVertexDesc.StructureByteStride = 0;
+    D3D11_SUBRESOURCE_DATA cappedVertexData = {};
+    cappedVertexData.pSysMem = cappedVertexBytes.data();
+    const HRESULT vertexResult = device->CreateBuffer(
+        &cappedVertexDesc, &cappedVertexData, &replacementVertexBuffer);
+    if (FAILED(vertexResult) || !replacementVertexBuffer) {
+        Log("[VanillaHands] ERROR: capped vertex buffer creation failed: 0x%08X",
+            vertexResult);
+        device->Release();
+        return nullptr;
+    }
     D3D11_BUFFER_DESC desc = {};
     desc.ByteWidth = static_cast<UINT>(indexBytes.size());
     desc.Usage = D3D11_USAGE_IMMUTABLE;
@@ -742,11 +951,17 @@ static ID3D11Buffer* CreateHandOnlyIndexBuffer(
     const HRESULT result = device->CreateBuffer(&desc, &data, &replacement);
     device->Release();
     if (FAILED(result) || !replacement) {
-        Log("[VanillaHands] ERROR: dynamic index buffer creation failed: 0x%08X", result);
+        Log("[VanillaHands] ERROR: capped index buffer creation failed: 0x%08X", result);
+        replacementVertexBuffer->Release();
         return nullptr;
     }
-    Log("[VanillaHands] %s cut ready: vertices=%zu kept=%zu/%zu threshold=%.1f",
-        signature.character, vertexCount, keptTriangles, indexCount / 3,
+    if (cappedVertexBuffer) *cappedVertexBuffer = replacementVertexBuffer;
+    else replacementVertexBuffer->Release();
+
+    Log("[VanillaHands] %s center-capped cut ready: vertices=%zu+%zu kept=%zu/%zu "
+        "boundary=%zu rings=%zu caps=%zu slotDistance=%.1f threshold=%.1f",
+        signature.character, vertexCount, cappedRings, keptTriangles, indexCount / 3,
+        boundaryTriangles, cappedRings, capTriangles, capSlotDistance,
         positionThreshold);
     return replacement;
 }
@@ -771,6 +986,29 @@ static void QueueHandOnlyIndexBuffer(ID3D11Buffer* vertexBuffer,
             "character=%s", signature->character);
     }
     ReleaseSRWLockExclusive(&s_handFilterLock);
+}
+
+static void STDMETHODCALLTYPE HookedIASetVertexBuffers(
+        ID3D11DeviceContext* context, UINT startSlot, UINT bufferCount,
+        ID3D11Buffer* const* vertexBuffers, const UINT* strides,
+        const UINT* offsets) {
+    if (s_insidePresent || !IsGameDeviceContext(context) || startSlot != 0 ||
+        bufferCount == 0 ||
+        bufferCount > D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT || !vertexBuffers ||
+        !s_vanillaHandsFilterEnabled.load(std::memory_order_acquire)) {
+        oIASetVertexBuffers(context, startSlot, bufferCount, vertexBuffers,
+                            strides, offsets);
+        return;
+    }
+
+    ID3D11Buffer* replacements[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+    memcpy(replacements, vertexBuffers, sizeof(ID3D11Buffer*) * bufferCount);
+    AcquireSRWLockShared(&s_handFilterLock);
+    if (s_handOnlyVertexBuffer && replacements[0] == s_targetVertexBuffer)
+        replacements[0] = s_handOnlyVertexBuffer;
+    oIASetVertexBuffers(context, startSlot, bufferCount, replacements,
+                        strides, offsets);
+    ReleaseSRWLockShared(&s_handFilterLock);
 }
 
 static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* context,
@@ -818,17 +1056,33 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
     const bool signatureMatches = signature != nullptr;
     bool targetMissing = true;
     bool identityMatches = false;
+    bool characterSignatureChanged = false;
     ID3D11Buffer* replacement = nullptr;
     AcquireSRWLockShared(&s_handFilterLock);
     targetMissing = s_targetVertexBuffer == nullptr;
+    characterSignatureChanged = !targetMissing && signatureMatches &&
+        s_targetHandSignature && signature != s_targetHandSignature;
     identityMatches = targetMissing ||
-        (vertexBuffer == s_targetVertexBuffer && indexBuffer == s_targetIndexBuffer);
+        ((vertexBuffer == s_targetVertexBuffer ||
+          vertexBuffer == s_handOnlyVertexBuffer) &&
+         indexBuffer == s_targetIndexBuffer);
     if (!targetMissing && identityMatches && s_handOnlyIndexBuffer) {
         replacement = s_handOnlyIndexBuffer;
         replacement->AddRef();
     }
     ReleaseSRWLockShared(&s_handFilterLock);
-    if (signatureMatches && identityMatches) {
+    if (characterSignatureChanged) {
+        Log("[VanillaHands] Character geometry changed to %s; rebuilding capped buffers",
+            signature->character);
+        ResetHandViewmodelIdentity();
+        QueueHandOnlyIndexBuffer(vertexBuffer, indexBuffer, signature,
+            rigIdentityValid ? rig.component : 0,
+            rigIdentityValid ? rig.skeletalMesh : 0);
+        vertexBuffer->Release();
+        oIASetIndexBuffer(context, indexBuffer, format, offset);
+        return;
+    }
+    if (identityMatches && (targetMissing ? signatureMatches : true)) {
         if (targetMissing) {
             QueueHandOnlyIndexBuffer(vertexBuffer, indexBuffer, signature,
                 rigIdentityValid ? rig.component : 0,
@@ -912,9 +1166,12 @@ static void EnsureHandOnlyIndexBuffer(ID3D11Device* device) {
     D3D11_BUFFER_DESC indexDesc = {};
     vertexBuffer->GetDesc(&vertexDesc);
     indexBuffer->GetDesc(&indexDesc);
+    ID3D11Buffer* replacementVertexBuffer = nullptr;
     ID3D11Buffer* replacement = CreateHandOnlyIndexBuffer(
-        s_gameContext, vertexBuffer, indexBuffer, *signature);
+        s_gameContext, vertexBuffer, indexBuffer, *signature,
+        &replacementVertexBuffer);
     if (!replacement) {
+        if (replacementVertexBuffer) replacementVertexBuffer->Release();
         vertexBuffer->Release();
         indexBuffer->Release();
         return;
@@ -922,9 +1179,12 @@ static void EnsureHandOnlyIndexBuffer(ID3D11Device* device) {
 
     AcquireSRWLockExclusive(&s_handFilterLock);
     if (s_handOnlyIndexBuffer) s_handOnlyIndexBuffer->Release();
+    if (s_handOnlyVertexBuffer) s_handOnlyVertexBuffer->Release();
     s_handOnlyIndexBuffer = replacement;
+    s_handOnlyVertexBuffer = replacementVertexBuffer;
     s_targetVertexBuffer = vertexBuffer;
     s_targetIndexBuffer = indexBuffer;
+    s_targetHandSignature = signature;
     s_targetComponent = component;
     s_targetSkeletalMesh = skeletalMesh;
     ReleaseSRWLockExclusive(&s_handFilterLock);
@@ -1000,7 +1260,9 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
                 config::Get().hide_player_body_and_arms);
         }
         s_vanillaHandsFilterEnabled.store(
-            config::Get().vanilla_hands_filter, std::memory_order_release);
+            config::Get().vanilla_hands_filter &&
+                s_handGeometryHooksReady.load(std::memory_order_acquire),
+            std::memory_order_release);
         const float cutThreshold = config::Get().vanilla_hands_cut_threshold;
         const float previousCutThreshold = s_vanillaHandsCutThreshold.exchange(
             cutThreshold, std::memory_order_acq_rel);
@@ -1242,6 +1504,7 @@ bool InstallHooks() {
     void* copyResourceTarget = contextVtable[47];
     void* resolveTarget = contextVtable[57];
     void* omSetRenderTargetsTarget = contextVtable[33];
+    void* iaSetVertexBuffersTarget = contextVtable[18];
     void* iaSetIndexBufferTarget = contextVtable[19];
     Log("[BL1GOTYVR] DXGI targets: Present=%p ResizeBuffers=%p", presentTarget, resizeTarget);
 
@@ -1338,7 +1601,16 @@ bool InstallHooks() {
         reinterpret_cast<void**>(&oIASetIndexBuffer));
     if (indexBufferStatus == MH_OK)
         indexBufferStatus = MH_QueueEnableHook(iaSetIndexBufferTarget);
+    MH_STATUS vertexBufferStatus = MH_CreateHook(
+        iaSetVertexBuffersTarget, &HookedIASetVertexBuffers,
+        reinterpret_cast<void**>(&oIASetVertexBuffers));
+    if (vertexBufferStatus == MH_OK)
+        vertexBufferStatus = MH_QueueEnableHook(iaSetVertexBuffersTarget);
     const MH_STATUS applyStatus = MH_ApplyQueued();
+    s_handGeometryHooksReady.store(
+        vertexBufferStatus == MH_OK && indexBufferStatus == MH_OK &&
+            applyStatus == MH_OK,
+        std::memory_order_release);
     if (presentStatus == MH_OK && applyStatus != MH_OK) presentStatus = applyStatus;
     if (presentStatus != MH_OK) {
         Log("[BL1GOTYVR] ERROR: Present hook failed: %s", MH_StatusToString(presentStatus));
@@ -1347,8 +1619,8 @@ bool InstallHooks() {
     Log("[BL1GOTYVR] Composition hooks queued: CopyResource=%s ResolveSubresource=%s OMSetRT=%s Apply=%s",
         MH_StatusToString(copyStatus), MH_StatusToString(resolveStatus), MH_StatusToString(omStatus),
         MH_StatusToString(applyStatus));
-    Log("[VanillaHands] Geometry hook queued: IASetIB=%s",
-        MH_StatusToString(indexBufferStatus));
+    Log("[VanillaHands] Geometry hooks queued: IASetVB=%s IASetIB=%s",
+        MH_StatusToString(vertexBufferStatus), MH_StatusToString(indexBufferStatus));
     Log("[BL1GOTYVR] ResizeBuffers hook deferred until Present path is stable (target=%p)",
         resizeTarget);
     Log("[BL1GOTYVR] Real DXGI Present hook installed");

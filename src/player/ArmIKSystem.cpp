@@ -2727,7 +2727,7 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
         const Vec3 shoulderToTarget = targetComponent - oldShoulder;
         const float requestedDistance = shoulderToTarget.length();
         const float maximumStretch = std::clamp(
-            config::Get().arm_reach_scale, 1.0f, 1.6f);
+            config::Get().arm_reach_scale, 1.0f, 2.0f);
         const float stretch = nativeReach > 1.0e-4f
             ? std::clamp(requestedDistance / nativeReach, 1.0f, maximumStretch)
             : 1.0f;

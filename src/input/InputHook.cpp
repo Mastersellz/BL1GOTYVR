@@ -287,6 +287,11 @@ bool InputHook::UpdatePhysicalMelee(const ControllerState& controller, int hand,
     seedTip();
 
     const float speed = distance * 1000.0f / static_cast<float>(elapsedMs);
+    const float verticalSpeed = delta[1] * 1000.0f /
+        static_cast<float>(elapsedMs);
+    const float downwardRatio = speed > 0.01f
+        ? (-verticalSpeed / speed) : 0.0f;
+    const bool downwardWeaponMelee = hand == 1 && !fistMode;
     tracker.filteredSpeed += (speed - tracker.filteredSpeed) * 0.45f;
     constexpr float kRearmSpeedMps = 0.65f;
     if (tracker.filteredSpeed <= kRearmSpeedMps) {
@@ -298,22 +303,34 @@ bool InputHook::UpdatePhysicalMelee(const ControllerState& controller, int hand,
         }
     } else {
         tracker.belowThresholdSinceMs = 0;
-        if (tracker.ready) tracker.travel += distance;
+        if (tracker.ready) {
+            if (downwardWeaponMelee) {
+                if (delta[1] < 0.0f && downwardRatio >= 0.45f)
+                    tracker.travel += -delta[1];
+                else if (delta[1] >= 0.0f || downwardRatio < 0.25f)
+                    tracker.travel = 0.0f;
+            } else {
+                tracker.travel += distance;
+            }
+        }
     }
 
     constexpr float kTriggerSpeedMps = 1.75f;
     constexpr float kTriggerTravelMeters = 0.10f;
+    const bool directionValid = !downwardWeaponMelee ||
+        (verticalSpeed <= -1.20f && downwardRatio >= 0.65f);
     if (tracker.ready && nowMs >= tracker.cooldownUntilMs &&
         tracker.filteredSpeed >= kTriggerSpeedMps &&
-        tracker.travel >= kTriggerTravelMeters) {
+        tracker.travel >= kTriggerTravelMeters && directionValid) {
         const float measuredTravel = tracker.travel;
         tracker.ready = false;
         tracker.travel = 0.0f;
         tracker.pulseUntilMs = nowMs + 90;
         tracker.cooldownUntilMs = nowMs + (fistMode ? 300 : 500);
-        Log("[Input] %s VR %s triggered: speed=%.2fm/s travel=%.3fm front=%.2fm",
+        Log("[Input] %s VR %s triggered: speed=%.2fm/s vertical=%.2fm/s "
+            "travel=%.3fm front=%.2fm",
             hand == 0 ? "Left" : "Right", fistMode ? "Berserk punch" : "melee",
-            tracker.filteredSpeed, measuredTravel, frontDistance);
+            tracker.filteredSpeed, verticalSpeed, measuredTravel, frontDistance);
     }
     return nowMs < tracker.pulseUntilMs;
 }
@@ -461,11 +478,12 @@ void InputHook::UpdateState(XrTime displayTime) {
         const bool leftMeleePulse = leftArmed &&
             UpdatePhysicalMelee(left, 0, now, true);
         if (!leftArmed) ResetPhysicalMelee(0);
-        const bool rightWeaponPulse =
+        const bool normalRightMeleeEnabled =
             m_weaponPoseActive.load(std::memory_order_acquire) &&
+            !camera::IsTransientFirstPersonActionActive();
+        const bool rightWeaponPulse = normalRightMeleeEnabled &&
             UpdatePhysicalMelee(right, 1, now, false);
-        if (!m_weaponPoseActive.load(std::memory_order_acquire))
-            ResetPhysicalMelee(1);
+        if (!normalRightMeleeEnabled) ResetPhysicalMelee(1);
         physicalMeleePulse = leftMeleePulse || rightWeaponPulse;
         if (physicalMeleePulse)
             m_physicalMeleeAnimationSuppressUntilMs.store(

@@ -35,7 +35,7 @@ struct Field {
     bool integer;
 };
 
-constexpr std::array<Field, 13> kFields = {{
+constexpr std::array<Field, 14> kFields = {{
     {101, "Render width", "Display", "Width", "2048", 640.0f, 7680.0f, true},
     {102, "Render height", "Display", "Height", "2048", 480.0f, 4320.0f, true},
     {103, "Resolution scale", "Display", "ResolutionScale", "1.00", 0.5f, 2.0f, false},
@@ -48,7 +48,8 @@ constexpr std::array<Field, 13> kFields = {{
     {110, "Rotation scale", "Tracking", "RotationScale", "1.00", 0.0f, 5.0f, false},
     {111, "Aim target distance (m)", "Dot", "ConvergenceDistance", "20.0", 1.0f, 100.0f, false},
     {112, "OpenXR refresh rate (Hz, 0=default)", "OpenXR", "RefreshRateHz", "72.0", 0.0f, 240.0f, false},
-    {113, "Arm reach scale", "Hands", "ArmReachScale", "1.35", 1.0f, 1.6f, false},
+    {113, "Arm reach scale", "Hands", "ArmReachScale", "1.60", 1.0f, 2.0f, false},
+    {114, "Hand cut position", "Visibility", "VanillaHandsCutThreshold", "70.0", 20.0f, 90.0f, false},
 }};
 
 struct RenderPreset {

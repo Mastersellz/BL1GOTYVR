@@ -186,7 +186,7 @@ void Load(const char* path) {
     s_settings.right_hand_rotation_roll = std::clamp(
         ReadFloat("Hands", "RightRoll", s_settings.right_hand_rotation_roll, path), -180.0f, 180.0f);
     s_settings.arm_reach_scale = std::clamp(
-        ReadFloat("Hands", "ArmReachScale", s_settings.arm_reach_scale, path), 1.0f, 1.6f);
+        ReadFloat("Hands", "ArmReachScale", s_settings.arm_reach_scale, path), 1.0f, 2.0f);
 
     s_settings.dot_horizontal_offset = std::clamp(
         ReadFloat("Dot", "HorizontalOffset", s_settings.dot_horizontal_offset, path), -0.25f, 0.25f);

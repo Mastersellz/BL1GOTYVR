@@ -32,7 +32,8 @@ Save; resolution and OpenXR refresh-rate changes require restarting the game.
 | Aim dot | On/off | Shows or hides the controller-driven aiming dot |
 | HMD-directed movement | On/off | Rotates left-stick locomotion by current HMD yaw instead of body/game forward |
 | Physical crouch | On/off | Toggles the game's crouch when tracked head height crosses the calibrated posture threshold |
-| Arm reach scale | 1.00 to 1.60 | Allows the IK arm segments to stretch toward the tracked hands; `1.35` matches a roughly 75 cm reach on the current rigs |
+| Arm reach scale | 1.00 to 2.00 | Allows the IK arm segments to stretch toward the tracked hands; default `1.60` prevents forward reach from clamping on the current rigs |
+| Hand cut position | 20 to 90 | Moves the hand-only geometry boundary; default `70`, with lower values retaining more forearm and moving the capped edge away from the wrist |
 | Hide player body and arms | On/off | Experimental `Visibility/HidePlayerBodyAndArms` gate; off by default and only writes after runtime identity and reflected-schema validation |
 
 ## Render Presets
@@ -66,7 +67,7 @@ controllers instead.
 
 Physical melee uses the game's native hit authority while the IK suppresses its
 viewmodel animation. With any character, hold the left trigger and swing the
-left fist, or swing the right-hand weapon. During Brick's Berserk action skill,
+left fist, or swing the right-hand weapon quickly from above to below. During Brick's Berserk action skill,
 either fist attacks directly without a trigger. Ordinary motion remains below
 guarded speed, travel, front-of-head, and cooldown thresholds.
 
