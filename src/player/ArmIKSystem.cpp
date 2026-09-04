@@ -9,6 +9,7 @@
 #include "../input/WeaponAimSystem.hpp"
 #include "../input/XRInput.hpp"
 #include "../hook/MinHookWrapper.hpp"
+#include "../xr/FrameLoop.hpp"
 
 #include <algorithm>
 #include <array>
@@ -620,6 +621,12 @@ struct ArmIKSystem::Rig {
     bool backupBone[256] = {};
     Quat wristCalibration[2] = {};
     bool wristCalibrationValid[2] = {};
+    Quat unarmedWristCalibration[2] = {};
+    bool unarmedWristCalibrationValid[2] = {};
+    Vec3 stableShoulder[2];
+    Vec3 stableElbow[2];
+    Vec3 stableWrist[2];
+    bool stableArmBaseValid[2] = {};
     Vec3 viewmodelTrackingOrigin;
     Vec3 viewmodelTrackingCameraOrigin;
     bool viewmodelTrackingOriginValid = false;
@@ -948,6 +955,19 @@ void ArmIKSystem::RequestRescan() {
 }
 
 void ArmIKSystem::RequestInventoryScan() {
+    const input::PlayerIdentitySnapshot identity =
+        input::WeaponAimSystem::Instance().GetPlayerIdentity();
+    uintptr_t rigPawn = 0;
+    AcquireSRWLockShared(&m_rigLock);
+    if (m_rig) rigPawn = m_rig->localPawn;
+    ReleaseSRWLockShared(&m_rigLock);
+    if (identity.pawnValid && rigPawn >= 0x10000 && rigPawn != identity.pawn) {
+        Log("[ArmIK] Confirmed pawn transition %p -> %p; resetting rig discovery",
+            reinterpret_cast<void*>(rigPawn), reinterpret_cast<void*>(identity.pawn));
+        RequestRescan();
+        return;
+    }
+
     AcquireSRWLockExclusive(&m_scanResetLock);
     m_scanEpoch.fetch_add(1, std::memory_order_acq_rel);
     m_inventoryRequestGeneration.fetch_add(1, std::memory_order_acq_rel);
@@ -1673,8 +1693,7 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
     // metadata paths. Preserve runtime calibration when the actual rig and
     // pose storage are unchanged; otherwise the off-hand recaptures from an
     // arbitrary animation frame and twists after a disable/enable cycle.
-    if (m_rig && m_rig->localController == best.localController &&
-        m_rig->localPawn == best.localPawn &&
+    if (m_rig && m_rig->localPawn == best.localPawn &&
         m_rig->component == best.component &&
         m_rig->skeletalMesh == best.skeletalMesh &&
         m_rig->componentPose == best.componentPose &&
@@ -1695,6 +1714,20 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
         best.wristCalibration[1] = m_rig->wristCalibration[1];
         best.wristCalibrationValid[0] = m_rig->wristCalibrationValid[0];
         best.wristCalibrationValid[1] = m_rig->wristCalibrationValid[1];
+        best.unarmedWristCalibration[0] = m_rig->unarmedWristCalibration[0];
+        best.unarmedWristCalibration[1] = m_rig->unarmedWristCalibration[1];
+        best.unarmedWristCalibrationValid[0] =
+            m_rig->unarmedWristCalibrationValid[0];
+        best.unarmedWristCalibrationValid[1] =
+            m_rig->unarmedWristCalibrationValid[1];
+        best.stableShoulder[0] = m_rig->stableShoulder[0];
+        best.stableShoulder[1] = m_rig->stableShoulder[1];
+        best.stableElbow[0] = m_rig->stableElbow[0];
+        best.stableElbow[1] = m_rig->stableElbow[1];
+        best.stableWrist[0] = m_rig->stableWrist[0];
+        best.stableWrist[1] = m_rig->stableWrist[1];
+        best.stableArmBaseValid[0] = m_rig->stableArmBaseValid[0];
+        best.stableArmBaseValid[1] = m_rig->stableArmBaseValid[1];
         best.viewmodelTrackingOrigin = m_rig->viewmodelTrackingOrigin;
         best.viewmodelTrackingCameraOrigin = m_rig->viewmodelTrackingCameraOrigin;
         best.viewmodelTrackingOriginValid = m_rig->viewmodelTrackingOriginValid;
@@ -1731,6 +1764,8 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
         best.componentPoseOffset, reinterpret_cast<void*>(best.componentPose), best.matrixOffset,
         best.rightShoulder, best.rightElbow, best.rightWrist,
         best.leftShoulder, best.leftElbow, best.leftWrist);
+    if (best.valid && !inventoryRequestGeneration)
+        RequestInventoryScan();
     return true;
 }
 
@@ -2247,6 +2282,49 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
             snapshot.valid[hand] = true;
         }
 
+        // Native camera translation includes walk/run head bob. Once the arm
+        // rig has a calibrated shoulder origin, derive both world targets from
+        // that fixed component-space anchor instead.
+        uintptr_t anchorComponent = 0;
+        int anchorMatrixOffset = 0;
+        Vec3 anchorOrigin;
+        AcquireSRWLockShared(&m_rigLock);
+        if (m_rig && m_rig->valid && m_rig->viewmodelTrackingOriginValid) {
+            anchorComponent = m_rig->component;
+            anchorMatrixOffset = m_rig->matrixOffset;
+            anchorOrigin = m_rig->viewmodelTrackingOrigin;
+        }
+        ReleaseSRWLockShared(&m_rigLock);
+        float anchorLocalToWorld[16] = {};
+        if (anchorComponent >= 0x10000 && anchorMatrixOffset > 0 &&
+            ReadMemory(anchorComponent + anchorMatrixOffset,
+                       anchorLocalToWorld, sizeof(anchorLocalToWorld)) &&
+            ValidateMatrix(anchorLocalToWorld)) {
+            for (int hand = 0; hand < 2; ++hand) {
+                if (!snapshot.valid[hand]) continue;
+                const Vec3 worldOffset =
+                    snapshot.position[hand] - snapshot.cameraPosition;
+                const Vec3 componentOffset{
+                    -(anchorLocalToWorld[0]*worldOffset.x +
+                      anchorLocalToWorld[1]*worldOffset.y +
+                      anchorLocalToWorld[2]*worldOffset.z),
+                    anchorLocalToWorld[4]*worldOffset.x +
+                      anchorLocalToWorld[5]*worldOffset.y +
+                      anchorLocalToWorld[6]*worldOffset.z,
+                    anchorLocalToWorld[8]*worldOffset.x +
+                      anchorLocalToWorld[9]*worldOffset.y +
+                      anchorLocalToWorld[10]*worldOffset.z};
+                const Vec3 target = anchorOrigin + componentOffset;
+                snapshot.position[hand] = {
+                    anchorLocalToWorld[0]*target.x + anchorLocalToWorld[4]*target.y +
+                      anchorLocalToWorld[8]*target.z + anchorLocalToWorld[12],
+                    anchorLocalToWorld[1]*target.x + anchorLocalToWorld[5]*target.y +
+                      anchorLocalToWorld[9]*target.z + anchorLocalToWorld[13],
+                    anchorLocalToWorld[2]*target.x + anchorLocalToWorld[6]*target.y +
+                      anchorLocalToWorld[10]*target.z + anchorLocalToWorld[14]};
+            }
+        }
+
         if (headTrackingPosition && headTrackingRotation) {
             const Vec3 trackingHeadDelta{
                 headTrackingPosition[0] - trackingReferencePosition[0],
@@ -2476,6 +2554,10 @@ void ArmIKSystem::SetRenderContext(uint64_t renderGeneration,
             m_rig->wristCalibration[1] = {};
             m_rig->wristCalibrationValid[0] = false;
             m_rig->wristCalibrationValid[1] = false;
+            m_rig->unarmedWristCalibrationValid[0] = false;
+            m_rig->unarmedWristCalibrationValid[1] = false;
+            m_rig->stableArmBaseValid[0] = false;
+            m_rig->stableArmBaseValid[1] = false;
             m_rig->viewmodelTrackingOrigin = {};
             m_rig->viewmodelTrackingCameraOrigin = {};
             m_rig->viewmodelTrackingOriginValid = false;
@@ -2525,6 +2607,7 @@ bool ArmIKSystem::ApplyPostAnimation(void* component) {
 bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
                          bool restoreAfterRender) {
     if (!m_enabled.load()) return false;
+    if (xr::FrameLoop::Instance().IsTheaterFallbackActive()) return false;
     Rig rig = {};
     TargetSnapshot targets = {};
     AcquireSRWLockShared(&m_rigLock);
@@ -2538,8 +2621,12 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
         rig.boneCount <= 0 || rig.boneCount > 256) return false;
     const input::PlayerIdentitySnapshot identity =
         input::WeaponAimSystem::Instance().GetPlayerIdentity();
-    if (!identity.pawnValid || identity.controller != rig.localController ||
-        identity.pawn != rig.localPawn) return false;
+    // Identity discovery can briefly lose or replace the controller while the
+    // same live pawn component remains valid. The pose and mesh ownership checks
+    // below remain authoritative during that transient gap.
+    if (identity.pawnValid && identity.pawn != rig.localPawn) return false;
+    const bool ordinaryUnarmed = !identity.weaponValid &&
+        !input::InputHook::Instance().IsBerserkPunchMode();
     TArray64 livePose = {};
     const bool poseStillOwned = ReadMemory(rig.component + rig.componentPoseOffset,
         &livePose, sizeof(livePose)) && livePose.data == rig.componentPose &&
@@ -2663,9 +2750,30 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
                     targets.cameraRotation).normalized()
                 : targetRotation;
         }
-        const Vec3 oldShoulder = original[shoulder].position;
-        const Vec3 oldElbow = original[elbow].position;
-        const Vec3 oldWrist = original[wrist].position;
+        const Vec3 animatedShoulder = original[shoulder].position;
+        const Vec3 animatedElbow = original[elbow].position;
+        const Vec3 animatedWrist = original[wrist].position;
+        if (!rig.stableArmBaseValid[hand]) {
+            rig.stableShoulder[hand] = animatedShoulder;
+            rig.stableElbow[hand] = animatedElbow;
+            rig.stableWrist[hand] = animatedWrist;
+            rig.stableArmBaseValid[hand] = true;
+            AcquireSRWLockExclusive(&m_rigLock);
+            if (m_rig && m_rig->component == rig.component &&
+                !m_rig->stableArmBaseValid[hand]) {
+                m_rig->stableShoulder[hand] = animatedShoulder;
+                m_rig->stableElbow[hand] = animatedElbow;
+                m_rig->stableWrist[hand] = animatedWrist;
+                m_rig->stableArmBaseValid[hand] = true;
+            }
+            ReleaseSRWLockExclusive(&m_rigLock);
+            Log("[ArmIK] Stable locomotion base captured: hand=%d "
+                "shoulder=(%.1f,%.1f,%.1f)", hand,
+                animatedShoulder.x, animatedShoulder.y, animatedShoulder.z);
+        }
+        const Vec3 oldShoulder = rig.stableShoulder[hand];
+        const Vec3 oldElbow = rig.stableElbow[hand];
+        const Vec3 oldWrist = rig.stableWrist[hand];
         const float armReach = (oldElbow - oldShoulder).length() +
             (oldWrist - oldElbow).length();
         if (!targets.componentSpace &&
@@ -2695,10 +2803,8 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
                     localToWorld[9]*cameraWorldDelta.y +
                     localToWorld[10]*cameraWorldDelta.z};
             Vec3 trackingOrigin = shoulderCenter + Vec3{0.0f, 0.0f, 22.0f};
-            if (rig.viewmodelTrackingOriginValid) {
-                trackingOrigin = rig.viewmodelTrackingOrigin +
-                    (cameraComponent - rig.viewmodelTrackingCameraOrigin);
-            }
+            if (rig.viewmodelTrackingOriginValid)
+                trackingOrigin = rig.viewmodelTrackingOrigin;
             if (!rig.viewmodelTrackingOriginValid) {
                 rig.viewmodelTrackingOrigin = trackingOrigin;
                 rig.viewmodelTrackingCameraOrigin = cameraComponent;
@@ -2773,12 +2879,12 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
             return false;
         };
 
-        const Quat upperDelta = FromTo(oldElbow - oldShoulder,
+        const Quat upperDelta = FromTo(animatedElbow - animatedShoulder,
             result.elbow - oldShoulder);
         for (int bone = 0; bone < rig.boneCount; ++bone) {
             if (!descendantOf(bone, shoulder)) continue;
             solved[bone].position = oldShoulder + RotateByQuat(
-                upperDelta, original[bone].position - oldShoulder);
+                upperDelta, original[bone].position - animatedShoulder);
             solved[bone].rotation = QuatMultiply(
                 upperDelta, original[bone].rotation).normalized();
         }
@@ -2806,9 +2912,23 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
         // The weapon hand must be deterministic across pawn/map rebuilds.
         // Its complete controller-to-wrist correction comes from the persisted
         // global hand settings plus the per-character weapon profile.
-        Quat wristCalibration = hand == 1
-            ? Quat{} : rig.wristCalibration[hand];
-        if (hand != 1 && !rig.wristCalibrationValid[hand]) {
+        Quat wristCalibration = ordinaryUnarmed
+            ? rig.unarmedWristCalibration[hand]
+            : (hand == 1 ? Quat{} : rig.wristCalibration[hand]);
+        if (ordinaryUnarmed && !rig.unarmedWristCalibrationValid[hand]) {
+            wristCalibration = QuatMultiply(targetRotation.conjugate(),
+                original[wrist].rotation).normalized();
+            rig.unarmedWristCalibration[hand] = wristCalibration;
+            rig.unarmedWristCalibrationValid[hand] = true;
+            AcquireSRWLockExclusive(&m_rigLock);
+            if (m_rig && m_rig->component == rig.component) {
+                m_rig->unarmedWristCalibration[hand] = wristCalibration;
+                m_rig->unarmedWristCalibrationValid[hand] = true;
+            }
+            ReleaseSRWLockExclusive(&m_rigLock);
+            Log("[ArmIK] Unarmed wrist calibration captured: hand=%d", hand);
+        } else if (!ordinaryUnarmed && hand != 1 &&
+                   !rig.wristCalibrationValid[hand]) {
             // The weapon hand inherits the native camera-to-wrist basis and
             // follows OpenXR aim/pose. The off-hand follows grip/pose.
             wristCalibration = QuatMultiply(calibrationReferenceRotation.conjugate(),
@@ -2822,7 +2942,7 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
             }
             ReleaseSRWLockExclusive(&m_rigLock);
         }
-        if (hand == 1 && !rig.wristCalibrationValid[hand]) {
+        if (!ordinaryUnarmed && hand == 1 && !rig.wristCalibrationValid[hand]) {
             rig.wristCalibration[hand] = {};
             rig.wristCalibrationValid[hand] = true;
             AcquireSRWLockExclusive(&m_rigLock);
@@ -2883,8 +3003,7 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
         finalPose.capacity >= finalPose.count &&
         finalSkeleton.data == rig.refSkeleton && finalSkeleton.count == rig.boneCount &&
         finalSkeleton.capacity >= finalSkeleton.count;
-    if (!finalIdentity.pawnValid || finalIdentity.controller != rig.localController ||
-        finalIdentity.pawn != rig.localPawn ||
+    if ((finalIdentity.pawnValid && finalIdentity.pawn != rig.localPawn) ||
         !m_enabled.load(std::memory_order_acquire) || !m_rig ||
         m_rig->component != rig.component || m_rig->componentPose != rig.componentPose ||
         m_rig->skeletalMesh != rig.skeletalMesh || m_rig->refSkeleton != rig.refSkeleton ||
@@ -2990,13 +3109,13 @@ ArmRigStatus ArmIKSystem::GetStatus() const {
     return status;
 }
 
-bool ArmIKSystem::IsBrickBerserkActive() const {
+bool ArmIKSystem::IsBrickRigActive() const {
     const ArmRigStatus rig = GetStatus();
     if (!rig.rigValid || rig.boneCount != 67 ||
         rig.rightWrist != 39 || rig.leftWrist != 14) return false;
 
     const ComponentInventoryStatus inventory = GetComponentInventory();
-    if (!inventory.pawnIdentityValid || inventory.weaponIdentityValid) return false;
+    if (!inventory.pawnIdentityValid) return false;
     for (size_t index = 0; index < inventory.count; ++index) {
         const ComponentInventoryEntry& entry = inventory.entries[index];
         if (entry.role == ComponentRole::ProbableFirstPersonArms &&

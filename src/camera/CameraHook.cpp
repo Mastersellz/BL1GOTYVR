@@ -675,7 +675,9 @@ static bool ApplyDownedFirstPersonOverride(
     }
     ReleaseSRWLockShared(&s_firstPersonCameraLock);
     if (!referenceValid) {
-        if (identity.weaponValid) {
+        const bool firstPersonArmsAvailable =
+            player::ArmIKSystem::Instance().GetStatus().rigValid;
+        if (identity.weaponValid || firstPersonArmsAvailable) {
             AcquireSRWLockExclusive(&s_firstPersonCameraLock);
             s_firstPersonCameraValid = true;
             s_firstPersonCameraPawn = identity.pawn;
@@ -701,7 +703,6 @@ static bool ApplyDownedFirstPersonOverride(
     bool active = s_downedFirstPersonActive.load(std::memory_order_acquire);
     constexpr float kThirdPersonCameraDisplacementUu = 50.0f;
     constexpr float kFirstPersonRecoveryDisplacementUu = 20.0f;
-    constexpr float kStableReferenceDisplacementUu = 10.0f;
     if (active && !injured &&
         !s_externalViewFirstPersonActive.load(std::memory_order_acquire) &&
         cameraDisplacement <= kFirstPersonRecoveryDisplacementUu) {
@@ -751,20 +752,23 @@ static bool ApplyDownedFirstPersonOverride(
         memcpy(outputRotation, expectedRotation, sizeof(expectedRotation));
         return true;
     }
-    if (identity.weaponValid &&
-        cameraDisplacement < kStableReferenceDisplacementUu) {
-        AcquireSRWLockExclusive(&s_firstPersonCameraLock);
-        s_firstPersonCameraValid = true;
-        s_firstPersonCameraPawn = identity.pawn;
-        for (int axis = 0; axis < 3; ++axis)
-            s_firstPersonCameraOffset[axis] = gameLocation[axis] - pawnLocation[axis];
-        memcpy(s_firstPersonCameraWorldLocation, gameLocation,
-               sizeof(s_firstPersonCameraWorldLocation));
-        memcpy(s_firstPersonCameraRotation, gameRotation,
-               sizeof(s_firstPersonCameraRotation));
-        ReleaseSRWLockExclusive(&s_firstPersonCameraLock);
-    }
     return false;
+}
+
+static bool GetStableFirstPersonLocation(
+        const input::PlayerIdentitySnapshot& identity, float output[3]) {
+    if (!output || !identity.pawnValid) return false;
+    float pawnLocation[3] = {};
+    if (!GetPawnWorldLocation(identity, pawnLocation)) return false;
+    bool valid = false;
+    AcquireSRWLockShared(&s_firstPersonCameraLock);
+    valid = s_firstPersonCameraValid && s_firstPersonCameraPawn == identity.pawn;
+    if (valid) {
+        for (int axis = 0; axis < 3; ++axis)
+            output[axis] = pawnLocation[axis] + s_firstPersonCameraOffset[axis];
+    }
+    ReleaseSRWLockShared(&s_firstPersonCameraLock);
+    return valid;
 }
 
 static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, void* canvas) {
@@ -869,14 +873,55 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                     int32_t firstPersonRotation[3] = {};
                     const input::PlayerIdentitySnapshot identity =
                         input::WeaponAimSystem::Instance().GetPlayerIdentity();
+                    static uintptr_t trackedFirstPersonPawn = 0;
+                    static uint64_t ordinaryUnarmedSinceMs = 0;
+                    static bool ordinaryUnarmedReset = false;
+                    const bool pawnChanged = identity.pawnValid &&
+                        identity.pawn != trackedFirstPersonPawn;
+                    if (pawnChanged) trackedFirstPersonPawn = identity.pawn;
+                    const bool ordinaryUnarmed = identity.pawnValid &&
+                        !identity.weaponValid &&
+                        !input::InputHook::Instance().IsBerserkPunchMode();
+                    const uint64_t nowMs = GetTickCount64();
+                    if (ordinaryUnarmed) {
+                        if (!ordinaryUnarmedSinceMs)
+                            ordinaryUnarmedSinceMs = nowMs;
+                    } else {
+                        ordinaryUnarmedSinceMs = 0;
+                        ordinaryUnarmedReset = false;
+                    }
+                    if (pawnChanged || (ordinaryUnarmed && !ordinaryUnarmedReset &&
+                        nowMs - ordinaryUnarmedSinceMs >= 500)) {
+                        AcquireSRWLockExclusive(&s_firstPersonCameraLock);
+                        s_firstPersonCameraValid = false;
+                        s_firstPersonCameraPawn = 0;
+                        s_downedCameraAnchorValid = false;
+                        ReleaseSRWLockExclusive(&s_firstPersonCameraLock);
+                        s_downedFirstPersonActive.store(false, std::memory_order_release);
+                        s_externalViewFirstPersonActive.store(false,
+                            std::memory_order_release);
+                        s_transientFirstPersonActionActive.store(false,
+                            std::memory_order_release);
+                        s_gamePitchReferenceValid.store(false, std::memory_order_release);
+                        ordinaryUnarmedReset = ordinaryUnarmed;
+                        Log("[Camera] First-person reference reset for %s",
+                            pawnChanged ? "new pawn" : "ordinary unarmed state");
+                    }
                     const bool downedFirstPerson = !vehicleAnchorActive &&
                         ApplyDownedFirstPersonOverride(identity, originalLocation,
                             rotation, firstPersonLocation,
                             firstPersonRotation);
+                    float stableFirstPersonLocation[3] = {};
+                    const bool stableFirstPerson = !vehicleAnchorActive &&
+                        !downedFirstPerson &&
+                        GetStableFirstPersonLocation(identity,
+                            stableFirstPersonLocation);
                     renderTicket.baseCameraValid = true;
                     memcpy(renderTicket.baseLocation,
-                           vehicleAnchorActive ? vehicleSeat :
-                               (downedFirstPerson ? firstPersonLocation : originalLocation),
+                            vehicleAnchorActive ? vehicleSeat :
+                                (downedFirstPerson ? firstPersonLocation :
+                                    (stableFirstPerson ? stableFirstPersonLocation :
+                                        originalLocation)),
                            sizeof(renderTicket.baseLocation));
                     memcpy(renderTicket.baseRotation,
                            downedFirstPerson ? firstPersonRotation : rotation,
@@ -2282,16 +2327,15 @@ static DWORD WINAPI ScannerThread(LPVOID) {
         s_pendingViewPoses[0] = {};
         s_pendingViewPoses[1] = {};
         ReleaseSRWLockExclusive(&s_pendingViewPoseLock);
-s_recenterRequested.store(true, std::memory_order_release);
         s_gamePitchReferenceValid.store(false, std::memory_order_release);
-        s_aimBasisValid = false;
         xr::FrameLoop::Instance().AbortStereoPair();
         input::WeaponAimSystem::Instance().Discover(
             &s_globals, refreshed.controllerAddress,
             reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll), modInfo.SizeOfImage);
         if (!s_vehiclePawn.load(std::memory_order_acquire))
-            player::ArmIKSystem::Instance().RequestRescan();
-        Log("[Camera] Runtime camera refreshed: controller=%p -> %p; 6DoF recentered",
+            player::ArmIKSystem::Instance().RequestInventoryScan();
+        Log("[Camera] Runtime camera refreshed: controller=%p -> %p; "
+            "tracking reference and current arm rig retained",
             reinterpret_cast<void*>(previous.controllerAddress),
             reinterpret_cast<void*>(refreshed.controllerAddress));
     }

@@ -99,7 +99,7 @@ public:
     bool IsVisibilityEnabled() const { return m_visibilityEnabled.load(); }
     void SetSimulationEnabled(bool enabled);
     bool IsSimulationEnabled() const { return m_simulationEnabled.load(); }
-    bool IsBrickBerserkActive() const;
+    bool IsBrickRigActive() const;
     void RequestRescan();
     void RequestInventoryScan();
     void RequestCalibrationReset();

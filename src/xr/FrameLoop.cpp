@@ -2075,29 +2075,23 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
 
     auto& weaponAim = input::WeaponAimSystem::Instance();
     const bool explicitVehicleTerminalUi = weaponAim.IsVehicleTerminalUiActive();
-    const bool phaseWalkActive = weaponAim.IsPhaseWalkActive();
     const input::PlayerIdentitySnapshot identity = weaponAim.GetPlayerIdentity();
-    const bool missingWeaponTerminalCandidate = identity.pawnValid &&
-        !identity.weaponValid && !camera::IsVehicleCameraActive() &&
-        !camera::IsDownedFirstPersonActive() &&
-        !camera::IsTransientFirstPersonActionActive() && !phaseWalkActive &&
-        !player::ArmIKSystem::Instance().IsBrickBerserkActive();
     if (explicitVehicleTerminalUi) {
         m_terminalMissingWeaponPresents = 90;
-    } else if (missingWeaponTerminalCandidate) {
+    } else if (!identity.pawnValid) {
         if (m_terminalMissingWeaponPresents < 90)
             ++m_terminalMissingWeaponPresents;
     } else {
         m_terminalMissingWeaponPresents = 0;
     }
-    const bool vehicleTerminalUi = explicitVehicleTerminalUi ||
-        m_terminalMissingWeaponPresents >= 90;
-    if (vehicleTerminalUi) {
+    const bool flatNonGameplayView = explicitVehicleTerminalUi ||
+        m_terminalMissingWeaponPresents >= 2;
+    if (flatNonGameplayView) {
         if (!m_theaterFallbackActive) {
             m_theaterFallbackActive = true;
             m_missingTicketPresents = 0;
-            Log("[FrameLoop] Vehicle terminal UI detected; stable eye-1 flat submission latched "
-                "(explicit=%d)", explicitVehicleTerminalUi ? 1 : 0);
+            Log("[FrameLoop] Flat non-gameplay view latched: explicitTerminal=%d pawnValid=%d",
+                explicitVehicleTerminalUi ? 1 : 0, identity.pawnValid ? 1 : 0);
         }
         m_theaterRecoveryTickets = 0;
         // UE3's final AER pass owns the freshest mono UI. Updating the quad

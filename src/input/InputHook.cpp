@@ -8,6 +8,7 @@
 #include "../config/Config.hpp"
 #include "../player/ArmIKSystem.hpp"
 #include "../ui/Overlay.hpp"
+#include "../xr/FrameLoop.hpp"
 #include "../xr/OpenXRContext.hpp"
 #include <windows.h>
 #include <cmath>
@@ -103,7 +104,7 @@ void InputHook::Install() {
         config::Get().snap_turn_angle, config::Get().locomotion_deadzone,
         config::Get().weapon_position_scale);
     Log("[Input] Map: sticks analog, RT fire, LT ADS, A jump, B crouch, "
-        "X use/reload, Y cycle, LB skill, RB grenade, L3 sprint, R3 melee, Menu Start");
+        "X use/reload, Y cycle, LB skill, RB grenade, L3 sprint, R3 melee, Menu Esc/back");
     Log("[Input] Y chord: tap=Y, hold 400ms=Back/ECHO, hold+left stick=D-pad");
     Log("[Input] B chord: tap=B, hold 400ms=toggle motion controls");
     Log("[Input] Calibration: Ctrl+Numpad 1=global left hand, 3=active weapon, "
@@ -178,9 +179,13 @@ void InputHook::ReleaseAllInput() {
     m_leftTriggerDown = m_rightTriggerDown = false;
     m_leftTriggerWasDown = false;
     m_leftGripDown = m_rightGripDown = false;
+    m_skillGripWasDown = false;
+    m_berserkActivationUntilMs = 0;
+    m_berserkPunchMode.store(false, std::memory_order_release);
     m_yWasDown = m_yChordUsed = false;
     m_bWasDown = m_bHoldUsed = false;
     m_recenterChordLatched = false;
+    m_recenterChordStartedMs = 0;
     m_yPressMs = m_yTapPulseUntilMs = 0;
     m_bPressMs = m_bTapPulseUntilMs = 0;
     m_physicalCrouchPulseUntilMs = 0;
@@ -454,10 +459,23 @@ void InputHook::UpdateState(XrTime displayTime) {
     WeaponAimSystem::Instance().SetFireActive(
         m_rightTriggerDown || vehicleSecondaryFire);
 
-    const bool berserkPunchMode =
-        player::ArmIKSystem::Instance().IsBrickBerserkActive();
-    if (berserkPunchMode != m_berserkPunchMode) {
-        m_berserkPunchMode = berserkPunchMode;
+    const auto playerIdentity = WeaponAimSystem::Instance().GetPlayerIdentity();
+    const bool brickRigActive =
+        player::ArmIKSystem::Instance().IsBrickRigActive();
+    if (brickRigActive && playerIdentity.weaponValid && m_leftGripDown &&
+        !m_skillGripWasDown) {
+        m_berserkActivationUntilMs = now + 5000;
+    }
+    m_skillGripWasDown = m_leftGripDown;
+    const bool previousBerserkPunchMode =
+        m_berserkPunchMode.load(std::memory_order_acquire);
+    const bool berserkPunchMode = brickRigActive && !playerIdentity.weaponValid &&
+        (previousBerserkPunchMode ||
+         (m_berserkActivationUntilMs && now <= m_berserkActivationUntilMs));
+    if (!brickRigActive || (previousBerserkPunchMode && playerIdentity.weaponValid))
+        m_berserkActivationUntilMs = 0;
+    if (berserkPunchMode != previousBerserkPunchMode) {
+        m_berserkPunchMode.store(berserkPunchMode, std::memory_order_release);
         ResetPhysicalMelee();
         if (berserkPunchMode &&
             !player::ArmIKSystem::Instance().IsEnabled())
@@ -552,6 +570,7 @@ void InputHook::UpdateState(XrTime displayTime) {
             m_weaponCalibrationResetRequested.store(true, std::memory_order_release);
             m_motionControlsEnabled.store(true, std::memory_order_release);
             m_dotVisibleAtMs.store(now, std::memory_order_release);
+            player::ArmIKSystem::Instance().SetEnabled(true);
             Log("[Input] Motion controls enabled; waiting for coherent weapon pose");
         }
     }
@@ -583,16 +602,28 @@ void InputHook::UpdateState(XrTime displayTime) {
         (!cfg.physical_crouch_enabled && bTapPulse);
 
     const bool bothSticksClicked = left.thumbstickClick && right.thumbstickClick;
-    if (bothSticksClicked && !m_recenterChordLatched) {
+    if (bothSticksClicked && !m_recenterChordStartedMs)
+        m_recenterChordStartedMs = now;
+    if (bothSticksClicked && !m_recenterChordLatched &&
+        now - m_recenterChordStartedMs >= 1000) {
         m_recenterChordLatched = true;
         camera::RequestRecenter();
         player::ArmIKSystem::Instance().RequestCalibrationReset();
         RequestMotionCalibrationReset();
-        Log("[Input] Camera, hands, and weapon recentered by L3+R3");
+        Log("[Input] Camera, hands, and weapon recentered after holding L3+R3");
     }
-    const bool suppressStickClicks = m_recenterChordLatched;
-    if (m_recenterChordLatched && !left.thumbstickClick && !right.thumbstickClick)
+    const bool suppressStickClicks = bothSticksClicked;
+    if (!bothSticksClicked) {
         m_recenterChordLatched = false;
+        m_recenterChordStartedMs = 0;
+    }
+
+    // Escape is contextual in UE3: it opens pause from gameplay and backs out
+    // of the current interface. Send it directly so Menu is not limited to the
+    // XInput Start behavior used only by some screens.
+    if (left.menuButton && !m_prevMenu) PressKey(VK_ESCAPE);
+    else if (!left.menuButton && m_prevMenu) ReleaseKey(VK_ESCAPE);
+    m_prevMenu = left.menuButton ? 1 : 0;
 
     WORD buttons = chordDirection;
     if (right.buttonA) buttons |= XINPUT_GAMEPAD_A;
@@ -604,7 +635,6 @@ void InputHook::UpdateState(XrTime displayTime) {
     if (left.thumbstickClick && !suppressStickClicks) buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
     if (right.thumbstickClick && !suppressStickClicks)
         buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
-    if (left.menuButton) buttons |= XINPUT_GAMEPAD_START;
     if (echoHeld) buttons |= XINPUT_GAMEPAD_BACK;
 
     const bool suppressMove = chordDirection != 0;
@@ -626,7 +656,7 @@ void InputHook::UpdateState(XrTime displayTime) {
         state.moveX = suppressMove ? 0.0f : moveX;
         state.moveY = suppressMove ? 0.0f : moveY;
         state.turnX = right.thumbstickX;
-        state.turnY = right.thumbstickY;
+        state.turnY = 0.0f;
         state.leftTrigger = 0.0f;
         state.rightTrigger = berserkPunchMode ? 0.0f :
             (m_rightTriggerDown ? (std::max)(right.trigger, 0.55f) : 0.0f);
@@ -680,7 +710,6 @@ void InputHook::UpdateState(XrTime displayTime) {
         setKey(VK_LSHIFT, left.thumbstickClick && !suppressStickClicks, m_prevSprint);
         setKey('V', (right.thumbstickClick || physicalMeleePulse) &&
             !suppressStickClicks, m_prevMelee);
-        setKey(VK_ESCAPE, left.menuButton, m_prevMenu);
         setKey(VK_TAB, echoHeld, m_prevEcho);
         setKey('1', (chordDirection & XINPUT_GAMEPAD_DPAD_UP) != 0, m_prevDpadUp);
         setKey('2', (chordDirection & XINPUT_GAMEPAD_DPAD_RIGHT) != 0, m_prevDpadRight);
@@ -1263,9 +1292,10 @@ void InputHook::ApplyRightHand(int eye) {
         return;
     }
     auto& armIK = player::ArmIKSystem::Instance();
-    if (!m_weaponPoseActive.load(std::memory_order_acquire) && armIK.IsEnabled() &&
-        !armIK.IsBrickBerserkActive())
-        armIK.SetEnabled(false);
+    if (xr::FrameLoop::Instance().IsTheaterFallbackActive()) {
+        m_weaponPoseActive.store(false, std::memory_order_release);
+        return;
+    }
     if (camera::IsVehicleCameraActive()) {
         AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
         if (m_renderWeaponStampActive && m_weaponNativeMatrixValid &&
@@ -1287,6 +1317,7 @@ void InputHook::ApplyRightHand(int eye) {
             Log("[WeaponPose] Blocked: vehicle camera active");
         return;
     }
+    if (!armIK.IsEnabled()) armIK.SetEnabled(true);
     if (m_weaponCalibrationResetRequested.exchange(false, std::memory_order_acq_rel)) {
         bool nativeRestored = false;
         size_t preservedMounts = 0;
@@ -1419,8 +1450,15 @@ void InputHook::ApplyRightHand(int eye) {
             strstr(entry.className, "SkeletalMeshComponent") == nullptr) continue;
         if (!active || entry.updateCount > active->updateCount) active = &entry;
     }
-    const char* characterMeshName = activeArms
-        ? activeArms->meshName : "unknown_character";
+    if (!activeArms) {
+        const uint64_t now = GetTickCount64();
+        if (now >= m_nextWeaponComponentScanMs) {
+            m_nextWeaponComponentScanMs = now + 1000;
+            Log("[WeaponPose] Waiting for character arms before selecting a weapon preset");
+        }
+        return;
+    }
+    const char* characterMeshName = activeArms->meshName;
     if (!active) {
         const uint64_t now = GetTickCount64();
         if (now >= m_nextWeaponComponentScanMs) {

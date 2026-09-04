@@ -122,6 +122,7 @@ static std::atomic<bool>     s_vanillaHandsFilterEnabled{false};
 static std::atomic<bool>     s_handGeometryHooksReady{false};
 static std::atomic<float>    s_vanillaHandsCutThreshold{70.0f};
 static std::atomic<bool>     s_handOnlyBufferAttempted{false};
+static std::atomic<uint64_t> s_handGeometryGeneration{0};
 
 static constexpr UINT kHandsVertexStride = 32;
 
@@ -618,7 +619,26 @@ static void ReleaseReplacedSourceIndexBuffer() {
     s_replacedSourceIndexBuffer = nullptr;
 }
 
-static void ResetHandViewmodelIdentity() {
+static void ResetHandViewmodelIdentity(ID3D11DeviceContext* context = nullptr) {
+    if (context && oIASetVertexBuffers) {
+        ID3D11Buffer* boundVertexBuffer = nullptr;
+        ID3D11Buffer* sourceVertexBuffer = nullptr;
+        UINT stride = 0;
+        UINT offset = 0;
+        context->IAGetVertexBuffers(0, 1, &boundVertexBuffer, &stride, &offset);
+        AcquireSRWLockShared(&s_handFilterLock);
+        if (boundVertexBuffer && boundVertexBuffer == s_handOnlyVertexBuffer &&
+            s_targetVertexBuffer) {
+            sourceVertexBuffer = s_targetVertexBuffer;
+            sourceVertexBuffer->AddRef();
+        }
+        ReleaseSRWLockShared(&s_handFilterLock);
+        if (sourceVertexBuffer) {
+            oIASetVertexBuffers(context, 0, 1, &sourceVertexBuffer, &stride, &offset);
+            sourceVertexBuffer->Release();
+        }
+        if (boundVertexBuffer) boundVertexBuffer->Release();
+    }
     AcquireSRWLockExclusive(&s_handFilterLock);
     if (s_pendingHandVertexBuffer) {
         s_pendingHandVertexBuffer->Release();
@@ -851,8 +871,6 @@ static ID3D11Buffer* CreateHandOnlyIndexBuffer(
         centerX /= static_cast<float>(ring.size());
         centerY /= static_cast<float>(ring.size());
         centerZ /= static_cast<float>(ring.size());
-        constexpr float kCapInsetUe = 8.0f;
-        centerX += handSide == 0 ? -kCapInsetUe : kCapInsetUe;
         for (CapVertex& point : ring)
             point.angle = atan2f(point.z - centerZ, point.y - centerY);
         std::sort(ring.begin(), ring.end(), [](const CapVertex& a,
@@ -874,34 +892,13 @@ static ID3D11Buffer* CreateHandOnlyIndexBuffer(
         }
         if (uniqueRing.size() < 3) continue;
 
-        const size_t centerIndex = cappedVertexBytes.size() / kHandsVertexStride;
-        if (centerIndex > UINT16_MAX) continue;
-        size_t templatePoint = 0;
-        float nearestDistance = 1.0e30f;
-        for (size_t index = 0; index < uniqueRing.size(); ++index) {
-            const float dx = uniqueRing[index].x - centerX;
-            const float dy = uniqueRing[index].y - centerY;
-            const float dz = uniqueRing[index].z - centerZ;
-            const float distance = dx*dx + dy*dy + dz*dz;
-            if (distance < nearestDistance) {
-                nearestDistance = distance;
-                templatePoint = index;
-            }
-        }
-        const uint8_t* templateVertex = vertexBytes.data() +
-            static_cast<size_t>(uniqueRing[templatePoint].index) * kHandsVertexStride;
-        cappedVertexBytes.insert(cappedVertexBytes.end(), templateVertex,
-                                 templateVertex + kHandsVertexStride);
-        uint8_t* centerVertex = cappedVertexBytes.data() +
-            centerIndex * kHandsVertexStride;
-        memcpy(centerVertex, &centerX, sizeof(float));
-        memcpy(centerVertex + sizeof(float), &centerY, sizeof(float));
-        memcpy(centerVertex + sizeof(float) * 2, &centerZ, sizeof(float));
-        const uint16_t root = static_cast<uint16_t>(centerIndex);
-        for (size_t index = 0; index < uniqueRing.size(); ++index) {
+        // Triangulate with real seam vertices only. A synthetic center inherits
+        // one arbitrary skin influence and can be pulled out of the wrist.
+        const uint16_t root = uniqueRing[0].index;
+        for (size_t index = 1; index + 1 < uniqueRing.size(); ++index) {
             if (removedSlot + 1 >= removedTriangles.size()) break;
             const uint16_t a = uniqueRing[index].index;
-            const uint16_t b = uniqueRing[(index + 1) % uniqueRing.size()].index;
+            const uint16_t b = uniqueRing[index + 1].index;
             const uint16_t first = handSide == 0 ? a : b;
             const uint16_t second = handSide == 0 ? b : a;
             const size_t front = removedTriangles[removedSlot++].start;
@@ -1042,7 +1039,7 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
     if (rigIdentityValid &&
         ((targetComponent && targetComponent != rig.component) ||
          (targetSkeletalMesh && targetSkeletalMesh != rig.skeletalMesh)))
-        ResetHandViewmodelIdentity();
+        ResetHandViewmodelIdentity(context);
 
     ID3D11Buffer* vertexBuffer = nullptr;
     UINT vertexStride = 0;
@@ -1074,11 +1071,16 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
     if (characterSignatureChanged) {
         Log("[VanillaHands] Character geometry changed to %s; rebuilding capped buffers",
             signature->character);
-        ResetHandViewmodelIdentity();
+        ResetHandViewmodelIdentity(context);
+        vertexBuffer->Release();
+        vertexBuffer = nullptr;
+        vertexStride = 0;
+        vertexOffset = 0;
+        context->IAGetVertexBuffers(0, 1, &vertexBuffer, &vertexStride, &vertexOffset);
         QueueHandOnlyIndexBuffer(vertexBuffer, indexBuffer, signature,
             rigIdentityValid ? rig.component : 0,
             rigIdentityValid ? rig.skeletalMesh : 0);
-        vertexBuffer->Release();
+        if (vertexBuffer) vertexBuffer->Release();
         oIASetIndexBuffer(context, indexBuffer, format, offset);
         return;
     }
@@ -1104,8 +1106,11 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
                 indexBuffer->AddRef();
                 s_replacedSourceIndexBuffer = indexBuffer;
             }
-            static std::atomic<bool> loggedSwap{false};
-            if (!loggedSwap.exchange(true, std::memory_order_relaxed)) {
+            const uint64_t geometryGeneration =
+                s_handGeometryGeneration.load(std::memory_order_acquire);
+            static std::atomic<uint64_t> loggedGeneration{0};
+            if (loggedGeneration.exchange(geometryGeneration, std::memory_order_relaxed) !=
+                geometryGeneration) {
                 Log("[VanillaHands] Geometry cut active: VB=%u stride=%u IB=%u indices=%u",
                     vertexDesc.ByteWidth, vertexStride, indexDesc.ByteWidth,
                     indexDesc.ByteWidth / static_cast<UINT>(sizeof(uint16_t)));
@@ -1187,6 +1192,7 @@ static void EnsureHandOnlyIndexBuffer(ID3D11Device* device) {
     s_targetHandSignature = signature;
     s_targetComponent = component;
     s_targetSkeletalMesh = skeletalMesh;
+    s_handGeometryGeneration.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&s_handFilterLock);
     Log("[VanillaHands] Viewmodel buffers locked: VB=%p bytes=%u stride=%u "
         "IB=%p bytes=%u",

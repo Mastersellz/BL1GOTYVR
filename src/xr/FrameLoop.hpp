@@ -48,6 +48,9 @@ public:
 
     bool IsVRActive() const { return m_vrActive; }
     bool IsDesktopTestMode() const { return m_desktopTestMode.load(); }
+    bool IsTheaterFallbackActive() const {
+        return m_theaterFallbackActive.load(std::memory_order_acquire);
+    }
     uint64_t GetFrameCount() const { return m_frameCount; }
     int GetRenderEye() const;
     bool AcquireRenderTicket(StereoRenderTicket& ticket);
@@ -131,7 +134,7 @@ private:
     uint32_t m_missingTicketPresents = 0;
     uint32_t m_theaterRecoveryTickets = 0;
     uint32_t m_terminalMissingWeaponPresents = 0;
-    bool m_theaterFallbackActive = false;
+    std::atomic<bool> m_theaterFallbackActive{false};
     bool m_hasSubmittedStereoProjection = false;
     uint64_t m_lastNativeMultiviewGeneration = 0;
     bool m_submittingNativeEyes = false;

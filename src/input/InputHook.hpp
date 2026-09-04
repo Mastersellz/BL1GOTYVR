@@ -78,6 +78,9 @@ public:
     bool IsWeaponPoseActive() const {
         return m_weaponPoseActive.load(std::memory_order_acquire);
     }
+    bool IsBerserkPunchMode() const {
+        return m_berserkPunchMode.load(std::memory_order_acquire);
+    }
     bool IsAimDotVisible() const;
     bool GetWeaponBarrelLocalDirection(float direction[3]);
     bool GetDrivenWeaponFrame(float position[3], float forward[3],
@@ -139,6 +142,7 @@ private:
     bool m_yWasDown = false;
     bool m_yChordUsed = false;
     bool m_recenterChordLatched = false;
+    uint64_t m_recenterChordStartedMs = 0;
     bool m_bWasDown = false;
     bool m_bHoldUsed = false;
     uint64_t m_yPressMs = 0;
@@ -161,7 +165,9 @@ private:
         bool ready = true;
     };
     PhysicalMeleeTracker m_melee[2] = {};
-    bool m_berserkPunchMode = false;
+    std::atomic<bool> m_berserkPunchMode{false};
+    bool m_skillGripWasDown = false;
+    uint64_t m_berserkActivationUntilMs = 0;
     std::atomic<uint64_t> m_physicalMeleeAnimationSuppressUntilMs{0};
 
     /* Turn system */
