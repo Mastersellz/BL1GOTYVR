@@ -700,10 +700,19 @@ static bool ApplyDownedFirstPersonOverride(
     auto& weaponAim = input::WeaponAimSystem::Instance();
     const bool injured = weaponAim.IsPlayerInjured();
     const bool phaseWalk = weaponAim.IsPhaseWalkActive();
+    const bool vrCrouch = input::InputHook::Instance().IsVrCrouchActive();
     bool active = s_downedFirstPersonActive.load(std::memory_order_acquire);
     constexpr float kThirdPersonCameraDisplacementUu = 50.0f;
     constexpr float kFirstPersonRecoveryDisplacementUu = 20.0f;
-    if (active && !injured &&
+    if (active && !injured && vrCrouch &&
+        !s_externalViewFirstPersonActive.load(std::memory_order_acquire)) {
+        active = false;
+        s_downedFirstPersonActive.store(false, std::memory_order_release);
+        AcquireSRWLockExclusive(&s_firstPersonCameraLock);
+        s_downedCameraAnchorValid = false;
+        ReleaseSRWLockExclusive(&s_firstPersonCameraLock);
+        Log("[Camera] Downed first-person override suppressed for VR crouch");
+    } else if (active && !injured &&
         !s_externalViewFirstPersonActive.load(std::memory_order_acquire) &&
         cameraDisplacement <= kFirstPersonRecoveryDisplacementUu) {
         active = false;
@@ -713,7 +722,8 @@ static bool ApplyDownedFirstPersonOverride(
         ReleaseSRWLockExclusive(&s_firstPersonCameraLock);
         Log("[Camera] Downed first-person override ended");
     }
-    if (!active && (injured || cameraDisplacement >= kThirdPersonCameraDisplacementUu)) {
+    if (!active && (injured || (!vrCrouch &&
+        cameraDisplacement >= kThirdPersonCameraDisplacementUu))) {
         active = true;
         AcquireSRWLockExclusive(&s_firstPersonCameraLock);
         s_downedCameraAnchorValid = true;
@@ -729,7 +739,7 @@ static bool ApplyDownedFirstPersonOverride(
     }
     const bool previousTransientAction =
         s_transientFirstPersonActionActive.load(std::memory_order_acquire);
-    const bool transientAction = phaseWalk || (!active && !identity.weaponValid &&
+    const bool transientAction = phaseWalk || (!vrCrouch && !active && !identity.weaponValid &&
         (previousTransientAction || cameraDisplacement >= 5.0f));
     s_transientFirstPersonActionActive.store(
         transientAction, std::memory_order_release);
@@ -916,6 +926,12 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                         !downedFirstPerson &&
                         GetStableFirstPersonLocation(identity,
                             stableFirstPersonLocation);
+                    if (stableFirstPerson &&
+                        input::InputHook::Instance().ShouldUseNativeCrouchCamera()) {
+                        // Keep the stable pawn-relative X/Y anchor, but allow the
+                        // game's native crouch transition to lower the VR camera.
+                        stableFirstPersonLocation[2] = originalLocation[2];
+                    }
                     renderTicket.baseCameraValid = true;
                     memcpy(renderTicket.baseLocation,
                             vehicleAnchorActive ? vehicleSeat :

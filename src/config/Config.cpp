@@ -2,6 +2,7 @@
 #include "../core/VRMod.hpp"
 #include <Windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstdio>
 #include <cmath>
@@ -12,15 +13,22 @@ static Settings s_settings;
 static char s_configPath[MAX_PATH] = {};
 static FILETIME s_lastWriteTime = {};
 static ULONGLONG s_lastReloadCheck = 0;
+static std::atomic<float> s_meleeRangeMultiplier{1.60f};
 
 Settings& Get() { return s_settings; }
+float GetMeleeRangeMultiplier() {
+    return s_meleeRangeMultiplier.load(std::memory_order_acquire);
+}
 
 static float ReadFloat(const char* section, const char* key, float fallback, const char* path) {
     char fallbackText[32] = {};
     char value[32] = {};
     sprintf_s(fallbackText, "%.4f", fallback);
     GetPrivateProfileStringA(section, key, fallbackText, value, sizeof(value), path);
-    return static_cast<float>(atof(value));
+    char* end = nullptr;
+    const float parsed = strtof(value, &end);
+    return end && end != value && *end == '\0' && std::isfinite(parsed)
+        ? parsed : fallback;
 }
 
 void Load(const char* path) {
@@ -160,6 +168,11 @@ void Load(const char* path) {
         ReadFloat("Weapon", "RotationYaw", s_settings.weapon_rotation_yaw, path), -180.0f, 180.0f);
     s_settings.weapon_rotation_roll = std::clamp(
         ReadFloat("Weapon", "RotationRoll", s_settings.weapon_rotation_roll, path), -180.0f, 180.0f);
+    s_settings.melee_range_multiplier = std::clamp(
+        ReadFloat("Melee", "RangeMultiplier", s_settings.melee_range_multiplier, path),
+        1.0f, 5.0f);
+    s_meleeRangeMultiplier.store(s_settings.melee_range_multiplier,
+                                 std::memory_order_release);
 
     s_settings.left_hand_offset_forward = std::clamp(
         ReadFloat("Hands", "LeftForward", s_settings.left_hand_offset_forward, path), -100.0f, 100.0f);
@@ -315,6 +328,7 @@ void Save(const char* path) {
     WriteFloat("Weapon", "RotationPitch", s_settings.weapon_rotation_pitch, path);
     WriteFloat("Weapon", "RotationYaw", s_settings.weapon_rotation_yaw, path);
     WriteFloat("Weapon", "RotationRoll", s_settings.weapon_rotation_roll, path);
+    WriteFloat("Melee", "RangeMultiplier", s_settings.melee_range_multiplier, path);
     WriteFloat("Hands", "LeftForward", s_settings.left_hand_offset_forward, path);
     WriteFloat("Hands", "LeftRight", s_settings.left_hand_offset_right, path);
     WriteFloat("Hands", "LeftUp", s_settings.left_hand_offset_up, path);

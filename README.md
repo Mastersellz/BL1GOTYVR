@@ -101,14 +101,17 @@ button.
 | Right trigger | Fire |
 | Left trigger | Aim down sights |
 | A | Jump |
-| B | Crouch |
+| B | Close/back (`Escape`) |
 | X | Use/reload game action |
 | Left grip | Left shoulder action |
 | Right grip | Right shoulder action |
 | Y tap | Cycle weapon |
 | Y hold | Echo/menu back action |
 | Y hold + left thumbstick | D-pad/weapon slot selection |
-| Left menu button | Start/pause |
+| R3 click | Toggle crouch |
+| Left thumbstick in menus/terminals | Navigate up/down |
+| Physical controller swing | Native melee attack |
+| Left menu button | Reserved by the VR runtime |
 | L3 + R3 | Recenter headset and aim reference |
 
 The right controller pose drives weapon direction and the guarded ballistic aim

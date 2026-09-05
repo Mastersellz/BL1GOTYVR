@@ -2,6 +2,7 @@
 #include <ShlObj.h>
 
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -35,7 +36,7 @@ struct Field {
     bool integer;
 };
 
-constexpr std::array<Field, 14> kFields = {{
+constexpr std::array<Field, 15> kFields = {{
     {101, "Render width", "Display", "Width", "2048", 640.0f, 7680.0f, true},
     {102, "Render height", "Display", "Height", "2048", 480.0f, 4320.0f, true},
     {103, "Resolution scale", "Display", "ResolutionScale", "1.00", 0.5f, 2.0f, false},
@@ -50,6 +51,7 @@ constexpr std::array<Field, 14> kFields = {{
     {112, "OpenXR refresh rate (Hz, 0=default)", "OpenXR", "RefreshRateHz", "72.0", 0.0f, 240.0f, false},
     {113, "Arm reach scale", "Hands", "ArmReachScale", "1.60", 1.0f, 2.0f, false},
     {114, "Hand cut position", "Visibility", "VanillaHandsCutThreshold", "70.0", 20.0f, 90.0f, false},
+    {115, "Melee range scale", "Melee", "RangeMultiplier", "1.60", 1.0f, 5.0f, false},
 }};
 
 struct RenderPreset {
@@ -129,7 +131,8 @@ bool ReadField(HWND window, const Field& field, std::string& text, int& integerV
     GetDlgItemTextA(window, field.id, value, sizeof(value));
     char* end = nullptr;
     const float parsed = strtof(value, &end);
-    if (!end || *end != '\0' || parsed < field.minimum || parsed > field.maximum) return false;
+    if (!end || *end != '\0' || !std::isfinite(parsed) ||
+        parsed < field.minimum || parsed > field.maximum) return false;
     if (field.integer && parsed != static_cast<float>(static_cast<int>(parsed))) return false;
     text = value;
     integerValue = static_cast<int>(parsed);
@@ -264,7 +267,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         CreateWindowExA(0, "BUTTON", "Display and optics", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                         16, 12, 500, 270, window, nullptr, nullptr, nullptr);
         CreateWindowExA(0, "BUTTON", "Tracking and rendering", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                        16, 290, 500, 194, window, nullptr, nullptr, nullptr);
+                        16, 290, 500, 226, window, nullptr, nullptr, nullptr);
 
         CreateLabel(window, "Render preset", 34, 42, 90);
         const char* presetLabels[] = {"Low", "Medium", "High", "Ultra", "Mega"};
@@ -291,22 +294,22 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                             nullptr, nullptr);
         }
 
-        CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 502);
-        CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 502);
-        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 532);
-        CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 532);
-        CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 562);
-        CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 562);
-        CreateCheckbox(window, "Physical crouch", kPhysicalCrouchCheck, 274, 586);
+        CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 534);
+        CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 534);
+        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 564);
+        CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 564);
+        CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 594);
+        CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 594);
+        CreateCheckbox(window, "Physical crouch", kPhysicalCrouchCheck, 274, 618);
 
         CreateWindowExA(0, "BUTTON", "Save settings", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                        154, 604, 110, 34, window,
+                        154, 636, 110, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveButton)), nullptr, nullptr);
         CreateWindowExA(0, "BUTTON", "Defaults", WS_CHILD | WS_VISIBLE,
-                        278, 604, 100, 34, window,
+                        278, 636, 100, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultsButton)), nullptr, nullptr);
         CreateLabel(window, "Convergence 10 = recommended; 0 = parallel. Applies live after Save.",
-                    66, 654, 430);
+                    66, 686, 430);
         LoadSettings(window);
         return 0;
     }
@@ -338,7 +341,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
 
     HWND window = CreateWindowExA(0, windowClass.lpszClassName, "Borderlands GOTY Enhanced VR Config",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 550, 730, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 550, 762, nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
     ShowWindow(window, showCommand);
     UpdateWindow(window);

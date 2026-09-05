@@ -72,6 +72,9 @@ float hud_horizontal_offset = 0.0f;
     float weapon_rotation_yaw = 0.0f;
     float weapon_rotation_roll = 0.0f;
 
+    /* Native melee hit and lunge range */
+    float melee_range_multiplier = 1.60f;
+
     /* Hand IK offsets in camera-local Unreal units */
     float left_hand_offset_forward = 0.0f;
     float left_hand_offset_right = 0.0f;
@@ -101,6 +104,7 @@ float hud_horizontal_offset = 0.0f;
 };
 
 Settings& Get();
+float GetMeleeRangeMultiplier();
 void Load(const char* path);
 void Save(const char* path);
 bool SaveLoaded();

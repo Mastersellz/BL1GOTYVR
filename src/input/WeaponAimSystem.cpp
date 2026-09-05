@@ -2,6 +2,7 @@
 
 #include "../camera/UE3Scanner.hpp"
 #include "../camera/CameraHook.hpp"
+#include "../config/Config.hpp"
 #include "../core/VRMod.hpp"
 #include "../hook/MinHookWrapper.hpp"
 
@@ -53,6 +54,15 @@ static AimFunctionCandidate s_aimFunctionCandidates[128] = {};
 static size_t s_aimFunctionCandidateCount = 0;
 static bool s_aimFunctionCacheValid = false;
 static SRWLOCK s_aimFunctionCacheLock = SRWLOCK_INIT;
+thread_local unsigned s_meleeAttackDepth = 0;
+
+struct InFlightMeleeHook {
+    explicit InFlightMeleeHook(std::atomic<uint32_t>& counter) : counter(counter) {
+        counter.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~InFlightMeleeHook() { counter.fetch_sub(1, std::memory_order_acq_rel); }
+    std::atomic<uint32_t>& counter;
+};
 
 bool ReadMem(uintptr_t address, void* output, size_t size) {
     SIZE_T read = 0;
@@ -250,6 +260,215 @@ bool FindObjectProperty(const camera::UE3Globals& globals, const TArray64& names
         }
     }
     return propertyObject != 0 && !ambiguous;
+}
+
+bool FindUniqueNamedObject(const camera::UE3Globals& globals, const TArray64& names,
+                           const TArray64& objects, const char* objectName,
+                           const char* className, uintptr_t& result) {
+    result = 0;
+    for (int32_t index = 0; index < objects.count; ++index) {
+        uintptr_t object = 0;
+        char candidateName[128] = {};
+        char candidateClass[128] = {};
+        if (!ReadMem(objects.data + static_cast<uint64_t>(index) * sizeof(uintptr_t),
+                     &object, sizeof(object)) || object < 0x10000 ||
+            !ReadObjectName(globals, names, object, candidateName, sizeof(candidateName)) ||
+            strcmp(candidateName, objectName) != 0 ||
+            !ReadClassName(globals, names, object, candidateClass, sizeof(candidateClass)) ||
+            strcmp(candidateClass, className) != 0) continue;
+        if (result && result != object) return false;
+        result = object;
+    }
+    return result != 0;
+}
+
+bool FindUniqueOwnedObject(const camera::UE3Globals& globals, const TArray64& names,
+                           const TArray64& objects, const char* objectName,
+                           const char* className, uintptr_t expectedOwner,
+                           uintptr_t& result) {
+    result = 0;
+    for (int32_t index = 0; index < objects.count; ++index) {
+        uintptr_t object = 0;
+        uintptr_t owner = 0;
+        char candidateName[128] = {};
+        char candidateClass[128] = {};
+        if (!ReadMem(objects.data + static_cast<uint64_t>(index) * sizeof(uintptr_t),
+                     &object, sizeof(object)) || object < 0x10000 ||
+            !ReadObjectName(globals, names, object, candidateName, sizeof(candidateName)) ||
+            strcmp(candidateName, objectName) != 0 ||
+            !ReadClassName(globals, names, object, candidateClass, sizeof(candidateClass)) ||
+            strcmp(candidateClass, className) != 0 ||
+            !ReadOuter(globals, object, owner) || owner != expectedOwner) continue;
+        if (result && result != object) return false;
+        result = object;
+    }
+    return result != 0;
+}
+
+bool ReadPropertyLayout(uintptr_t property, int32_t expectedElementSize,
+                        int32_t& offset, int32_t& elementSize) {
+    int32_t arrayDim = 0;
+    offset = -1;
+    elementSize = 0;
+    return ReadMem(property + 0x68, &arrayDim, sizeof(arrayDim)) && arrayDim == 1 &&
+        ReadMem(property + 0x6C, &elementSize, sizeof(elementSize)) &&
+        elementSize == expectedElementSize &&
+        ReadMem(property + 0x8C, &offset, sizeof(offset)) &&
+        offset >= 0 && offset < 0x10000;
+}
+
+bool IsInputParameter(uintptr_t property) {
+    constexpr uint64_t kParameter = 0x0000000000000080ull;
+    constexpr uint64_t kOutOrReturn = 0x0000000000000500ull;
+    uint64_t flags = 0;
+    return ReadMem(property + 0x70, &flags, sizeof(flags)) &&
+        (flags & kParameter) != 0 && (flags & kOutOrReturn) == 0;
+}
+
+bool PropertyReferencesStruct(uintptr_t property, uintptr_t expectedStruct) {
+    int matches = 0;
+    for (uintptr_t offset = 0x90; offset < 0xF0; offset += sizeof(uintptr_t)) {
+        uintptr_t candidate = 0;
+        if (ReadMem(property + offset, &candidate, sizeof(candidate)) &&
+            candidate == expectedStruct) ++matches;
+    }
+    return matches == 1;
+}
+
+bool ResolveNativeExecTarget(uintptr_t function, uint64_t moduleBase,
+                             uint32_t moduleSize, uintptr_t& target,
+                             uint16_t& parameterSize) {
+    constexpr uint32_t kFunctionNative = 0x00000400;
+    uint32_t flags = 0;
+    target = 0;
+    parameterSize = 0;
+    if (!ReadMem(function + 0xD0, &flags, sizeof(flags)) ||
+        !(flags & kFunctionNative) ||
+        !ReadMem(function + 0xE2, &parameterSize, sizeof(parameterSize)) ||
+        !ReadMem(function + 0xF0, &target, sizeof(target)) ||
+        target < moduleBase || target >= moduleBase + moduleSize) return false;
+
+    MEMORY_BASIC_INFORMATION memory = {};
+    return VirtualQuery(reinterpret_cast<void*>(target), &memory, sizeof(memory)) &&
+        memory.State == MEM_COMMIT &&
+        (memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+}
+
+struct MeleeDiscovery {
+    uintptr_t meleeDefinitionClass = 0;
+    uintptr_t meleeAttackFunction = 0;
+    uintptr_t meleeAttackTarget = 0;
+    uintptr_t findMeleeTargetFunction = 0;
+    uintptr_t findMeleeTargetTarget = 0;
+    int32_t contextParameterOffset = -1;
+    int32_t traceScaleOffset = -1;
+    int32_t radiusScaleOffset = -1;
+    int32_t maxLungeDistanceParameterOffset = -1;
+    uint16_t meleeAttackParameterSize = 0;
+    uint16_t findMeleeTargetParameterSize = 0;
+};
+
+bool DiscoverMeleeMetadata(const camera::UE3Globals& globals, const TArray64& names,
+                           const TArray64& objects, uint64_t moduleBase,
+                           uint32_t moduleSize, MeleeDiscovery& discovery) {
+    uintptr_t attributeInitializationData = 0;
+    uintptr_t meleeAttackFunction = 0;
+    uintptr_t traceDistanceProperty = 0;
+    uintptr_t damageRadiusProperty = 0;
+    uintptr_t scaleConstantProperty = 0;
+    uintptr_t contextProperty = 0;
+    int32_t traceOffset = -1;
+    int32_t radiusOffset = -1;
+    int32_t scaleOffset = -1;
+    int32_t contextElementSize = 0;
+    int32_t formulaSize = 0;
+    int32_t radiusFormulaSize = 0;
+    int32_t scaleSize = 0;
+    uint32_t meleeDefinitionPropertySize = 0;
+
+    const bool meleeMetadataValid =
+        FindUniqueNamedObject(globals, names, objects, "MeleeDefinition", "Class",
+                              discovery.meleeDefinitionClass) &&
+        FindUniqueOwnedObject(globals, names, objects, "MeleeAttack", "Function",
+                              discovery.meleeDefinitionClass, meleeAttackFunction) &&
+        FindUniqueOwnedObject(globals, names, objects, "TraceDistanceFormula",
+                              "StructProperty", discovery.meleeDefinitionClass,
+                              traceDistanceProperty) &&
+        FindUniqueOwnedObject(globals, names, objects, "DamageRadiusFormula",
+                              "StructProperty", discovery.meleeDefinitionClass,
+                              damageRadiusProperty) &&
+        FindUniqueOwnedObject(globals, names, objects, "ContextObject", "ObjectProperty",
+                              meleeAttackFunction, contextProperty) &&
+        FindUniqueNamedObject(globals, names, objects, "AttributeInitializationData",
+                              "ScriptStruct", attributeInitializationData) &&
+        FindUniqueOwnedObject(globals, names, objects, "BaseValueScaleConstant",
+                              "FloatProperty", attributeInitializationData,
+                              scaleConstantProperty) &&
+        ReadMem(discovery.meleeDefinitionClass + 0x84,
+                &meleeDefinitionPropertySize, sizeof(meleeDefinitionPropertySize)) &&
+        ReadPropertyLayout(traceDistanceProperty, 0x20, traceOffset, formulaSize) &&
+        ReadPropertyLayout(damageRadiusProperty, formulaSize, radiusOffset,
+                           radiusFormulaSize) &&
+        traceOffset + formulaSize <= static_cast<int32_t>(meleeDefinitionPropertySize) &&
+        radiusOffset + radiusFormulaSize <=
+            static_cast<int32_t>(meleeDefinitionPropertySize) &&
+        PropertyReferencesStruct(traceDistanceProperty, attributeInitializationData) &&
+        PropertyReferencesStruct(damageRadiusProperty, attributeInitializationData) &&
+        ReadPropertyLayout(scaleConstantProperty, 4, scaleOffset, scaleSize) &&
+        ReadPropertyLayout(contextProperty, 8, discovery.contextParameterOffset,
+                           contextElementSize) &&
+        IsInputParameter(contextProperty) &&
+        scaleOffset + scaleSize <= formulaSize &&
+        ResolveNativeExecTarget(meleeAttackFunction, moduleBase, moduleSize,
+                                discovery.meleeAttackTarget,
+                                discovery.meleeAttackParameterSize) &&
+        discovery.contextParameterOffset + contextElementSize <=
+            discovery.meleeAttackParameterSize;
+    if (meleeMetadataValid) {
+        discovery.meleeAttackFunction = meleeAttackFunction;
+        discovery.traceScaleOffset = traceOffset + scaleOffset;
+        discovery.radiusScaleOffset = radiusOffset + scaleOffset;
+    } else {
+        discovery.meleeDefinitionClass = 0;
+        discovery.meleeAttackFunction = 0;
+        discovery.meleeAttackTarget = 0;
+    }
+
+    uintptr_t willowPawnClass = 0;
+    uintptr_t findMeleeTargetFunction = 0;
+    uintptr_t maxLungeDistanceProperty = 0;
+    int32_t lungeElementSize = 0;
+    const bool lungeMetadataValid =
+        FindUniqueNamedObject(globals, names, objects, "WillowPawn", "Class",
+                              willowPawnClass) &&
+        FindUniqueOwnedObject(globals, names, objects, "FindMeleeTarget", "Function",
+                              willowPawnClass, findMeleeTargetFunction) &&
+        FindUniqueOwnedObject(globals, names, objects, "MaxLungeDistance", "FloatProperty",
+                              findMeleeTargetFunction, maxLungeDistanceProperty) &&
+        ReadPropertyLayout(maxLungeDistanceProperty, 4,
+                           discovery.maxLungeDistanceParameterOffset,
+                           lungeElementSize) &&
+        IsInputParameter(maxLungeDistanceProperty) &&
+        ResolveNativeExecTarget(findMeleeTargetFunction, moduleBase, moduleSize,
+                                discovery.findMeleeTargetTarget,
+                                discovery.findMeleeTargetParameterSize) &&
+        discovery.maxLungeDistanceParameterOffset + lungeElementSize <=
+            discovery.findMeleeTargetParameterSize;
+    if (!lungeMetadataValid) {
+        discovery.findMeleeTargetFunction = 0;
+        discovery.findMeleeTargetTarget = 0;
+        discovery.maxLungeDistanceParameterOffset = -1;
+    } else {
+        discovery.findMeleeTargetFunction = findMeleeTargetFunction;
+    }
+    if (discovery.meleeAttackTarget &&
+        discovery.meleeAttackTarget == discovery.findMeleeTargetTarget) {
+        discovery.findMeleeTargetFunction = 0;
+        discovery.findMeleeTargetTarget = 0;
+        discovery.maxLungeDistanceParameterOffset = -1;
+    }
+    return meleeMetadataValid || lungeMetadataValid;
 }
 
 } // namespace
@@ -580,6 +799,96 @@ bool WeaponAimSystem::InstallGameplayStateProbes(
     return installedAny;
 }
 
+bool WeaponAimSystem::InstallMeleeAttackHook(
+        uintptr_t function, uintptr_t target, uintptr_t meleeDefinitionClass,
+        int32_t objectClassOffset, int32_t contextParameterOffset,
+        int32_t traceScaleOffset, int32_t radiusScaleOffset) {
+    if (m_meleeAttackInstalled.load(std::memory_order_acquire))
+        return target == m_meleeAttackTarget;
+    if (function < 0x10000 || target < 0x10000 || meleeDefinitionClass < 0x10000 ||
+        objectClassOffset < 0 || contextParameterOffset < 0 ||
+        traceScaleOffset <= 0 || radiusScaleOffset <= 0 ||
+        traceScaleOffset == radiusScaleOffset) return false;
+
+    const MH_STATUS createStatus = MH_CreateHook(
+        reinterpret_cast<void*>(target), &HookedMeleeAttack,
+        reinterpret_cast<void**>(&m_originalMeleeAttack));
+    if (createStatus != MH_OK) {
+        Log("[MeleeRange] MeleeAttack hook creation failed: %s",
+            MH_StatusToString(createStatus));
+        m_originalMeleeAttack = nullptr;
+        return false;
+    }
+
+    m_meleeAttackFunction = function;
+    m_meleeAttackTarget = target;
+    m_meleeDefinitionClass = meleeDefinitionClass;
+    m_meleeObjectClassOffset = objectClassOffset;
+    m_meleeContextParameterOffset = contextParameterOffset;
+    m_traceScaleOffset = traceScaleOffset;
+    m_radiusScaleOffset = radiusScaleOffset;
+    m_meleeMutationSafe.store(true, std::memory_order_release);
+    m_meleeHooksStopping.store(false, std::memory_order_release);
+    const MH_STATUS enableStatus = MH_EnableHook(reinterpret_cast<void*>(target));
+    if (enableStatus != MH_OK) {
+        MH_RemoveHook(reinterpret_cast<void*>(target));
+        Log("[MeleeRange] MeleeAttack hook enable failed: %s",
+            MH_StatusToString(enableStatus));
+        m_meleeAttackTarget = 0;
+        m_meleeAttackFunction = 0;
+        m_originalMeleeAttack = nullptr;
+        m_meleeDefinitionClass = 0;
+        m_meleeObjectClassOffset = -1;
+        m_meleeContextParameterOffset = -1;
+        m_traceScaleOffset = -1;
+        m_radiusScaleOffset = -1;
+        return false;
+    }
+    m_meleeAttackInstalled.store(true, std::memory_order_release);
+    Log("[MeleeRange] MeleeAttack hook installed at %p: context=+0x%X "
+        "traceScale=+0x%X radiusScale=+0x%X multiplier=%.2f",
+        reinterpret_cast<void*>(target), contextParameterOffset,
+        traceScaleOffset, radiusScaleOffset,
+        config::GetMeleeRangeMultiplier());
+    return true;
+}
+
+bool WeaponAimSystem::InstallFindMeleeTargetHook(uintptr_t function, uintptr_t target,
+                                                  int32_t parameterOffset) {
+    if (m_findMeleeTargetInstalled.load(std::memory_order_acquire))
+        return target == m_findMeleeTargetTarget;
+    if (function < 0x10000 || target < 0x10000 || parameterOffset < 0) return false;
+
+    const MH_STATUS createStatus = MH_CreateHook(
+        reinterpret_cast<void*>(target), &HookedFindMeleeTarget,
+        reinterpret_cast<void**>(&m_originalFindMeleeTarget));
+    if (createStatus != MH_OK) {
+        Log("[MeleeRange] FindMeleeTarget hook creation failed: %s",
+            MH_StatusToString(createStatus));
+        m_originalFindMeleeTarget = nullptr;
+        return false;
+    }
+    m_findMeleeTargetFunction = function;
+    m_findMeleeTargetTarget = target;
+    m_maxLungeDistanceParameterOffset = parameterOffset;
+    m_meleeHooksStopping.store(false, std::memory_order_release);
+    const MH_STATUS enableStatus = MH_EnableHook(reinterpret_cast<void*>(target));
+    if (enableStatus != MH_OK) {
+        MH_RemoveHook(reinterpret_cast<void*>(target));
+        Log("[MeleeRange] FindMeleeTarget hook enable failed: %s",
+            MH_StatusToString(enableStatus));
+        m_findMeleeTargetTarget = 0;
+        m_findMeleeTargetFunction = 0;
+        m_originalFindMeleeTarget = nullptr;
+        m_maxLungeDistanceParameterOffset = -1;
+        return false;
+    }
+    m_findMeleeTargetInstalled.store(true, std::memory_order_release);
+    Log("[MeleeRange] FindMeleeTarget hook installed at %p: MaxLungeDistance=+0x%X",
+        reinterpret_cast<void*>(target), parameterOffset);
+    return true;
+}
+
 bool WeaponAimSystem::InstallScriptInvokeProbe(uintptr_t function,
                                                 uint64_t moduleBase,
                                                 uint32_t moduleSize) {
@@ -811,6 +1120,180 @@ void __fastcall WeaponAimSystem::HookedPhaseWalkVisibility(
     }
 }
 
+void __fastcall WeaponAimSystem::HookedMeleeAttack(
+        void* object, void* frame, void* result) {
+    auto& system = Instance();
+    InFlightMeleeHook inFlight(system.m_inFlightMeleeHooks);
+    NativeExecFn original = system.m_originalMeleeAttack;
+    if (!original) return;
+    if (system.m_meleeHooksStopping.load(std::memory_order_acquire) ||
+        s_meleeAttackDepth != 0) {
+        original(object, frame, result);
+        return;
+    }
+
+    PlayerIdentitySnapshot identity = system.GetPlayerIdentity();
+    uintptr_t frameNode = 0;
+    uintptr_t locals = 0;
+    uintptr_t context = 0;
+    uintptr_t objectClass = 0;
+    const bool localPlayerAttack = object && frame && identity.pawnValid &&
+        ReadDirect(reinterpret_cast<uintptr_t>(frame) + 0x14,
+                   &frameNode, sizeof(frameNode)) &&
+        frameNode == system.m_meleeAttackFunction &&
+        ReadDirect(reinterpret_cast<uintptr_t>(frame) + 0x2C,
+                   &locals, sizeof(locals)) && locals >= 0x10000 &&
+        ReadDirect(locals + static_cast<uintptr_t>(system.m_meleeContextParameterOffset),
+                   &context, sizeof(context)) && context == identity.pawn &&
+        ReadDirect(reinterpret_cast<uintptr_t>(object) +
+                       static_cast<uintptr_t>(system.m_meleeObjectClassOffset),
+                   &objectClass, sizeof(objectClass)) &&
+        ClassDistance(objectClass, system.m_meleeDefinitionClass) >= 0;
+    const float multiplier = config::GetMeleeRangeMultiplier();
+    if (!localPlayerAttack ||
+        !system.m_meleeMutationSafe.load(std::memory_order_acquire) ||
+        !std::isfinite(multiplier) || multiplier <= 1.0001f) {
+        original(object, frame, result);
+        return;
+    }
+
+    const DWORD currentThread = GetCurrentThreadId();
+    DWORD expectedThread = 0;
+    system.m_meleeExecutionThread.compare_exchange_strong(
+        expectedThread, currentThread, std::memory_order_acq_rel);
+    if (expectedThread != 0 && expectedThread != currentThread) {
+        original(object, frame, result);
+        return;
+    }
+    if (!TryAcquireSRWLockExclusive(&system.m_meleeRangeLock)) {
+        original(object, frame, result);
+        return;
+    }
+    const bool identityStillValid =
+        system.m_identityGeneration.load(std::memory_order_acquire) == identity.generation &&
+        system.m_pawnIdentityValid.load(std::memory_order_acquire) &&
+        system.m_localPawn.load(std::memory_order_acquire) == identity.pawn;
+    if (!identityStillValid) {
+        ReleaseSRWLockExclusive(&system.m_meleeRangeLock);
+        original(object, frame, result);
+        return;
+    }
+
+    ++s_meleeAttackDepth;
+    const uintptr_t traceAddress = reinterpret_cast<uintptr_t>(object) +
+        static_cast<uintptr_t>(system.m_traceScaleOffset);
+    const uintptr_t radiusAddress = reinterpret_cast<uintptr_t>(object) +
+        static_cast<uintptr_t>(system.m_radiusScaleOffset);
+    float traceScale = 0.0f;
+    float radiusScale = 0.0f;
+    const bool valuesValid = ReadDirect(traceAddress, &traceScale, sizeof(traceScale)) &&
+        ReadDirect(radiusAddress, &radiusScale, sizeof(radiusScale)) &&
+        std::isfinite(traceScale) && std::isfinite(radiusScale) &&
+        fabsf(traceScale) <= 1000000.0f && fabsf(radiusScale) <= 1000000.0f;
+    const float scaledTrace = traceScale * multiplier;
+    const float scaledRadius = radiusScale * multiplier;
+    bool traceWritten = false;
+    bool radiusWritten = false;
+    if (valuesValid && std::isfinite(scaledTrace) && std::isfinite(scaledRadius)) {
+        traceWritten = WriteDirect(traceAddress, &scaledTrace, sizeof(scaledTrace));
+        radiusWritten = traceWritten &&
+            WriteDirect(radiusAddress, &scaledRadius, sizeof(scaledRadius));
+    }
+    if (!traceWritten || !radiusWritten) {
+        const bool traceRolledBack = !traceWritten ||
+            WriteDirect(traceAddress, &traceScale, sizeof(traceScale));
+        const bool radiusRolledBack = !radiusWritten ||
+            WriteDirect(radiusAddress, &radiusScale, sizeof(radiusScale));
+        system.m_meleeMutationSafe.store(false, std::memory_order_release);
+        --s_meleeAttackDepth;
+        ReleaseSRWLockExclusive(&system.m_meleeRangeLock);
+        Log("[MeleeRange] ERROR: formula mutation rejected; scaling disabled "
+            "values=%d traceWrite=%d radiusWrite=%d traceRollback=%d radiusRollback=%d",
+            valuesValid, traceWritten, radiusWritten, traceRolledBack, radiusRolledBack);
+        original(object, frame, result);
+        return;
+    }
+
+    original(object, frame, result);
+
+    const bool traceRestored = WriteDirect(traceAddress, &traceScale, sizeof(traceScale));
+    const bool radiusRestored = WriteDirect(radiusAddress, &radiusScale, sizeof(radiusScale));
+    const bool restored = traceRestored && radiusRestored;
+    if (!restored)
+        system.m_meleeMutationSafe.store(false, std::memory_order_release);
+    const uint64_t count = system.m_meleeRangeApplies.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    if (count <= 8 || count % 100 == 0) {
+        Log("[MeleeRange] Attack %llu object=%p context=%p multiplier=%.2f "
+            "traceScale=%.4f->%.4f radiusScale=%.4f->%.4f restored=%d",
+            static_cast<unsigned long long>(count), object,
+            reinterpret_cast<void*>(context), multiplier,
+            traceScale, scaledTrace, radiusScale, scaledRadius, restored);
+    }
+    --s_meleeAttackDepth;
+    ReleaseSRWLockExclusive(&system.m_meleeRangeLock);
+    if (!restored)
+        Log("[MeleeRange] ERROR: failed to restore melee definition %p", object);
+}
+
+void __fastcall WeaponAimSystem::HookedFindMeleeTarget(
+        void* object, void* frame, void* result) {
+    auto& system = Instance();
+    InFlightMeleeHook inFlight(system.m_inFlightMeleeHooks);
+    NativeExecFn original = system.m_originalFindMeleeTarget;
+    if (!original) return;
+    const PlayerIdentitySnapshot identity = system.GetPlayerIdentity();
+    uintptr_t frameNode = 0;
+    const float multiplier = config::GetMeleeRangeMultiplier();
+    if (system.m_meleeHooksStopping.load(std::memory_order_acquire) ||
+        !identity.pawnValid || reinterpret_cast<uintptr_t>(object) != identity.pawn ||
+        !frame || !ReadDirect(reinterpret_cast<uintptr_t>(frame) + 0x14,
+                              &frameNode, sizeof(frameNode)) ||
+        frameNode != system.m_findMeleeTargetFunction ||
+        !system.m_meleeMutationSafe.load(std::memory_order_acquire) ||
+        !std::isfinite(multiplier) || multiplier <= 1.0001f) {
+        original(object, frame, result);
+        return;
+    }
+
+    uintptr_t locals = 0;
+    float distance = 0.0f;
+    const bool valueValid = ReadDirect(reinterpret_cast<uintptr_t>(frame) + 0x2C,
+                                       &locals, sizeof(locals)) &&
+        locals >= 0x10000 &&
+        ReadDirect(locals + static_cast<uintptr_t>(
+                       system.m_maxLungeDistanceParameterOffset),
+                   &distance, sizeof(distance)) &&
+        std::isfinite(distance) && distance > 0.0f && distance <= 1000000.0f;
+    const float scaledDistance = distance * multiplier;
+    const uintptr_t distanceAddress = locals + static_cast<uintptr_t>(
+        system.m_maxLungeDistanceParameterOffset);
+    const bool identityStillValid =
+        system.m_identityGeneration.load(std::memory_order_acquire) == identity.generation &&
+        system.m_pawnIdentityValid.load(std::memory_order_acquire) &&
+        system.m_localPawn.load(std::memory_order_acquire) == identity.pawn;
+    const bool written = valueValid && identityStillValid &&
+        std::isfinite(scaledDistance) &&
+        WriteDirect(distanceAddress, &scaledDistance, sizeof(scaledDistance));
+    original(object, frame, result);
+    const bool restored = !written ||
+        WriteDirect(distanceAddress, &distance, sizeof(distance));
+    if (written && !restored)
+        system.m_meleeMutationSafe.store(false, std::memory_order_release);
+    if (written) {
+        const uint64_t count = system.m_lungeRangeApplies.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (count <= 8 || count % 100 == 0) {
+            Log("[MeleeRange] Lunge query %llu pawn=%p multiplier=%.2f "
+                "distance=%.3f->%.3f restored=%d",
+                static_cast<unsigned long long>(count), object, multiplier,
+                distance, scaledDistance, restored);
+        }
+    }
+    if (!restored)
+        Log("[MeleeRange] ERROR: failed to restore MaxLungeDistance for pawn %p", object);
+}
+
 void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAddress,
                                  uint64_t moduleBase, uint32_t moduleSize) {
     const auto& globals = *static_cast<const camera::UE3Globals*>(globalsAddress);
@@ -1022,6 +1505,42 @@ void WeaponAimSystem::Discover(const void* globalsAddress, uint64_t controllerAd
     }
     InstallGameplayStateProbes(isInjuredFunction, phaseWalkVisibilityFunction,
                                moduleBase, moduleSize);
+    if (!m_meleeAttackInstalled.load(std::memory_order_acquire) ||
+        !m_findMeleeTargetInstalled.load(std::memory_order_acquire)) {
+        MeleeDiscovery melee = {};
+        if (DiscoverMeleeMetadata(globals, names, objects, moduleBase, moduleSize,
+                                  melee)) {
+            Log("[MeleeRange] Reflected metadata: class=%p function=%p attack=%p params=0x%X "
+                "context=+0x%X traceScale=+0x%X radiusScale=+0x%X "
+                "findFunction=%p findTarget=%p params=0x%X maxLunge=+0x%X",
+                reinterpret_cast<void*>(melee.meleeDefinitionClass),
+                reinterpret_cast<void*>(melee.meleeAttackFunction),
+                reinterpret_cast<void*>(melee.meleeAttackTarget),
+                melee.meleeAttackParameterSize, melee.contextParameterOffset,
+                melee.traceScaleOffset, melee.radiusScaleOffset,
+                reinterpret_cast<void*>(melee.findMeleeTargetFunction),
+                reinterpret_cast<void*>(melee.findMeleeTargetTarget),
+                melee.findMeleeTargetParameterSize,
+                melee.maxLungeDistanceParameterOffset);
+            if (melee.meleeAttackTarget &&
+                !m_meleeAttackInstalled.load(std::memory_order_acquire)) {
+                InstallMeleeAttackHook(
+                    melee.meleeAttackFunction, melee.meleeAttackTarget,
+                    melee.meleeDefinitionClass,
+                    globals.gObjectClassOffset, melee.contextParameterOffset,
+                    melee.traceScaleOffset, melee.radiusScaleOffset);
+            }
+            if (melee.findMeleeTargetTarget &&
+                !m_findMeleeTargetInstalled.load(std::memory_order_acquire)) {
+                InstallFindMeleeTargetHook(
+                    melee.findMeleeTargetFunction,
+                    melee.findMeleeTargetTarget,
+                    melee.maxLungeDistanceParameterOffset);
+            }
+        } else {
+            Log("[MeleeRange] Reflected melee metadata unavailable; hooks remain disabled");
+        }
+    }
     InstallNativeAimProbe(moduleBase, moduleSize);
     if (!m_scriptInvokeInstalled.load(std::memory_order_acquire)) {
         for (size_t index = 0; index < aimCandidateCount; ++index) {
@@ -1387,6 +1906,35 @@ void WeaponAimSystem::Shutdown() {
     }
     m_phaseWalkVisibilityTarget = 0;
     m_originalPhaseWalkVisibility = nullptr;
+    m_meleeHooksStopping.store(true, std::memory_order_release);
+    if (m_findMeleeTargetTarget &&
+        m_findMeleeTargetInstalled.load(std::memory_order_acquire))
+        MH_DisableHook(reinterpret_cast<void*>(m_findMeleeTargetTarget));
+    if (m_meleeAttackTarget &&
+        m_meleeAttackInstalled.load(std::memory_order_acquire))
+        MH_DisableHook(reinterpret_cast<void*>(m_meleeAttackTarget));
+    while (m_inFlightMeleeHooks.load(std::memory_order_acquire) != 0) Sleep(1);
+    if (m_findMeleeTargetTarget &&
+        m_findMeleeTargetInstalled.exchange(false, std::memory_order_acq_rel)) {
+        MH_RemoveHook(reinterpret_cast<void*>(m_findMeleeTargetTarget));
+    }
+    m_findMeleeTargetFunction = 0;
+    m_findMeleeTargetTarget = 0;
+    m_originalFindMeleeTarget = nullptr;
+    m_maxLungeDistanceParameterOffset = -1;
+    if (m_meleeAttackTarget &&
+        m_meleeAttackInstalled.exchange(false, std::memory_order_acq_rel)) {
+        MH_RemoveHook(reinterpret_cast<void*>(m_meleeAttackTarget));
+    }
+    m_meleeAttackFunction = 0;
+    m_meleeAttackTarget = 0;
+    m_originalMeleeAttack = nullptr;
+    m_meleeDefinitionClass = 0;
+    m_meleeObjectClassOffset = -1;
+    m_meleeContextParameterOffset = -1;
+    m_traceScaleOffset = -1;
+    m_radiusScaleOffset = -1;
+    m_meleeExecutionThread.store(0, std::memory_order_release);
     if (m_processEventTarget && m_hookInstalled.exchange(false, std::memory_order_acq_rel)) {
         MH_DisableHook(reinterpret_cast<void*>(m_processEventTarget));
         MH_RemoveHook(reinterpret_cast<void*>(m_processEventTarget));

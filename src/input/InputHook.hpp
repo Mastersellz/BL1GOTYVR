@@ -81,6 +81,13 @@ public:
     bool IsBerserkPunchMode() const {
         return m_berserkPunchMode.load(std::memory_order_acquire);
     }
+    bool IsVrCrouchActive() const {
+        return m_vrCrouchActive.load(std::memory_order_acquire) ||
+            GetTickCount64() < m_vrCrouchTransitionUntilMs.load(std::memory_order_acquire);
+    }
+    bool ShouldUseNativeCrouchCamera() const {
+        return m_nativeCrouchCameraActive.load(std::memory_order_acquire);
+    }
     bool IsAimDotVisible() const;
     bool GetWeaponBarrelLocalDirection(float direction[3]);
     bool GetDrivenWeaponFrame(float position[3], float forward[3],
@@ -131,6 +138,7 @@ private:
     int m_prevGrenade = 0, m_prevMenu = 0, m_prevEcho = 0;
     int m_prevDpadUp = 0, m_prevDpadDown = 0;
     int m_prevDpadLeft = 0, m_prevDpadRight = 0;
+    int m_prevMenuUp = 0, m_prevMenuDown = 0;
     int m_prevWeaponCycle = 0;
 
     /* Analog/button filtering and Y chord */
@@ -143,14 +151,16 @@ private:
     bool m_yChordUsed = false;
     bool m_recenterChordLatched = false;
     uint64_t m_recenterChordStartedMs = 0;
-    bool m_bWasDown = false;
-    bool m_bHoldUsed = false;
     uint64_t m_yPressMs = 0;
     uint64_t m_yTapPulseUntilMs = 0;
-    uint64_t m_bPressMs = 0;
-    uint64_t m_bTapPulseUntilMs = 0;
     uint64_t m_physicalCrouchPulseUntilMs = 0;
     bool m_physicalCrouchGameState = false;
+    bool m_manualCrouchDesired = false;
+    bool m_rightStickWasDown = false;
+    bool m_rightStickTurnSuppressed = false;
+    std::atomic<bool> m_vrCrouchActive{false};
+    std::atomic<bool> m_nativeCrouchCameraActive{false};
+    std::atomic<uint64_t> m_vrCrouchTransitionUntilMs{0};
 
     /* Physical melee swing detectors, one per tracked hand. */
     struct PhysicalMeleeTracker {

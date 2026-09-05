@@ -54,6 +54,7 @@ private:
     using GetAimRotationFn = void(__fastcall*)(void*, void*, void*);
     using ScriptInvokeFn = void(__fastcall*)(void*, void*, void*);
     using GameplayStateFn = void(__fastcall*)(void*, void*, void*);
+    using NativeExecFn = void(__fastcall*)(void*, void*, void*);
 
     static int32_t __fastcall HookedProcessEvent(void* object, uint64_t functionName,
                                                   void* params, void* result);
@@ -69,6 +70,14 @@ private:
     static void __fastcall HookedIsInjured(void* object, void* frame, void* result);
     static void __fastcall HookedPhaseWalkVisibility(
         void* object, void* frame, void* result);
+    static void __fastcall HookedMeleeAttack(void* object, void* frame, void* result);
+    static void __fastcall HookedFindMeleeTarget(void* object, void* frame, void* result);
+    bool InstallMeleeAttackHook(uintptr_t function, uintptr_t target,
+                                uintptr_t meleeDefinitionClass,
+                                int32_t objectClassOffset, int32_t contextParameterOffset,
+                                int32_t traceScaleOffset, int32_t radiusScaleOffset);
+    bool InstallFindMeleeTargetHook(uintptr_t function, uintptr_t target,
+                                    int32_t parameterOffset);
     uintptr_t FindProcessEvent(uint64_t controllerAddress, uint64_t moduleBase,
                                uint32_t moduleSize);
     bool FindPawnAimRotation(uint64_t controllerAddress);
@@ -125,6 +134,27 @@ private:
     GameplayStateFn m_originalIsInjured = nullptr;
     uintptr_t m_phaseWalkVisibilityTarget = 0;
     GameplayStateFn m_originalPhaseWalkVisibility = nullptr;
+    std::atomic<bool> m_meleeAttackInstalled{false};
+    uintptr_t m_meleeAttackFunction = 0;
+    uintptr_t m_meleeAttackTarget = 0;
+    NativeExecFn m_originalMeleeAttack = nullptr;
+    uintptr_t m_meleeDefinitionClass = 0;
+    int32_t m_meleeObjectClassOffset = -1;
+    int32_t m_meleeContextParameterOffset = -1;
+    int32_t m_traceScaleOffset = -1;
+    int32_t m_radiusScaleOffset = -1;
+    mutable SRWLOCK m_meleeRangeLock = SRWLOCK_INIT;
+    std::atomic<bool> m_meleeMutationSafe{true};
+    std::atomic<DWORD> m_meleeExecutionThread{0};
+    std::atomic<uint64_t> m_meleeRangeApplies{0};
+    std::atomic<bool> m_findMeleeTargetInstalled{false};
+    uintptr_t m_findMeleeTargetFunction = 0;
+    uintptr_t m_findMeleeTargetTarget = 0;
+    NativeExecFn m_originalFindMeleeTarget = nullptr;
+    int32_t m_maxLungeDistanceParameterOffset = -1;
+    std::atomic<uint64_t> m_lungeRangeApplies{0};
+    std::atomic<bool> m_meleeHooksStopping{false};
+    std::atomic<uint32_t> m_inFlightMeleeHooks{0};
 };
 
 }} // namespace bl1gotyvr::input

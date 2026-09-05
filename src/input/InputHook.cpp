@@ -103,10 +103,10 @@ void InputHook::Install() {
         config::Get().turn_mode, config::Get().smooth_turn_speed,
         config::Get().snap_turn_angle, config::Get().locomotion_deadzone,
         config::Get().weapon_position_scale);
-    Log("[Input] Map: sticks analog, RT fire, LT ADS, A jump, B crouch, "
-        "X use/reload, Y cycle, LB skill, RB grenade, L3 sprint, R3 melee, Menu Esc/back");
+    Log("[Input] Map: sticks analog, RT fire, LT ADS, A jump, B Esc/back, "
+        "X use/reload, Y cycle, LB skill, RB grenade, L3 sprint, R3 crouch");
     Log("[Input] Y chord: tap=Y, hold 400ms=Back/ECHO, hold+left stick=D-pad");
-    Log("[Input] B chord: tap=B, hold 400ms=toggle motion controls");
+    Log("[Input] UI navigation: left stick vertical=D-pad up/down; melee=physical VR swing");
     Log("[Input] Calibration: Ctrl+Numpad 1=global left hand, 3=active weapon, "
         "0 toggles rotation/position, 8/2 4/6 7/9 adjust axes, "
         "5 resets current mode; release Ctrl to save");
@@ -160,6 +160,8 @@ void InputHook::ReleaseAllInput() {
     RELEASE(m_prevDpadRight, '2')
     RELEASE(m_prevDpadDown, '3')
     RELEASE(m_prevDpadLeft, '4')
+    RELEASE(m_prevMenuUp, VK_UP)
+    RELEASE(m_prevMenuDown, VK_DOWN)
 #undef RELEASE
     if (count) SendInput(count, inputs, sizeof(INPUT));
     m_prevGrip = m_prevW = m_prevA = m_prevS = m_prevD = 0;
@@ -167,6 +169,7 @@ void InputHook::ReleaseAllInput() {
     m_prevCrouch = m_prevUse = m_prevReload = m_prevGrenade = 0;
     m_prevMenu = m_prevEcho = 0;
     m_prevDpadUp = m_prevDpadDown = m_prevDpadLeft = m_prevDpadRight = 0;
+    m_prevMenuUp = m_prevMenuDown = 0;
     m_prevWeaponCycle = 0;
 
     INPUT mouse[3] = {};
@@ -183,13 +186,17 @@ void InputHook::ReleaseAllInput() {
     m_berserkActivationUntilMs = 0;
     m_berserkPunchMode.store(false, std::memory_order_release);
     m_yWasDown = m_yChordUsed = false;
-    m_bWasDown = m_bHoldUsed = false;
     m_recenterChordLatched = false;
     m_recenterChordStartedMs = 0;
     m_yPressMs = m_yTapPulseUntilMs = 0;
-    m_bPressMs = m_bTapPulseUntilMs = 0;
     m_physicalCrouchPulseUntilMs = 0;
     m_physicalCrouchGameState = false;
+    m_manualCrouchDesired = false;
+    m_rightStickWasDown = false;
+    m_rightStickTurnSuppressed = false;
+    m_vrCrouchActive.store(false, std::memory_order_release);
+    m_nativeCrouchCameraActive.store(false, std::memory_order_release);
+    m_vrCrouchTransitionUntilMs.store(0, std::memory_order_release);
     m_weaponGrabArmed.store(false, std::memory_order_release);
     m_weaponGrabHeld.store(false, std::memory_order_release);
     m_weaponGrabCancelRequested.store(false, std::memory_order_release);
@@ -348,6 +355,11 @@ void InputHook::ProcessTurn() {
     const auto& cfg = config::Get();
 
     if (cfg.turn_mode == 2 || !right.valid) return;
+    if (m_rightStickTurnSuppressed) {
+        m_snapTurnAccum = 0.0f;
+        QueryPerformanceCounter(&m_lastFrameTime);
+        return;
+    }
 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -537,71 +549,21 @@ void InputHook::UpdateState(XrTime displayTime) {
     m_yWasDown = yDown;
     const bool yTapPulse = !yDown && now < m_yTapPulseUntilMs;
 
-    const bool bDown = right.buttonB;
-    if (bDown && !m_bWasDown) {
-        m_bPressMs = now;
-        m_bHoldUsed = false;
-        m_bTapPulseUntilMs = 0;
-    }
-    const uint64_t bHeldMs = bDown && now >= m_bPressMs ? now - m_bPressMs : 0;
-    if (bDown && !m_bHoldUsed && bHeldMs >= 400) {
-        m_bHoldUsed = true;
-        if (m_motionControlsEnabled.exchange(false, std::memory_order_acq_rel)) {
-            m_dotVisibleAtMs.store(0, std::memory_order_release);
-            player::ArmIKSystem::Instance().SetEnabled(false);
-            AcquireSRWLockExclusive(&m_weaponPoseWriteLock);
-            if (m_weaponNativeMatrixValid && m_renderWeaponComponent >= 0x10000 &&
-                m_renderWeaponMatrixOffset > 0) {
-                SIZE_T bytesWritten = 0;
-                WriteProcessMemory(GetCurrentProcess(),
-                    reinterpret_cast<void*>(m_renderWeaponComponent +
-                                            m_renderWeaponMatrixOffset),
-                    m_weaponNativeMatrix, sizeof(m_weaponNativeMatrix), &bytesWritten);
-            }
-            m_renderWeaponStampActive = false;
-            m_renderWeaponComponent = 0;
-            m_renderWeaponMatrixOffset = 0;
-            ReleaseSRWLockExclusive(&m_weaponPoseWriteLock);
-            m_weaponPoseActive.store(false, std::memory_order_release);
-            CancelWeaponGrab();
-            WeaponAimSystem::Instance().InvalidateDirection();
-            Log("[Input] Motion controls disabled by hold-B");
-        } else {
-            m_weaponCalibrationResetRequested.store(true, std::memory_order_release);
-            m_motionControlsEnabled.store(true, std::memory_order_release);
-            m_dotVisibleAtMs.store(now, std::memory_order_release);
-            player::ArmIKSystem::Instance().SetEnabled(true);
-            Log("[Input] Motion controls enabled; waiting for coherent weapon pose");
-        }
-    }
-    if (!bDown && m_bWasDown && !m_bHoldUsed &&
-        now >= m_bPressMs && now - m_bPressMs < 400) {
-        m_bTapPulseUntilMs = now + 100;
-    }
-    m_bWasDown = bDown;
-    const bool bTapPulse = !bDown && now < m_bTapPulseUntilMs;
-    bool physicalCrouchPulse = false;
-    if (vehicleMode) {
-        m_physicalCrouchGameState = false;
-        m_physicalCrouchPulseUntilMs = 0;
-    } else {
-        const bool physicalCrouchDesired = cfg.physical_crouch_enabled &&
-            cfg.room_scale_enabled &&
-            m_motionControlsEnabled.load(std::memory_order_acquire) &&
-            player::ArmIKSystem::Instance().GetPhysicalPoseIntent() !=
-                player::PhysicalPose::Standing;
-        if (physicalCrouchDesired != m_physicalCrouchGameState) {
-            m_physicalCrouchGameState = physicalCrouchDesired;
-            m_physicalCrouchPulseUntilMs = now + 100;
-            Log("[Input] Physical crouch %s",
-                physicalCrouchDesired ? "entered" : "exited");
-        }
-        physicalCrouchPulse = now < m_physicalCrouchPulseUntilMs;
-    }
-    const bool crouchPulse = physicalCrouchPulse ||
-        (!cfg.physical_crouch_enabled && bTapPulse);
-
     const bool bothSticksClicked = left.thumbstickClick && right.thumbstickClick;
+    if (right.thumbstickClick) {
+        m_rightStickTurnSuppressed = true;
+    } else if (m_rightStickTurnSuppressed &&
+               (std::max)(std::fabs(right.thumbstickX),
+                          std::fabs(right.thumbstickY)) < cfg.locomotion_deadzone) {
+        m_rightStickTurnSuppressed = false;
+    }
+    if (right.thumbstickClick && !m_rightStickWasDown && !left.thumbstickClick) {
+        m_manualCrouchDesired = !m_manualCrouchDesired;
+        Log("[Input] Manual VR crouch %s via R3",
+            m_manualCrouchDesired ? "enabled" : "disabled");
+    }
+    m_rightStickWasDown = right.thumbstickClick;
+
     if (bothSticksClicked && !m_recenterChordStartedMs)
         m_recenterChordStartedMs = now;
     if (bothSticksClicked && !m_recenterChordLatched &&
@@ -618,29 +580,67 @@ void InputHook::UpdateState(XrTime displayTime) {
         m_recenterChordStartedMs = 0;
     }
 
-    // Escape is contextual in UE3: it opens pause from gameplay and backs out
-    // of the current interface. Send it directly so Menu is not limited to the
-    // XInput Start behavior used only by some screens.
-    if (left.menuButton && !m_prevMenu) PressKey(VK_ESCAPE);
-    else if (!left.menuButton && m_prevMenu) ReleaseKey(VK_ESCAPE);
-    m_prevMenu = left.menuButton ? 1 : 0;
+    bool physicalCrouchPulse = false;
+    if (vehicleMode) {
+        m_manualCrouchDesired = false;
+        m_physicalCrouchGameState = false;
+        m_physicalCrouchPulseUntilMs = 0;
+        m_vrCrouchActive.store(false, std::memory_order_release);
+        m_nativeCrouchCameraActive.store(false, std::memory_order_release);
+        m_vrCrouchTransitionUntilMs.store(0, std::memory_order_release);
+    } else {
+        const bool trackedCrouchDesired = cfg.physical_crouch_enabled &&
+            cfg.room_scale_enabled && m_motionControlsEnabled.load(std::memory_order_acquire) &&
+            player::ArmIKSystem::Instance().GetPhysicalPoseIntent() !=
+                player::PhysicalPose::Standing;
+        const bool crouchDesired = trackedCrouchDesired || m_manualCrouchDesired;
+        if (crouchDesired != m_physicalCrouchGameState) {
+            m_physicalCrouchGameState = crouchDesired;
+            m_physicalCrouchPulseUntilMs = now + 100;
+            Log("[Input] Combined crouch %s (tracked=%d manual=%d)",
+                crouchDesired ? "entered" : "exited",
+                trackedCrouchDesired, m_manualCrouchDesired);
+        }
+        const bool previousVrCrouch = m_vrCrouchActive.exchange(
+            crouchDesired, std::memory_order_acq_rel);
+        if (previousVrCrouch != crouchDesired)
+            m_vrCrouchTransitionUntilMs.store(now + 1500, std::memory_order_release);
+        m_nativeCrouchCameraActive.store(
+            m_manualCrouchDesired && !trackedCrouchDesired,
+            std::memory_order_release);
+        physicalCrouchPulse = now < m_physicalCrouchPulseUntilMs;
+    }
+    const bool crouchPulse = physicalCrouchPulse;
 
-    WORD buttons = chordDirection;
+    // Escape is contextual in UE3: it opens pause from gameplay and backs out
+    // of the current interface. Quest B is available under SteamVR, unlike the
+    // left menu button reserved by the runtime.
+    if (right.buttonB && !m_prevMenu) PressKey(VK_ESCAPE);
+    else if (!right.buttonB && m_prevMenu) ReleaseKey(VK_ESCAPE);
+    m_prevMenu = right.buttonB ? 1 : 0;
+
+    const bool menuNavigationActive =
+        xr::FrameLoop::Instance().IsTheaterFallbackActive() ||
+        WeaponAimSystem::Instance().IsVehicleTerminalUiActive();
+    WORD menuDirection = 0;
+    if (menuNavigationActive) {
+        if (left.thumbstickY >= 0.55f) menuDirection = XINPUT_GAMEPAD_DPAD_UP;
+        else if (left.thumbstickY <= -0.55f) menuDirection = XINPUT_GAMEPAD_DPAD_DOWN;
+    }
+
+    WORD buttons = chordDirection | menuDirection;
     if (right.buttonA) buttons |= XINPUT_GAMEPAD_A;
-    if (crouchPulse) buttons |= XINPUT_GAMEPAD_B;
     if (left.buttonX) buttons |= XINPUT_GAMEPAD_X;
     if (yTapPulse) buttons |= XINPUT_GAMEPAD_Y;
     if (m_leftGripDown) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
     if (m_rightGripDown && !vehicleMode) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
     if (left.thumbstickClick && !suppressStickClicks) buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
-    if (right.thumbstickClick && !suppressStickClicks)
-        buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
     if (echoHeld) buttons |= XINPUT_GAMEPAD_BACK;
 
-    const bool suppressMove = chordDirection != 0;
+    const bool suppressMove = chordDirection != 0 || menuNavigationActive;
     float moveX = left.thumbstickX;
     float moveY = left.thumbstickY;
-    if (cfg.hmd_directed_locomotion) {
+    if (!menuNavigationActive && cfg.hmd_directed_locomotion) {
         float headYaw = 0.0f;
         if (camera::GetRelativeHeadYaw(headYaw)) {
             const float sine = sinf(headYaw);
@@ -655,7 +655,7 @@ void InputHook::UpdateState(XrTime displayTime) {
         VrGamepadState state = {};
         state.moveX = suppressMove ? 0.0f : moveX;
         state.moveY = suppressMove ? 0.0f : moveY;
-        state.turnX = right.thumbstickX;
+        state.turnX = m_rightStickTurnSuppressed ? 0.0f : right.thumbstickX;
         state.turnY = 0.0f;
         state.leftTrigger = 0.0f;
         state.rightTrigger = berserkPunchMode ? 0.0f :
@@ -675,6 +675,9 @@ void InputHook::UpdateState(XrTime displayTime) {
         if (physicalMeleePulse && !m_prevMelee) PressKey('V');
         else if (!physicalMeleePulse && m_prevMelee) ReleaseKey('V');
         m_prevMelee = physicalMeleePulse ? 1 : 0;
+        if (crouchPulse && !m_prevCrouch) PressKey('C');
+        else if (!crouchPulse && m_prevCrouch) ReleaseKey('C');
+        m_prevCrouch = crouchPulse ? 1 : 0;
         const bool sprintHeld = left.thumbstickClick && !suppressStickClicks;
         if (sprintHeld && !m_prevSprint) PressKey(VK_LSHIFT);
         else if (!sprintHeld && m_prevSprint) ReleaseKey(VK_LSHIFT);
@@ -708,13 +711,14 @@ void InputHook::UpdateState(XrTime displayTime) {
         setKey('F', m_leftGripDown, m_prevGrip);
         setKey('G', m_rightGripDown && !vehicleMode, m_prevGrenade);
         setKey(VK_LSHIFT, left.thumbstickClick && !suppressStickClicks, m_prevSprint);
-        setKey('V', (right.thumbstickClick || physicalMeleePulse) &&
-            !suppressStickClicks, m_prevMelee);
+        setKey('V', physicalMeleePulse, m_prevMelee);
         setKey(VK_TAB, echoHeld, m_prevEcho);
         setKey('1', (chordDirection & XINPUT_GAMEPAD_DPAD_UP) != 0, m_prevDpadUp);
         setKey('2', (chordDirection & XINPUT_GAMEPAD_DPAD_RIGHT) != 0, m_prevDpadRight);
         setKey('3', (chordDirection & XINPUT_GAMEPAD_DPAD_DOWN) != 0, m_prevDpadDown);
         setKey('4', (chordDirection & XINPUT_GAMEPAD_DPAD_LEFT) != 0, m_prevDpadLeft);
+        setKey(VK_UP, (menuDirection & XINPUT_GAMEPAD_DPAD_UP) != 0, m_prevMenuUp);
+        setKey(VK_DOWN, (menuDirection & XINPUT_GAMEPAD_DPAD_DOWN) != 0, m_prevMenuDown);
 
         if (yTapPulse && !m_prevWeaponCycle)
             mouse_event(MOUSEEVENTF_WHEEL, 0, 0, WHEEL_DELTA, 0);

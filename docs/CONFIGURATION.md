@@ -33,6 +33,7 @@ Save; resolution and OpenXR refresh-rate changes require restarting the game.
 | HMD-directed movement | On/off | Rotates left-stick locomotion by current HMD yaw instead of body/game forward |
 | Physical crouch | On/off | Toggles the game's crouch when tracked head height crosses the calibrated posture threshold |
 | Arm reach scale | 1.00 to 2.00 | Allows the IK arm segments to stretch toward the tracked hands; default `1.60` prevents forward reach from clamping on the current rigs |
+| Melee range scale | 1.00 to 5.00 | Multiplies native melee trace distance, damage radius, and target-lunge distance; default `1.60`, while `1.00` preserves vanilla range |
 | Hand cut position | 20 to 90 | Moves the hand-only geometry boundary; default `70`, with lower values retaining more forearm and moving the capped edge away from the wrist |
 | Hide player body and arms | On/off | Experimental `Visibility/HidePlayerBodyAndArms` gate; off by default and only writes after runtime identity and reflected-schema validation |
 
