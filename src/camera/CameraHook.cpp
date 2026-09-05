@@ -718,7 +718,7 @@ static bool ApplyDownedFirstPersonOverride(
         AcquireSRWLockExclusive(&s_firstPersonCameraLock);
         s_downedCameraAnchorValid = true;
         s_downedCameraAnchorPawn = identity.pawn;
-        memcpy(s_downedCameraAnchorLocation, s_firstPersonCameraWorldLocation,
+        memcpy(s_downedCameraAnchorLocation, expectedLocation,
                sizeof(s_downedCameraAnchorLocation));
         memcpy(s_downedCameraAnchorPawnLocation, pawnLocation,
                sizeof(s_downedCameraAnchorPawnLocation));
