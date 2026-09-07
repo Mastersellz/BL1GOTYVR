@@ -300,6 +300,7 @@ static void RegisterCommands() {
 }
 
 static DWORD WINAPI InitializeThread(LPVOID) {
+    bl1gotyvr::config::EnforceGameResolution();
     if (!bl1gotyvr::display::Initialize())
         LogInternal("[BL1GOTYVR] ERROR: Display hooks were not installed");
     if (!bl1gotyvr::d3d11::InstallSteamVrDeviceCompatibility())

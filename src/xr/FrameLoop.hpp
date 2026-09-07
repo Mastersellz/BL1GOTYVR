@@ -63,6 +63,7 @@ public:
     void FinishSequentialRender();
     bool IsSequentialFramePending() const { return m_sequentialFramePending.load(); }
     void CaptureWorldBeforeHud(uint64_t pairSerial, int eye);
+    void CaptureNativeWorldBeforeHud(uint64_t pairSerial);
 
     // Desktop test mode
     void ToggleDesktopTestMode();
@@ -105,6 +106,12 @@ private:
     void ValidateDesktopStereoPair(ID3D11Device* device, ID3D11DeviceContext* context);
     bool TrySubmitTheaterFrame(ID3D11Device* device, ID3D11DeviceContext* context,
                                IDXGISwapChain* swapChain);
+    bool TrySubmitNativeMultiviewFrame(ID3D11Device* device,
+                                       ID3D11DeviceContext* context,
+                                       ID3D11Texture2D* source,
+                                       const StereoRenderTicket& ticket,
+                                       const XrView renderedViews[2],
+                                       uint64_t generation);
     bool ConsumeRenderedTicket(StereoRenderTicket& ticket);
     bool EnsureHudExtractionTexture(ID3D11Device* device, ID3D11Texture2D* source);
     bool ValidateHudPair(ID3D11Device* device, ID3D11DeviceContext* context,
@@ -183,6 +190,8 @@ private:
     ID3D11Texture2D* m_eyeTextures[2] = {};
     ID3D11Texture2D* m_swapchainUploadTextures[2] = {};
     ID3D11Texture2D* m_worldBeforeHudTextures[2] = {};
+    ID3D11Texture2D* m_nativeWorldBeforeHudTexture = nullptr;
+    uint64_t m_nativeWorldPairSerial = 0;
     ID3D11Texture2D* m_hudExtractionTexture = nullptr;
     ID3D11Texture2D* m_hudValidationTexture = nullptr;
     ID3D11Texture2D* m_hudValidationStaging = nullptr;

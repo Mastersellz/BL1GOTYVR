@@ -211,6 +211,27 @@ void SaveSettings(HWND window) {
     const std::string path = ConfigPath();
     int width = 0;
     int height = 0;
+    std::string widthText;
+    std::string heightText;
+    if (!ReadField(window, kFields[0], widthText, width) ||
+        !ReadField(window, kFields[1], heightText, height)) {
+        MessageBoxA(window, "Select a valid square render preset.",
+                    "Invalid resolution", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    bool supportedPreset = false;
+    for (const auto& preset : kRenderPresets) {
+        if (width == atoi(preset.width) && height == atoi(preset.height)) {
+            supportedPreset = true;
+            break;
+        }
+    }
+    if (!supportedPreset) {
+        MessageBoxA(window,
+            "Unsupported resolution. Choose Low, Medium, High, Ultra, or Mega.",
+            "Invalid resolution", MB_OK | MB_ICONWARNING);
+        return;
+    }
     for (const auto& field : kFields) {
         std::string text;
         int integerValue = 0;
@@ -288,7 +309,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             const int y = lowerGroup ? 322 + localIndex * 32 : 78 + localIndex * 32;
             CreateLabel(window, kFields[i].label, x, y, 128);
             CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
-                            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL |
+                                (i < 2 ? ES_READONLY : 0),
                             x + 132, y - 3, 88, 25, window,
                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFields[i].id)),
                             nullptr, nullptr);

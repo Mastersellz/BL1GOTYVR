@@ -59,9 +59,9 @@ Validated stereo uses geometric AFR:
 
 Runtime and headset validation confirmed geometric parallax and head tracking. A stability run exceeded 5,700 frames without errors.
 
-### Coherent AER Reimplementation (2026-07-30)
+### Coherent stereo paths
 
-The active stereo path now follows the validated Mass Effect 2 VR pair protocol rather than the later experimental native-multiview path:
+The fallback stereo path follows the validated Mass Effect 2 VR pair protocol:
 
 1. Eye 0 snapshots the OpenXR head pose, both runtime eye positions/FOVs, and the unmodified BL1 camera state.
 2. Eye 1 restores that same BL1 camera state and reuses the exact eye-0 OpenXR snapshot.
@@ -69,7 +69,15 @@ The active stereo path now follows the validated Mass Effect 2 VR pair protocol 
 4. Eye textures are submitted only when both captures carry the same serial.
 5. The exact rendered `XrView` pair is used for submission; projection crop uses the same frozen FOV and render aspect as the camera.
 
-IPD comes from the OpenXR runtime in headset mode. The configured IPD remains only as the desktop-simulation fallback. `RenderScene`, render-command multiview, and double-Draw hooks are not installed, so camera pose and projection are applied at one authority only: the validated `WillowPlayerController` camera cache around a single `GameViewportClient::Draw` call.
+When `SameFrameStereo=1`, the validated render-command constructor expands the
+principal source family to two owned views. `RenderScene` applies both eye
+positions from the same frozen OpenXR snapshot, and `FrameLoop` splits the SBS
+backbuffer into the matching OpenXR eye swapchains. A missing or mismatched
+native frame falls back to the coherent AER path. The unsafe double-Draw path is
+never installed.
+
+IPD comes from the OpenXR runtime in headset mode. The configured IPD remains
+only as the desktop-simulation fallback.
 
 ## D3D11 and OpenXR
 
@@ -85,10 +93,10 @@ The `RenderScene` call stack shows that `FSceneView` belongs to a render-thread 
 
 ## Remaining Work
 
-1. Validate visible side-by-side output from the two native command views.
-2. Route each same-frame view into its matching OpenXR eye texture.
-3. Locate projection creation and frustum construction for asymmetric per-eye projection.
-4. Add motion-controller input and HUD depth handling.
+1. Validate native multiview image orientation and geometric parallax in-headset.
+2. Validate integrated HUD placement on both VDXR and SteamVR.
+3. Compare long-session convergence against the AER fallback.
+4. Replace symmetric FOV plus submission crop with native asymmetric frusta if UE3 accepts them.
 
 ## Historical Native Multiview Stereo Progress (2026-07-19, inactive)
 

@@ -16,7 +16,7 @@ Save; resolution and OpenXR refresh-rate changes require restarting the game.
 
 | Setting | Range | Effect |
 |---|---:|---|
-| Render width/height | 640x480 to 7680x4320 | Game backbuffer resolution |
+| Render width/height | 640x480 to 7680x4320 | Square game backbuffer resolution |
 | Resolution scale | 0.50 to 2.00 | OpenXR eye swapchain scale |
 | OpenXR refresh rate | 0 or 1 to 240 Hz | Requests the nearest runtime-supported rate; `0` keeps the runtime default |
 | Camera FOV | 60 to 150 degrees | UE3 camera FOV during each eye render |
@@ -25,7 +25,7 @@ Save; resolution and OpenXR refresh-rate changes require restarting the game.
 | Near/far plane | 0.01 to 100000 | OpenXR projection clipping range |
 | Position scale | 0 to 5 | Head translation multiplier |
 | Rotation scale | 0 to 5 | Head rotation multiplier |
-| Same-frame stereo | Experimental | Forced off because re-entering `GameViewportClient::Draw` corrupts the UE3 heap |
+| Same-frame stereo | Experimental | Uses native two-view UE3 command construction and one OpenXR submission; falls back to AER when a validated multiview frame is unavailable |
 | Reverse eyes | On/off | Swaps captured left and right textures |
 | Camera roll | On/off | Enabled by default so roll orientation remains consistent with positional tracking |
 | Debug logging | On/off | Enables runtime diagnostic logging |
@@ -43,6 +43,11 @@ The configurator includes square render presets for common performance targets.
 Selecting a preset fills only the width and height fields. The manually selected
 OpenXR resolution scale is preserved. Click `Save settings` and restart the game
 to apply the new game resolution.
+
+Width and height are read-only in the configurator. The DLL accepts only the
+five square presets below; an edited or malformed resolution is reset to
+2048x2048 at startup. It also synchronizes `[SystemSettings] ResX/ResY` in the
+game's `WillowEngine.ini` before installing the display hooks.
 
 | Preset | Game resolution |
 |---|---:|
@@ -100,5 +105,7 @@ The simulated pose follows the same camera conversion path as a real HMD.
 | Numpad `7` / `1` | Up/down |
 | `Home` | Reset pose |
 
-GDI capture, geometric AFR, and latency compensation are the stable defaults.
-The other source/projection modes are retained only for runtime research.
+Geometric AFR remains the stable fallback. Same-frame stereo never re-enters
+`GameViewportClient::Draw`; the old double-Draw implementation remains disabled
+because it corrupts the UE3 heap. Native multiview requires a game restart after
+changing `SameFrameStereo`.

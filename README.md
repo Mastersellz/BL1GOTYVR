@@ -23,9 +23,10 @@ The main gameplay path is working and headset-tested:
 - Configurable square render resolutions from 1536x1536 to 4096x4096
 - Automatic loading through a `dxgi.dll` proxy
 
-First-person arm IK, body hiding, alternative capture sources, and same-frame
-stereo remain experimental. The stable stereo path uses synchronized alternate
-eye rendering.
+First-person arm IK, body hiding, alternative capture sources, and native
+same-frame multiview remain experimental. `SameFrameStereo=1` expands the
+principal UE3 view family to two views and submits both halves in one OpenXR
+frame; synchronized alternate-eye rendering remains the per-frame fallback.
 
 ## Requirements
 

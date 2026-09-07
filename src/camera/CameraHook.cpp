@@ -271,6 +271,7 @@ struct PendingViewPose {
     float visualFov = 0.0f;
     float cullingFov = 0.0f;
     float roomOffsetView[3] = {};
+    float stereoRoomOffsetView[2][3] = {};
     float deltaOrientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     XrView xrViews[2] = {};
     uint64_t armTargetGeneration = 0;
@@ -329,6 +330,7 @@ bool GetPrincipalRenderExtent(uint32_t& width, uint32_t& height) {
 struct CompletedNativeFrameSlot {
     bool valid = false;
     uint64_t generation = 0;
+    uint64_t pairSerial = 0;
     XrView renderedViews[2] = {};
 };
 static CompletedNativeFrameSlot s_completedNativeFrame;
@@ -563,10 +565,12 @@ bool ConsumeCompletedNativeMultiviewFrame(CompletedNativeMultiviewFrame& frame) 
     AcquireSRWLockExclusive(&s_completedNativeFrameLock);
     if (s_completedNativeFrame.valid) {
         frame.generation = s_completedNativeFrame.generation;
+        frame.pairSerial = s_completedNativeFrame.pairSerial;
         frame.renderedViews[0] = s_completedNativeFrame.renderedViews[0];
         frame.renderedViews[1] = s_completedNativeFrame.renderedViews[1];
         s_completedNativeFrame.valid = false;
         s_completedNativeFrame.generation = 0;
+        s_completedNativeFrame.pairSerial = 0;
         available = true;
     }
     ReleaseSRWLockExclusive(&s_completedNativeFrameLock);
@@ -576,6 +580,7 @@ void DiscardCompletedNativeMultiviewFrame() {
     AcquireSRWLockExclusive(&s_completedNativeFrameLock);
     s_completedNativeFrame.valid = false;
     s_completedNativeFrame.generation = 0;
+    s_completedNativeFrame.pairSerial = 0;
     ReleaseSRWLockExclusive(&s_completedNativeFrameLock);
 }
 void SuspendNativeMultiview() {
@@ -821,6 +826,7 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
     float appliedLocation[3] = {};
     int32_t appliedRotation[3] = {};
     float roomOffsetView[3] = {};
+    float stereoRoomOffsetView[2][3] = {};
     float relative[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     float originalFov = 0.0f;
     float visualFov = 0.0f;
@@ -1047,6 +1053,36 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
             roomOffsetView[0] = referenceLocalXr[0] * positionScale;
             roomOffsetView[1] = referenceLocalXr[1] * positionScale;
             roomOffsetView[2] = -referenceLocalXr[2] * positionScale;
+
+            for (int viewEye = 0; viewEye < 2; ++viewEye) {
+                float stereoEyePosition[3] = {};
+                if (simulatedPose) {
+                    const float sideMeters = (viewEye == 0 ? -1.0f : 1.0f) *
+                        config::Get().ipd_mm * 0.0005f;
+                    const float localEye[3] = {sideMeters, 0.0f, 0.0f};
+                    float rotatedEye[3] = {};
+                    quat_rotate(headRotation[0], headRotation[1], headRotation[2],
+                                headRotation[3], localEye, rotatedEye);
+                    for (int axis = 0; axis < 3; ++axis)
+                        stereoEyePosition[axis] = headPosition[axis] + rotatedEye[axis];
+                } else {
+                    stereoEyePosition[0] = renderTicket.views[viewEye].pose.position.x;
+                    stereoEyePosition[1] = renderTicket.views[viewEye].pose.position.y;
+                    stereoEyePosition[2] = renderTicket.views[viewEye].pose.position.z;
+                }
+                const float stereoTrackingDelta[3] = {
+                    stereoEyePosition[0] - s_poseReferencePosition[0],
+                    stereoEyePosition[1] - s_poseReferencePosition[1],
+                    stereoEyePosition[2] - s_poseReferencePosition[2]
+                };
+                float stereoReferenceLocalXr[3] = {};
+                quat_rotate(inverseReference[0], inverseReference[1], inverseReference[2],
+                            inverseReference[3], stereoTrackingDelta,
+                            stereoReferenceLocalXr);
+                stereoRoomOffsetView[viewEye][0] = stereoReferenceLocalXr[0] * positionScale;
+                stereoRoomOffsetView[viewEye][1] = stereoReferenceLocalXr[1] * positionScale;
+                stereoRoomOffsetView[viewEye][2] = -stereoReferenceLocalXr[2] * positionScale;
+            }
 
             const float* armCameraLocation = simulatedPose
                 ? originalLocation : renderTicket.baseLocation;
@@ -1362,6 +1398,8 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
         pendingPose.cullingFov = cullingFov;
         memcpy(pendingPose.roomOffsetView, roomOffsetView,
                 sizeof(pendingPose.roomOffsetView));
+        memcpy(pendingPose.stereoRoomOffsetView, stereoRoomOffsetView,
+               sizeof(pendingPose.stereoRoomOffsetView));
         memcpy(pendingPose.deltaOrientation, relative,
                 sizeof(pendingPose.deltaOrientation));
         if (pendingPose.xrViewsValid) {
@@ -1790,17 +1828,13 @@ static int ApplyFinalViewPose(void* renderer, uintptr_t& firstViewAddress,
 
     int appliedCount = 0;
     constexpr uintptr_t kCommandViewStride = 0x1750;
-    float stereoRotation[16] = {};
-    if (commandViewCount == 2) BuildViewRotation(pose.rotation, stereoRotation);
     for (int index = 0; index < commandViewCount; ++index) {
         const uintptr_t viewAddress = viewArray + index * kCommandViewStride;
         PendingViewPose viewPose = pose;
         if (commandViewCount == 2) {
-            const float side = (index == 0 ? -1.0f : 1.0f) * config::Get().ipd_mm * 0.05f;
             viewPose.eye = index;
-            viewPose.location[0] = pose.headLocation[0] + stereoRotation[0] * side;
-            viewPose.location[1] = pose.headLocation[1] + stereoRotation[4] * side;
-            viewPose.location[2] = pose.headLocation[2] + stereoRotation[8] * side;
+            memcpy(viewPose.roomOffsetView, pose.stereoRoomOffsetView[index],
+                   sizeof(viewPose.roomOffsetView));
         }
         if (!ApplyPoseToView(viewAddress, viewPose)) continue;
         if (!firstViewAddress) firstViewAddress = viewAddress;
@@ -1884,11 +1918,13 @@ static void __fastcall HookedRenderScene(void* renderer) {
     }
     RemoveCommandPose(renderer);
     if (completedNativeMultiview) {
+        xr::FrameLoop::Instance().CaptureNativeWorldBeforeHud(appliedPose.pairSerial);
         AcquireSRWLockExclusive(&s_completedNativeFrameLock);
         if (!s_completedNativeFrame.valid ||
             commandGeneration > s_completedNativeFrame.generation) {
             s_completedNativeFrame.valid = true;
             s_completedNativeFrame.generation = commandGeneration;
+            s_completedNativeFrame.pairSerial = appliedPose.pairSerial;
             s_completedNativeFrame.renderedViews[0] = appliedPose.xrViews[0];
             s_completedNativeFrame.renderedViews[1] = appliedPose.xrViews[1];
         }
@@ -2010,10 +2046,17 @@ static void* __fastcall HookedRenderCommandConstructor(void* destination, void* 
                                sizeof(stereoSourceViews[0]));
                         memcpy(stereoSourceViews[1], reinterpret_cast<const void*>(sourceView),
                                sizeof(stereoSourceViews[1]));
+                        // Do not share temporal histories between simultaneous eyes.
+                        // A null ViewState is valid for transient UE3 scene views.
+                        *reinterpret_cast<uintptr_t*>(stereoSourceViews[1] + 0x08) = 0;
                         const float halfWidth = viewport[2] * 0.5f;
                         for (int eye = 0; eye < 2; ++eye) {
                             auto* eyeViewport = reinterpret_cast<float*>(stereoSourceViews[eye] + 0x50);
                             auto* eyePixels = reinterpret_cast<int*>(stereoSourceViews[eye] + 0x68);
+                            auto* eyeScreenScaleBias = reinterpret_cast<float*>(
+                                stereoSourceViews[eye] + 0x430);
+                            const float sourceScaleX = eyeScreenScaleBias[0];
+                            const float sourceBiasX = eyeScreenScaleBias[2];
                             eyeViewport[0] = eye == 0 ? viewport[0] : viewport[0] + halfWidth;
                             eyeViewport[1] = viewport[1];
                             eyeViewport[2] = halfWidth;
@@ -2022,6 +2065,9 @@ static void* __fastcall HookedRenderCommandConstructor(void* destination, void* 
                             eyePixels[1] = static_cast<int>(eyeViewport[1]);
                             eyePixels[2] = static_cast<int>(eyeViewport[2]);
                             eyePixels[3] = static_cast<int>(eyeViewport[3]);
+                            eyeScreenScaleBias[0] = sourceScaleX * 0.5f;
+                            eyeScreenScaleBias[2] = sourceBiasX +
+                                (eye == 0 ? -sourceScaleX * 0.5f : sourceScaleX * 0.5f);
                             stereoViewPointers[eye] = reinterpret_cast<uintptr_t>(
                                 stereoSourceViews[eye]);
                         }
@@ -2051,8 +2097,10 @@ static void* __fastcall HookedRenderCommandConstructor(void* destination, void* 
     }
     if (stereoSource) {
         static LONG loggedStereoSource = 0;
-        if (InterlockedCompareExchange(&loggedStereoSource, 1, 0) == 0)
+        if (InterlockedCompareExchange(&loggedStereoSource, 1, 0) == 0) {
             Log("[StereoResearch] Principal source family expanded to two native view copies");
+            LogRenderCommandLayout("stereo constructed", destination);
+        }
     }
     static LONG logged = 0;
     if (InterlockedCompareExchange(&logged, 1, 0) == 0)
@@ -2208,7 +2256,6 @@ static DWORD WINAPI ScannerThread(LPVOID) {
         }
         const bool drawHookInstalled = InstallViewportDrawHook(FindViewportDrawTarget(s_globals));
         if (drawHookInstalled && s_camera.found) {
-            config::Get().same_frame_stereo = false;
             const uintptr_t moduleBase = reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll);
             const DWORD moduleSize = modInfo.SizeOfImage;
             input::WeaponAimSystem::Instance().Discover(
@@ -2217,12 +2264,16 @@ static DWORD WINAPI ScannerThread(LPVOID) {
                 player::ArmIKSystem::Instance().RequestInventoryScan();
             const bool commandHookInstalled = InstallRenderCommandProbes(moduleBase);
             const bool renderSceneHookInstalled = InstallRenderSceneProbe(moduleBase);
+            config::Get().same_frame_stereo =
+                config::Get().same_frame_stereo_requested &&
+                commandHookInstalled && renderSceneHookInstalled;
             s_stereoReady.store(
                 commandHookInstalled && renderSceneHookInstalled,
                 std::memory_order_release);
-            Log("[Camera] Coherent alternate-eye stereo enabled; final FSceneView 6DoF=%s "
-                "native multiview=disabled double-Draw=disabled",
-                commandHookInstalled && renderSceneHookInstalled ? "enabled" : "FAILED");
+            Log("[Camera] Stereo enabled: final FSceneView 6DoF=%s native multiview=%s "
+                "double-Draw=disabled",
+                commandHookInstalled && renderSceneHookInstalled ? "enabled" : "FAILED",
+                config::Get().same_frame_stereo ? "enabled" : "disabled");
         } else {
             config::Get().same_frame_stereo = false;
             Log("[Camera] Stereo camera boundary unavailable; rendering remains unmodified");

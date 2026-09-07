@@ -105,6 +105,8 @@ float hud_horizontal_offset = 0.0f;
 
 Settings& Get();
 float GetMeleeRangeMultiplier();
+bool IsSupportedRenderResolution(int width, int height);
+bool EnforceGameResolution();
 void Load(const char* path);
 void Save(const char* path);
 bool SaveLoaded();

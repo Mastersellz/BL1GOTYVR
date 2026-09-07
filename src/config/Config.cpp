@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 
 namespace bl1gotyvr { namespace config {
 
@@ -14,10 +15,57 @@ static char s_configPath[MAX_PATH] = {};
 static FILETIME s_lastWriteTime = {};
 static ULONGLONG s_lastReloadCheck = 0;
 static std::atomic<float> s_meleeRangeMultiplier{1.60f};
+static constexpr int kRenderPresets[] = {1536, 2048, 2560, 3072, 4096};
 
 Settings& Get() { return s_settings; }
 float GetMeleeRangeMultiplier() {
     return s_meleeRangeMultiplier.load(std::memory_order_acquire);
+}
+
+bool IsSupportedRenderResolution(int width, int height) {
+    if (width != height) return false;
+    for (const int preset : kRenderPresets) {
+        if (width == preset) return true;
+    }
+    return false;
+}
+
+bool EnforceGameResolution() {
+    char userProfile[MAX_PATH] = {};
+    if (!GetEnvironmentVariableA("USERPROFILE", userProfile, MAX_PATH)) return false;
+    const char* suffixes[] = {
+        "\\Documents\\My Games\\Borderlands Game of the Year\\WillowGame\\Config\\WillowEngine.ini",
+        "\\Documents\\My Games\\Borderlands Game of the Year Enhanced\\WillowGame\\Config\\WillowEngine.ini"
+    };
+    char value[16] = {};
+    sprintf_s(value, "%d", s_settings.render_width);
+    for (const char* suffix : suffixes) {
+        char gameIni[MAX_PATH] = {};
+        strcpy_s(gameIni, userProfile);
+        if (strlen(gameIni) + strlen(suffix) >= MAX_PATH) continue;
+        strcat_s(gameIni, suffix);
+        if (GetFileAttributesA(gameIni) == INVALID_FILE_ATTRIBUTES) continue;
+        const int currentWidth = GetPrivateProfileIntA(
+            "SystemSettings", "ResX", 0, gameIni);
+        const int currentHeight = GetPrivateProfileIntA(
+            "SystemSettings", "ResY", 0, gameIni);
+        if (currentWidth == s_settings.render_width &&
+            currentHeight == s_settings.render_height) {
+            Log("[Config] Game resolution already matches preset: %dx%d",
+                currentWidth, currentHeight);
+            return true;
+        }
+        const BOOL widthWritten = WritePrivateProfileStringA(
+            "SystemSettings", "ResX", value, gameIni);
+        const BOOL heightWritten = WritePrivateProfileStringA(
+            "SystemSettings", "ResY", value, gameIni);
+        Log("[Config] Game resolution enforced: %dx%d previous=%dx%d result=%d/%d",
+            s_settings.render_width, s_settings.render_height,
+            currentWidth, currentHeight, widthWritten, heightWritten);
+        return widthWritten && heightWritten;
+    }
+    Log("[Config] WARNING: WillowEngine.ini not found; game resolution was not synchronized");
+    return false;
 }
 
 static float ReadFloat(const char* section, const char* key, float fallback, const char* path) {
@@ -34,10 +82,21 @@ static float ReadFloat(const char* section, const char* key, float fallback, con
 void Load(const char* path) {
     if (!path || !*path) return;
     if (path != s_configPath) strcpy_s(s_configPath, path);
-    s_settings.render_width = std::clamp(
-        static_cast<int>(GetPrivateProfileIntA("Display", "Width", s_settings.render_width, path)), 640, 7680);
-    s_settings.render_height = std::clamp(
-        static_cast<int>(GetPrivateProfileIntA("Display", "Height", s_settings.render_height, path)), 480, 4320);
+    const int requestedWidth = static_cast<int>(GetPrivateProfileIntA(
+        "Display", "Width", s_settings.render_width, path));
+    const int requestedHeight = static_cast<int>(GetPrivateProfileIntA(
+        "Display", "Height", s_settings.render_height, path));
+    if (IsSupportedRenderResolution(requestedWidth, requestedHeight)) {
+        s_settings.render_width = requestedWidth;
+        s_settings.render_height = requestedHeight;
+    } else {
+        s_settings.render_width = 2048;
+        s_settings.render_height = 2048;
+        WritePrivateProfileStringA("Display", "Width", "2048", path);
+        WritePrivateProfileStringA("Display", "Height", "2048", path);
+        Log("[Config] Unsupported render resolution %dx%d replaced with preset 2048x2048",
+            requestedWidth, requestedHeight);
+    }
     s_settings.resolution_scale = std::clamp(
         ReadFloat("Display", "ResolutionScale", s_settings.resolution_scale, path), 0.5f, 2.0f);
     s_settings.fov_degrees = std::clamp(
@@ -216,10 +275,11 @@ void Load(const char* path) {
         s_settings.vanilla_hands_cut_threshold, path), 20.0f, 90.0f);
 
     Log("[Config] Loaded %s: %dx%d scale=%.2f FOV=%.1f IPD=%.1fmm "
-        "convergenceShift=%.2f%% refresh=%.1fHz aim=(%.2f,%.2f) dot=%.1fm",
+        "convergenceShift=%.2f%% refresh=%.1fHz SFR=%s aim=(%.2f,%.2f) dot=%.1fm",
         path, s_settings.render_width, s_settings.render_height, s_settings.resolution_scale,
         s_settings.fov_degrees, s_settings.ipd_mm, s_settings.convergence_m,
         s_settings.openxr_refresh_rate_hz,
+        s_settings.same_frame_stereo_requested ? "requested" : "off",
         s_settings.aim_pitch_degrees, s_settings.aim_yaw_degrees,
         s_settings.dot_distance_m);
     WIN32_FILE_ATTRIBUTE_DATA attributes = {};

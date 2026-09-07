@@ -56,8 +56,7 @@ BOOL WINAPI HookedEnumDisplaySettingsA(LPCSTR deviceName, DWORD modeNumber,
                                         DEVMODEA* mode) {
     const BOOL result = s_enumDisplaySettingsA(deviceName, modeNumber, mode);
     const std::uint32_t target = s_targetResolution.load();
-    if (result && mode && target && IsPrimaryDisplay(deviceName) &&
-        (modeNumber == ENUM_CURRENT_SETTINGS || modeNumber == ENUM_REGISTRY_SETTINGS)) {
+    if (result && mode && target && IsPrimaryDisplay(deviceName)) {
         mode->dmPelsWidth = target;
         mode->dmPelsHeight = target;
         mode->dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT;
@@ -69,8 +68,7 @@ BOOL WINAPI HookedEnumDisplaySettingsW(LPCWSTR deviceName, DWORD modeNumber,
                                         DEVMODEW* mode) {
     const BOOL result = s_enumDisplaySettingsW(deviceName, modeNumber, mode);
     const std::uint32_t target = s_targetResolution.load();
-    if (result && mode && target && IsPrimaryDisplay(deviceName) &&
-        (modeNumber == ENUM_CURRENT_SETTINGS || modeNumber == ENUM_REGISTRY_SETTINGS)) {
+    if (result && mode && target && IsPrimaryDisplay(deviceName)) {
         mode->dmPelsWidth = target;
         mode->dmPelsHeight = target;
         mode->dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT;

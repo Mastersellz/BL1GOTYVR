@@ -43,6 +43,7 @@ void FrameLoop::Initialize() {
     m_terminalMissingWeaponPresents = 0;
     m_theaterFallbackActive = false;
     m_hasSubmittedStereoProjection = false;
+    m_lastNativeMultiviewGeneration = 0;
     AcquireSRWLockExclusive(&m_steamSubmissionLock);
     m_steamSubmittedViewsValid = false;
     m_steamSubmittedHud = false;
@@ -198,6 +199,7 @@ bool FrameLoop::PrepareForOpenXRRecovery() {
     InvalidateBackbufferResources();
     m_poseSeeded = false;
     m_hasSubmittedStereoProjection = false;
+    m_lastNativeMultiviewGeneration = 0;
     m_missingTicketPresents = 0;
     m_theaterRecoveryTickets = 0;
     m_terminalMissingWeaponPresents = 0;
@@ -230,6 +232,11 @@ void FrameLoop::InvalidateBackbufferResources() {
             m_worldBeforeHudTextures[i] = nullptr;
         }
     }
+    if (m_nativeWorldBeforeHudTexture) {
+        m_nativeWorldBeforeHudTexture->Release();
+        m_nativeWorldBeforeHudTexture = nullptr;
+    }
+    m_nativeWorldPairSerial = 0;
     if (m_hudExtractionTexture) {
         m_hudExtractionTexture->Release();
         m_hudExtractionTexture = nullptr;
@@ -587,6 +594,15 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     if (sideBySideSource) {
         uvScaleX *= 0.5f;
         uvOffsetX = (sampledEye == 0 ? 0.0f : 0.5f) + uvOffsetX * 0.5f;
+        // Keep linear filtering inside the selected half and valid source rows.
+        // Sampling the exact viewport edge can blend the SBS seam or an
+        // undefined post-process border into the bottom output line.
+        const float halfTexelX = 0.5f / static_cast<float>(sourceDesc.Width);
+        const float halfTexelY = 0.5f / static_cast<float>(sourceDesc.Height);
+        uvOffsetX += halfTexelX;
+        uvOffsetY += halfTexelY;
+        uvScaleX = (std::max)(0.0f, uvScaleX - halfTexelX * 2.0f);
+        uvScaleY = (std::max)(0.0f, uvScaleY - halfTexelY * 2.0f);
     } else if (!flatSource && !m_submittingNativeEyes && !projectionCrop &&
                vrSettings.convergence_m > 0.0f && eye >= 0 && eye < 2) {
         const float magnitude = (std::min)(0.20f, vrSettings.convergence_m * 0.01f);
@@ -1302,6 +1318,68 @@ void FrameLoop::CaptureWorldBeforeHud(uint64_t pairSerial, int eye) {
     releaseBindings();
 }
 
+void FrameLoop::CaptureNativeWorldBeforeHud(uint64_t pairSerial) {
+    if (!pairSerial || !OpenXRContext::Instance().WantsHudCapture() ||
+        m_desktopTestMode.load(std::memory_order_acquire)) return;
+
+    ID3D11Device* device = d3d11::GetGameDevice();
+    ID3D11DeviceContext* context = d3d11::GetGameContext();
+    IDXGISwapChain* swapChain = d3d11::GetGameSwapChain();
+    if (!device || !context || !swapChain) return;
+
+    ID3D11Texture2D* backbuffer = d3d11::AcquireCurrentBackbuffer(swapChain);
+    if (!backbuffer) return;
+    D3D11_TEXTURE2D_DESC desc = {};
+    backbuffer->GetDesc(&desc);
+    const bool supported = desc.Width >= 2 && (desc.Width & 1u) == 0 &&
+        desc.Height > 0 && desc.SampleDesc.Count == 1 &&
+        (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+         desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+         desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+         desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+         desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+         desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS);
+    if (!supported) {
+        backbuffer->Release();
+        return;
+    }
+
+    AcquireSRWLockExclusive(&m_captureLock);
+    bool recreate = !m_nativeWorldBeforeHudTexture;
+    if (!recreate) {
+        D3D11_TEXTURE2D_DESC current = {};
+        m_nativeWorldBeforeHudTexture->GetDesc(&current);
+        recreate = current.Width != desc.Width || current.Height != desc.Height ||
+            current.Format != desc.Format || current.SampleDesc.Count != 1;
+    }
+    if (recreate) {
+        if (m_nativeWorldBeforeHudTexture) {
+            m_nativeWorldBeforeHudTexture->Release();
+            m_nativeWorldBeforeHudTexture = nullptr;
+        }
+        D3D11_TEXTURE2D_DESC snapshotDesc = desc;
+        snapshotDesc.Usage = D3D11_USAGE_DEFAULT;
+        snapshotDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        snapshotDesc.CPUAccessFlags = 0;
+        snapshotDesc.MiscFlags = 0;
+        device->CreateTexture2D(&snapshotDesc, nullptr,
+                                &m_nativeWorldBeforeHudTexture);
+    }
+    if (m_nativeWorldBeforeHudTexture) {
+        context->CopyResource(m_nativeWorldBeforeHudTexture, backbuffer);
+        m_nativeWorldPairSerial = pairSerial;
+        static uint64_t captureCount = 0;
+        const uint64_t count = ++captureCount;
+        if (count <= 3 || count % 600 == 0) {
+            Log("[HUD] Native world-before-HUD snapshot: pair=%llu %ux%u count=%llu",
+                static_cast<unsigned long long>(pairSerial), desc.Width, desc.Height,
+                static_cast<unsigned long long>(count));
+        }
+    }
+    ReleaseSRWLockExclusive(&m_captureLock);
+    backbuffer->Release();
+}
+
 bool FrameLoop::EnsureHudExtractionTexture(ID3D11Device* device,
                                            ID3D11Texture2D* source) {
     if (!device || !source) return false;
@@ -1635,6 +1713,195 @@ bool FrameLoop::ConsumeRenderedTicket(StereoRenderTicket& ticket) {
     }
     ReleaseSRWLockExclusive(&m_stereoPairLock);
     return ticket.valid;
+}
+
+bool FrameLoop::TrySubmitNativeMultiviewFrame(
+        ID3D11Device* device, ID3D11DeviceContext* context,
+        ID3D11Texture2D* source, const StereoRenderTicket& ticket,
+        const XrView renderedViews[2], uint64_t generation) {
+    if (!device || !context || !source || !ticket.valid || !generation ||
+        generation <= m_lastNativeMultiviewGeneration) return false;
+
+    D3D11_TEXTURE2D_DESC sourceDesc = {};
+    source->GetDesc(&sourceDesc);
+    if (sourceDesc.Width < 2 || (sourceDesc.Width & 1u) != 0 ||
+        sourceDesc.Height == 0 || sourceDesc.SampleDesc.Count != 1) {
+        Log("[SFR] Native multiview source rejected: %ux%u samples=%u",
+            sourceDesc.Width, sourceDesc.Height, sourceDesc.SampleDesc.Count);
+        return false;
+    }
+
+    ID3D11Texture2D* nativeWorld = nullptr;
+    AcquireSRWLockShared(&m_captureLock);
+    if (m_nativeWorldPairSerial == ticket.pairSerial &&
+        m_nativeWorldBeforeHudTexture) {
+        nativeWorld = m_nativeWorldBeforeHudTexture;
+        nativeWorld->AddRef();
+    }
+    ReleaseSRWLockShared(&m_captureLock);
+    ID3D11Texture2D* worldSource = nativeWorld ? nativeWorld : source;
+
+    EnsureEyeTextures(device, worldSource, true);
+    if (!m_eyeTextures[0] || !m_eyeTextures[1]) {
+        if (nativeWorld) nativeWorld->Release();
+        return false;
+    }
+
+    ID3D11RenderTargetView* boundTarget = nullptr;
+    ID3D11DepthStencilView* boundDepth = nullptr;
+    context->OMGetRenderTargets(1, &boundTarget, &boundDepth);
+    bool sourceBound = false;
+    if (boundTarget) {
+        ID3D11Resource* resource = nullptr;
+        boundTarget->GetResource(&resource);
+        ID3D11Texture2D* texture = nullptr;
+        if (resource) {
+            resource->QueryInterface(__uuidof(ID3D11Texture2D),
+                                     reinterpret_cast<void**>(&texture));
+            resource->Release();
+        }
+        sourceBound = texture == source;
+        if (texture) texture->Release();
+    }
+    if (sourceBound) context->OMSetRenderTargets(0, nullptr, nullptr);
+
+    m_submissionViews[0] = renderedViews[0];
+    m_submissionViews[1] = renderedViews[1];
+    m_submissionViewsValid = true;
+    m_submissionProjectionCorrection = ticket.projectionCorrection;
+    m_submissionRenderAspect = ticket.renderAspect;
+    bool hudExtracted = false;
+    if (nativeWorld && ValidateHudPair(
+            device, context, source, nativeWorld, ticket.pairSerial) &&
+        EnsureHudExtractionTexture(device, source)) {
+        hudExtracted = render::HudBlitter::Instance().ExtractDifference(
+            device, context, source, nativeWorld, m_hudExtractionTexture);
+    }
+    m_submittingNativeEyes = true;
+    const bool leftCaptured = BlitTexture(
+        context, worldSource, m_eyeTextures[0], 0, true, 0, false);
+    const bool rightCaptured = BlitTexture(
+        context, worldSource, m_eyeTextures[1], 1, true, 1, false);
+    m_submittingNativeEyes = false;
+
+    if (sourceBound) context->OMSetRenderTargets(1, &boundTarget, boundDepth);
+    if (boundTarget) boundTarget->Release();
+    if (boundDepth) boundDepth->Release();
+    if (!leftCaptured || !rightCaptured) {
+        if (nativeWorld) nativeWorld->Release();
+        m_submissionViewsValid = false;
+        return false;
+    }
+
+    auto& xr = OpenXRContext::Instance();
+    const bool steamCompositorPump = xr.IsSteamRuntime();
+    bool xrFrameBegun = false;
+    bool preparedWaitConsumed = false;
+    if (!steamCompositorPump) {
+        StartWaitWorker();
+        preparedWaitConsumed = m_waitReadyEvent &&
+            WaitForSingleObject(m_waitReadyEvent, 1) == WAIT_OBJECT_0;
+        if (preparedWaitConsumed && xr.BeginFrame()) {
+            xrFrameBegun = true;
+            if (!xr.ShouldRender() || !xr.LocateViews()) xrFrameBegun = false;
+        }
+    }
+
+    const bool reverseEyes = config::Get().reverse_eyes;
+    const int leftSource = reverseEyes ? 1 : 0;
+    const int rightSource = reverseEyes ? 0 : 1;
+    if (steamCompositorPump) AcquireSRWLockExclusive(&m_steamSubmissionLock);
+    float dotPosition[3] = {};
+    float dotForward[3] = {};
+    bool dotValid = ticket.aimDotLocalValid;
+    if (dotValid) {
+        memcpy(dotPosition, ticket.aimDotLocalPosition, sizeof(dotPosition));
+        memcpy(dotForward, ticket.aimDotLocalForward, sizeof(dotForward));
+    } else if (ticket.rightAimValid) {
+        const float x = ticket.rightAimRotation[0];
+        const float y = ticket.rightAimRotation[1];
+        const float z = ticket.rightAimRotation[2];
+        const float w = ticket.rightAimRotation[3];
+        dotForward[0] = -2.0f * (x * z + w * y);
+        dotForward[1] = -2.0f * (y * z - w * x);
+        dotForward[2] = -(1.0f - 2.0f * (x * x + y * y));
+        const float length = std::sqrt(
+            dotForward[0] * dotForward[0] +
+            dotForward[1] * dotForward[1] +
+            dotForward[2] * dotForward[2]);
+        if (std::isfinite(length) && length > 1.0e-5f) {
+            const float distance = config::Get().dot_distance_m;
+            for (int axis = 0; axis < 3; ++axis) {
+                dotForward[axis] /= length;
+                dotPosition[axis] = ticket.rightAimPosition[axis] +
+                    dotForward[axis] * distance;
+            }
+            dotValid = true;
+        }
+    }
+    const bool reticlePrepared = (steamCompositorPump || xrFrameBegun) && dotValid &&
+        input::InputHook::Instance().IsAimDotVisible() &&
+        xr.PrepareReticleAt(dotPosition, dotForward,
+                            (std::max)(1.0f, (std::min)(100.0f,
+                                ticket.aimConvergenceMeters)),
+                            1.0f, ticket.pairSerial);
+    m_compositorReticleActive = reticlePrepared;
+    const bool bakeHud = hudExtracted && xr.ShouldBakeHud();
+    const bool hudQuadPrepared = hudExtracted && xr.ShouldSeparateHud() &&
+        (steamCompositorPump || xrFrameBegun) &&
+        xr.PrepareHudTexture(m_hudExtractionTexture, ticket.pairSerial);
+    ID3D11Texture2D* bakedHud = bakeHud ? m_hudExtractionTexture : nullptr;
+    const bool leftOk = (steamCompositorPump || xrFrameBegun) &&
+        CopyTextureToEye(context, m_eyeTextures[leftSource], 0,
+                         false, leftSource, bakedHud, true);
+    const bool rightOk = leftOk &&
+        CopyTextureToEye(context, m_eyeTextures[rightSource], 1,
+                         false, rightSource, bakedHud, true);
+    XrView submittedViews[2] = {
+        renderedViews[leftSource], renderedViews[rightSource]
+    };
+    bool submitted = false;
+    if (steamCompositorPump && leftOk && rightOk) {
+        m_steamSubmittedViews[0] = submittedViews[0];
+        m_steamSubmittedViews[1] = submittedViews[1];
+        m_steamSubmittedViewsValid = true;
+        m_steamSubmittedHud = hudQuadPrepared;
+        m_steamSubmittedHudSerial = hudQuadPrepared ? ticket.pairSerial : 0;
+        m_steamSubmittedReticle = reticlePrepared;
+        m_steamSubmittedReticleSerial = reticlePrepared ? ticket.pairSerial : 0;
+        m_steamTheaterActive = false;
+        submitted = true;
+    } else if (!steamCompositorPump && xrFrameBegun) {
+        submitted = xr.EndFrame(leftOk && rightOk,
+                                leftOk && rightOk ? submittedViews : nullptr,
+                                hudQuadPrepared,
+                                hudQuadPrepared ? ticket.pairSerial : 0,
+                                reticlePrepared,
+                                reticlePrepared ? ticket.pairSerial : 0);
+    }
+    if (steamCompositorPump) ReleaseSRWLockExclusive(&m_steamSubmissionLock);
+    if (!steamCompositorPump && xr.IsFrameActive()) xr.EndFrame(false);
+    if (steamCompositorPump && submitted) StartWaitWorker();
+    if (preparedWaitConsumed && m_waitRequestEvent) SetEvent(m_waitRequestEvent);
+
+    m_compositorReticleActive = false;
+    m_submissionViewsValid = false;
+    if (nativeWorld) nativeWorld->Release();
+    if (submitted) {
+        m_lastNativeMultiviewGeneration = generation;
+        m_hasSubmittedStereoProjection = true;
+        static uint64_t nativeSubmissions = 0;
+        const uint64_t count = ++nativeSubmissions;
+        if (count <= 5 || count % 600 == 0) {
+            Log("[SFR] Native multiview frame submitted: pair=%llu generation=%llu "
+                "source=%ux%u eye=%ux%u count=%llu",
+                static_cast<unsigned long long>(ticket.pairSerial),
+                static_cast<unsigned long long>(generation), sourceDesc.Width,
+                sourceDesc.Height, sourceDesc.Width / 2, sourceDesc.Height,
+                static_cast<unsigned long long>(count));
+        }
+    }
+    return submitted;
 }
 
 void FrameLoop::ResetStereoPair() {
@@ -2060,8 +2327,30 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         input::InputHook::Instance().UpdateState(xr.GetPredictedDisplayTime());
     StereoRenderTicket renderedTicket = {};
     const bool hasRenderedTicket = ConsumeRenderedTicket(renderedTicket);
+    camera::CompletedNativeMultiviewFrame nativeFrame = {};
+    const bool hasNativeFrame = config::Get().same_frame_stereo &&
+        camera::ConsumeCompletedNativeMultiviewFrame(nativeFrame);
+    const bool nativeFrameMatches = hasRenderedTicket && hasNativeFrame &&
+        nativeFrame.pairSerial == renderedTicket.pairSerial;
 
-    if (hasRenderedTicket && !camera::ConsumeRenderPoseAcknowledgement(
+    if (hasNativeFrame && !nativeFrameMatches) {
+        static uint64_t nativeTicketMismatches = 0;
+        const uint64_t count = ++nativeTicketMismatches;
+        if (count <= 10 || count % 300 == 0) {
+            Log("[SFR] Native frame/ticket mismatch: native=%llu ticket=%llu valid=%d; "
+                "stereo state reset (count=%llu)",
+                static_cast<unsigned long long>(nativeFrame.pairSerial),
+                static_cast<unsigned long long>(renderedTicket.pairSerial),
+                hasRenderedTicket ? 1 : 0,
+                static_cast<unsigned long long>(count));
+        }
+        ResetStereoPair();
+        ++m_frameCount;
+        g_currentEye = -1;
+        return;
+    }
+
+    if (hasRenderedTicket && !nativeFrameMatches && !camera::ConsumeRenderPoseAcknowledgement(
             renderedTicket.pairSerial, renderedTicket.eye)) {
         static uint64_t lateAcknowledgements = 0;
         ++lateAcknowledgements;
@@ -2387,6 +2676,28 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
             composedRejectedDevice, composedRejectedDesc, tonemapAccepted, tonemapSeen,
             captureSource == composedTexture ? "composed" :
                 (captureSource == tonemapTexture ? "tonemap" : "fallback"));
+    }
+
+    if (nativeFrameMatches) {
+        const bool submitted = TrySubmitNativeMultiviewFrame(
+            device, context, captureSource, renderedTicket,
+            nativeFrame.renderedViews, nativeFrame.generation);
+        if (captureSource != backbuffer) captureSource->Release();
+        backbuffer->Release();
+        if (!submitted) {
+            static uint64_t nativeDrops = 0;
+            const uint64_t count = ++nativeDrops;
+            if (count <= 10 || count % 300 == 0) {
+                Log("[SFR] Native frame retained by compositor: pair=%llu "
+                    "generation=%llu count=%llu",
+                    static_cast<unsigned long long>(nativeFrame.pairSerial),
+                    static_cast<unsigned long long>(nativeFrame.generation),
+                    static_cast<unsigned long long>(count));
+            }
+        }
+        ++m_frameCount;
+        g_currentEye = -1;
+        return;
     }
 
     const bool finalIsBackbuffer = captureSource == backbuffer;
