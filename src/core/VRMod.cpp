@@ -342,6 +342,11 @@ extern "C" __declspec(dllexport) BOOL WINAPI BL1GOTYVR_WaitForDisplayHooks(DWORD
         WaitForSingleObject(s_displayReadyEvent, timeoutMs) == WAIT_OBJECT_0;
 }
 
+extern "C" __declspec(dllexport) BOOL WINAPI BL1GOTYVR_ObserveDxgiFactory(
+        IUnknown* factory) {
+    return bl1gotyvr::d3d11::ObserveDxgiFactory(factory) ? TRUE : FALSE;
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);

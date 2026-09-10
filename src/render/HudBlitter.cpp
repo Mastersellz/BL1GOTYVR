@@ -39,6 +39,7 @@ HudBlitter& HudBlitter::Instance() {
 bool HudBlitter::Initialize(ID3D11Device* device) {
     if (!device) return false;
     if (m_vertexShader && m_pixelShader && m_differencePixelShader &&
+        m_compositeDifferencePixelShader &&
         m_constantBuffer && m_sampler && m_blend && m_depthDisabled && m_rasterizer) {
         return m_device == device;
     }
@@ -80,14 +81,14 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 Texture2D finalTexture : register(t0);
 Texture2D worldTexture : register(t1);
 SamplerState hudSampler : register(s0);
-float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
-    // The game reticle is camera-centered and does not represent the VR shot
-    // direction. Remove it from the extracted HUD; FrameLoop draws the guarded
-    // controller/ballistic dot after the world projection.
+cbuffer HudConstants : register(b0) {
+    float opacity; float3 padding;
+    float4 protectedDot;
+    float2 targetSize; float targetAspect; float padding2;
+};
+float4 extractColor(float3 finalColor, float3 worldColor, float2 uv) {
     float2 centerDelta = uv - 0.5;
-    if (length(centerDelta) < 0.025) return 0.0;
-    float3 finalColor = finalTexture.Sample(hudSampler, uv).rgb;
-    float3 worldColor = worldTexture.Sample(hudSampler, uv).rgb;
+    if (dot(centerDelta, centerDelta) < 0.025 * 0.025) return 0.0;
     float3 increase = saturate(
         (finalColor - worldColor) / max(1.0 - worldColor, 0.001));
     float3 decrease = saturate(
@@ -95,9 +96,41 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     float alpha = max(max(increase.r, increase.g), increase.b);
     alpha = max(alpha, max(max(decrease.r, decrease.g), decrease.b));
     if (alpha < 0.004) return 0.0;
-    float3 premultiplied = saturate(
-        finalColor - worldColor * (1.0 - alpha));
+    float3 premultiplied = saturate(finalColor - worldColor * (1.0 - alpha));
     return float4(premultiplied, alpha);
+}
+float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    // The game reticle is camera-centered and does not represent the VR shot
+    // direction. Remove it from the extracted HUD; FrameLoop draws the guarded
+    // controller/ballistic dot after the world projection.
+    float3 finalColor = finalTexture.Sample(hudSampler, uv).rgb;
+    float3 worldColor = worldTexture.Sample(hudSampler, uv).rgb;
+    return extractColor(finalColor, worldColor, uv);
+}
+float4 extractedTexel(int2 xy, int2 size) {
+    xy = clamp(xy, int2(0, 0), size - 1);
+    float4 color = extractColor(finalTexture.Load(int3(xy, 0)).rgb,
+        worldTexture.Load(int3(xy, 0)).rgb, (float2(xy) + 0.5) / float2(size));
+    // Match the intermediate R8/B8 UNORM render target, including alpha.
+    return round(saturate(color) * 255.0) / 255.0;
+}
+float4 composite(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    if (protectedDot.w > 0.5) {
+        float2 delta = position.xy / targetSize - protectedDot.xy;
+        delta.x *= targetAspect;
+        if (length(delta) < protectedDot.z * 1.15) return 0.0;
+    }
+    uint width, height;
+    finalTexture.GetDimensions(width, height);
+    int2 size = int2(width, height);
+    float2 texel = uv * float2(size) - 0.5;
+    int2 xy = int2(floor(texel));
+    float2 weight = frac(texel);
+    float4 a = lerp(extractedTexel(xy, size),
+                    extractedTexel(xy + int2(1, 0), size), weight.x);
+    float4 b = lerp(extractedTexel(xy + int2(0, 1), size),
+                    extractedTexel(xy + int2(1, 1), size), weight.x);
+    return lerp(a, b, weight.y) * opacity;
 }
 )";
 
@@ -150,6 +183,21 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         &m_differencePixelShader);
     Release(vertexBlob);
     Release(pixelBlob);
+    Release(differenceBlob);
+
+    if (SUCCEEDED(result)) result = D3DCompile(
+        differencePixelSource, sizeof(differencePixelSource), "BL1HudFusedPS",
+        nullptr, nullptr, "composite", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3,
+        0, &differenceBlob, &errors);
+    if (errors) {
+        if (FAILED(result)) Log("[HUD] Fused shader compile failed: %.*s",
+            static_cast<int>(errors->GetBufferSize()),
+            static_cast<const char*>(errors->GetBufferPointer()));
+        Release(errors);
+    }
+    if (SUCCEEDED(result)) result = device->CreatePixelShader(
+        differenceBlob->GetBufferPointer(), differenceBlob->GetBufferSize(), nullptr,
+        &m_compositeDifferencePixelShader);
     Release(differenceBlob);
 
     D3D11_BUFFER_DESC constantDesc = {};
@@ -228,6 +276,23 @@ bool HudBlitter::ExtractDifference(ID3D11Device* device,
                                          nullptr, true, nullptr, 1.0f);
 }
 
+bool HudBlitter::CompositeDifference(ID3D11Device* device, ID3D11DeviceContext* context,
+                                     ID3D11Texture2D* finalFrame,
+                                     ID3D11Texture2D* worldFrame,
+                                     ID3D11Texture2D* target,
+                                     const D3D11_VIEWPORT& viewport, float opacity,
+                                     const float protectedDot[4], float targetAspect) {
+    if (!finalFrame || !worldFrame) return false;
+    D3D11_TEXTURE2D_DESC desc = {};
+    finalFrame->GetDesc(&desc);
+    const DXGI_FORMAT format = TypedColorFormat(desc.Format);
+    if (format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+        format != DXGI_FORMAT_B8G8R8A8_UNORM) return false;
+    return Initialize(device) && Render(device, context, finalFrame, worldFrame,
+        target, opacity, m_compositeDifferencePixelShader, &viewport, false,
+        protectedDot, targetAspect);
+}
+
 bool HudBlitter::Render(ID3D11Device* device, ID3D11DeviceContext* context,
                          ID3D11Texture2D* source, ID3D11Texture2D* secondarySource,
                          ID3D11Texture2D* target, float opacity,
@@ -268,21 +333,15 @@ bool HudBlitter::Render(ID3D11Device* device, ID3D11DeviceContext* context,
     ID3D11ShaderResourceView* sourceView = nullptr;
     ID3D11ShaderResourceView* secondaryView = nullptr;
     ID3D11RenderTargetView* targetView = nullptr;
-    if (FAILED(device->CreateShaderResourceView(source, &sourceViewDesc, &sourceView)) ||
-        (secondarySource && FAILED(device->CreateShaderResourceView(
-            secondarySource, &secondaryViewDesc, &secondaryView))) ||
-        FAILED(device->CreateRenderTargetView(target, &targetViewDesc, &targetView))) {
-        Release(sourceView);
-        Release(secondaryView);
-        Release(targetView);
+    if (FAILED(m_views.ShaderResource(device, source, sourceViewDesc.Format, &sourceView)) ||
+        (secondarySource && FAILED(m_views.ShaderResource(
+            device, secondarySource, secondaryViewDesc.Format, &secondaryView))) ||
+        FAILED(m_views.RenderTarget(device, target, targetViewDesc.Format, &targetView))) {
         return false;
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(context->Map(m_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        Release(sourceView);
-        Release(secondaryView);
-        Release(targetView);
         return false;
     }
     const float constants[12] = {
@@ -328,12 +387,10 @@ bool HudBlitter::Render(ID3D11Device* device, ID3D11DeviceContext* context,
     context->PSGetSamplers(0, 1, &oldSampler);
     context->PSGetConstantBuffers(0, 1, &oldConstantBuffer);
 
-    if (clearTarget) {
-        const float transparent[4] = {};
-        context->ClearRenderTargetView(targetView, transparent);
-    }
+    // Full-screen passes overwrite every pixel (including transparent ones).
+    // No clear/read-modify-write blend is needed for extraction or Blit.
     context->OMSetRenderTargets(1, &targetView, nullptr);
-    context->OMSetBlendState(m_blend, nullptr, 0xFFFFFFFF);
+    context->OMSetBlendState(clearTarget ? nullptr : m_blend, nullptr, 0xFFFFFFFF);
     context->OMSetDepthStencilState(m_depthDisabled, 0);
     context->RSSetState(m_rasterizer);
     D3D11_VIEWPORT viewport = requestedViewport ? *requestedViewport : D3D11_VIEWPORT{};
@@ -383,13 +440,12 @@ bool HudBlitter::Render(ID3D11Device* device, ID3D11DeviceContext* context,
     for (auto*& value : oldResources) Release(value);
     Release(oldSampler);
     Release(oldConstantBuffer);
-    Release(sourceView);
-    Release(secondaryView);
-    Release(targetView);
     return true;
 }
 
 void HudBlitter::Shutdown() {
+    m_views.Clear();
+    Release(m_compositeDifferencePixelShader);
     Release(m_rasterizer);
     Release(m_depthDisabled);
     Release(m_blend);

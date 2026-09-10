@@ -90,6 +90,7 @@ target_include_directories(BL1GOTYVR PRIVATE src include)
 target_link_libraries(BL1GOTYVR PRIVATE minhook openxr_loader bl1gotyvr_imgui
     d3d11 dxgi dxguid d3dcompiler gdi32 imm32)
 target_compile_definitions(BL1GOTYVR PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+set_property(TARGET BL1GOTYVR PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
 # Automatic loader placed beside BorderlandsGOTY.exe. It forwards DXGI to
 # System32 and loads BL1GOTYVR.dll before the game's first DXGI factory call.
@@ -119,3 +120,12 @@ target_compile_definitions(BL1GOTYVRConfig PRIVATE
     NOMINMAX
     _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(BL1GOTYVRConfig PRIVATE shell32)
+
+option(BL1GOTYVR_BUILD_RENDER_TESTS "Build standalone D3D11 HUD regression tests" OFF)
+if(BL1GOTYVR_BUILD_RENDER_TESTS)
+    enable_testing()
+    add_executable(hud_render_tests tests/HudBlitterTests.cpp src/render/HudBlitter.cpp)
+    target_compile_definitions(hud_render_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(hud_render_tests PRIVATE d3d11 dxgi d3dcompiler)
+    add_test(NAME hud_render_tests COMMAND hud_render_tests)
+endif()

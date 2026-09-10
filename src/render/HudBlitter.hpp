@@ -1,6 +1,7 @@
 #pragma once
 
 #include <d3d11.h>
+#include "TextureViewCache.hpp"
 
 namespace bl1gotyvr { namespace render {
 
@@ -19,6 +20,13 @@ public:
                            ID3D11Texture2D* finalFrame,
                            ID3D11Texture2D* worldFrame,
                            ID3D11Texture2D* target);
+    // Fuses UNORM8 extraction and bilinear composition at the output HUD size.
+    // Reconstructs/quantizes each source texel BEFORE filtering, just like the
+    // two-pass path; nonlinear alpha must never be extracted after filtering.
+    bool CompositeDifference(ID3D11Device* device, ID3D11DeviceContext* context,
+                             ID3D11Texture2D* finalFrame, ID3D11Texture2D* worldFrame,
+                             ID3D11Texture2D* target, const D3D11_VIEWPORT& viewport,
+                             float opacity, const float protectedDot[4], float targetAspect);
     void Shutdown();
 
 private:
@@ -35,12 +43,14 @@ private:
     ID3D11VertexShader* m_vertexShader = nullptr;
     ID3D11PixelShader* m_pixelShader = nullptr;
     ID3D11PixelShader* m_differencePixelShader = nullptr;
+    ID3D11PixelShader* m_compositeDifferencePixelShader = nullptr;
     ID3D11Buffer* m_constantBuffer = nullptr;
     ID3D11SamplerState* m_sampler = nullptr;
     ID3D11BlendState* m_blend = nullptr;
     ID3D11DepthStencilState* m_depthDisabled = nullptr;
     ID3D11RasterizerState* m_rasterizer = nullptr;
     bool m_initializationAttempted = false;
+    TextureViewCache m_views;
 };
 
 }} // namespace bl1gotyvr::render

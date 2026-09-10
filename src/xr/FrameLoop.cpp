@@ -7,6 +7,7 @@
 #include "../player/ArmIKSystem.hpp"
 #include "../input/WeaponAimSystem.hpp"
 #include "../d3d11/D3D11Hooks.hpp"
+#include "../display/DisplayHooks.hpp"
 #include "../camera/CameraHook.hpp"
 #include "../config/Config.hpp"
 #include "../input/XRInput.hpp"
@@ -220,6 +221,8 @@ bool FrameLoop::PrepareForOpenXRRecovery() {
 }
 
 void FrameLoop::InvalidateBackbufferResources() {
+    m_blitViews.Clear();
+    m_frameProfiler.Reset();
     AcquireSRWLockExclusive(&m_captureLock);
     for (int i = 0; i < 2; i++) {
         if (m_eyeTextures[i]) { m_eyeTextures[i]->Release(); m_eyeTextures[i] = nullptr; }
@@ -251,6 +254,7 @@ void FrameLoop::InvalidateBackbufferResources() {
     }
     m_hudWorldValidated = false;
     m_nextHudValidationPair = 0;
+    m_pendingHudValidationPair = 0;
     ResetHudCaptureMetadata();
     ReleaseSRWLockExclusive(&m_captureLock);
     render::HudBlitter::Instance().Shutdown();
@@ -497,12 +501,12 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     rtvDesc.Format = destinationIsTypeless
         ? selectedSwapchainFormat : typedFormat(destinationDesc.Format);
     rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-    HRESULT hr = device->CreateShaderResourceView(source, &srvDesc, &sourceView);
+    HRESULT hr = m_blitViews.ShaderResource(device, source, srvDesc.Format, &sourceView);
     if (FAILED(hr)) {
         Log("[FrameLoop] CreateShaderResourceView failed: 0x%08X fmt=%u samples=%u bind=0x%X",
             hr, sourceDesc.Format, sourceDesc.SampleDesc.Count, sourceDesc.BindFlags);
     } else {
-        hr = device->CreateRenderTargetView(destination, &rtvDesc, &destinationView);
+        hr = m_blitViews.RenderTarget(device, destination, rtvDesc.Format, &destinationView);
         if (FAILED(hr)) {
             Log("[FrameLoop] CreateRenderTargetView failed: 0x%08X fmt=%u samples=%u bind=0x%X",
                 hr, destinationDesc.Format, destinationDesc.SampleDesc.Count, destinationDesc.BindFlags);
@@ -510,7 +514,6 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     }
     device->Release();
     if (FAILED(hr)) {
-        if (sourceView) sourceView->Release();
         return false;
     }
 
@@ -567,9 +570,26 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     const auto& vrSettings = config::Get();
     const int sampledEye = sourceEye >= 0 ? sourceEye : eye;
     uint32_t principalWidth = 0, principalHeight = 0;
-    const bool principalExtentValid = !flatSource && !sideBySideSource &&
+    const bool hasPrincipal = !flatSource && !sideBySideSource &&
         camera::GetPrincipalRenderExtent(principalWidth, principalHeight) &&
-        principalWidth <= sourceDesc.Width && principalHeight <= sourceDesc.Height;
+        principalWidth && principalHeight;
+    // A stale/smaller FSceneView (e.g. 2048 vs 4096 backbuffer) must not
+    // shrink the stereo UVs to a tiny window. Only trust the principal when
+    // it matches the actual capture extent.
+    const bool principalExtentValid = hasPrincipal &&
+        principalWidth == sourceDesc.Width && principalHeight == sourceDesc.Height;
+    if (hasPrincipal && !principalExtentValid) {
+        static uint32_t loggedMismatchSource = 0;
+        static uint32_t loggedMismatchPrincipal = 0;
+        const uint32_t sourceKey = sourceDesc.Width * 100000u + sourceDesc.Height;
+        const uint32_t principalKey = principalWidth * 100000u + principalHeight;
+        if (sourceKey != loggedMismatchSource || principalKey != loggedMismatchPrincipal) {
+            Log("[FrameLoop] Principal/capture mismatch ignored: principal=%ux%u source=%ux%u",
+                principalWidth, principalHeight, sourceDesc.Width, sourceDesc.Height);
+            loggedMismatchSource = sourceKey;
+            loggedMismatchPrincipal = principalKey;
+        }
+    }
     if (principalExtentValid) {
         contentScaleX = static_cast<float>(principalWidth) / sourceDesc.Width;
         contentScaleY = static_cast<float>(principalHeight) / sourceDesc.Height;
@@ -613,6 +633,38 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
         uvScaleY *= contentScaleY;
         uvOffsetX *= contentScaleX;
         uvOffsetY *= contentScaleY;
+    }
+    // Never rely on sampler clamping for projection correction. Repeating an
+    // out-of-range edge row produces the characteristic stretched bottom bar.
+    const float halfTexelX = 0.5f / static_cast<float>(sourceDesc.Width);
+    const float halfTexelY = 0.5f / static_cast<float>(sourceDesc.Height);
+    const float minU = sideBySideSource
+        ? (sampledEye == 0 ? halfTexelX : 0.5f + halfTexelX)
+        : halfTexelX;
+    const float maxU = sideBySideSource
+        ? (sampledEye == 0 ? 0.5f - halfTexelX : 1.0f - halfTexelX)
+        : 1.0f - halfTexelX;
+    const float minV = halfTexelY;
+    const float maxV = 1.0f - halfTexelY;
+    const float originalScaleX = uvScaleX;
+    const float originalScaleY = uvScaleY;
+    const float originalOffsetX = uvOffsetX;
+    const float originalOffsetY = uvOffsetY;
+    uvScaleX = std::clamp(uvScaleX, 0.0f, (std::max)(0.0f, maxU - minU));
+    uvScaleY = std::clamp(uvScaleY, 0.0f, (std::max)(0.0f, maxV - minV));
+    uvOffsetX = std::clamp(uvOffsetX, minU, maxU - uvScaleX);
+    uvOffsetY = std::clamp(uvOffsetY, minV, maxV - uvScaleY);
+    if (fabsf(originalScaleX - uvScaleX) > 1.0e-6f ||
+        fabsf(originalScaleY - uvScaleY) > 1.0e-6f ||
+        fabsf(originalOffsetX - uvOffsetX) > 1.0e-6f ||
+        fabsf(originalOffsetY - uvOffsetY) > 1.0e-6f) {
+        static std::atomic<bool> loggedUvContainment{false};
+        if (!loggedUvContainment.exchange(true, std::memory_order_relaxed)) {
+            Log("[FrameLoop] Blit UVs contained inside valid source texels: "
+                "scale=(%.4f,%.4f)->(%.4f,%.4f) offset=(%.4f,%.4f)->(%.4f,%.4f)",
+                originalScaleX, originalScaleY, uvScaleX, uvScaleY,
+                originalOffsetX, originalOffsetY, uvOffsetX, uvOffsetY);
+        }
     }
     if (eye == 0) {
         static float loggedConvergence = -1.0f;
@@ -763,8 +815,6 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     if (oldBlend) oldBlend->Release();
     if (oldDepthState) oldDepthState->Release();
     if (oldRasterizerState) oldRasterizerState->Release();
-    destinationView->Release();
-    sourceView->Release();
     return true;
 }
 
@@ -986,9 +1036,26 @@ ID3D11Texture2D* FrameLoop::CaptureGdiFrame(ID3D11Device* device,
 bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* source, int eye,
                                   bool sideBySideSource, int sourceEye,
                                   ID3D11Texture2D* hudOverlay,
-                                  bool flatSource) {
+                                  bool flatSource, bool theaterHud,
+                                  ID3D11Texture2D* hudWorld) {
     auto& xr = OpenXRContext::Instance();
-    if (xr.NeedsRecovery()) return false;
+    if (!context || !source || xr.NeedsRecovery()) return false;
+    D3D11_TEXTURE2D_DESC srcDesc = {};
+    source->GetDesc(&srcDesc);
+    const UINT requiredExtent = display::TargetResolution();
+    if (!flatSource && requiredExtent &&
+        (srcDesc.Width != requiredExtent || srcDesc.Height != requiredExtent)) {
+        static uint64_t rejectedProjectionExtents = 0;
+        const uint64_t count = ++rejectedProjectionExtents;
+        if (count <= 3 || count % 300 == 0) {
+            Log("[FrameLoop] Projection upload blocked: mode=%s source=%ux%u "
+                "required=%ux%u count=%llu",
+                sideBySideSource ? "SFR" : "AFR",
+                srcDesc.Width, srcDesc.Height, requiredExtent, requiredExtent,
+                static_cast<unsigned long long>(count));
+        }
+        return false;
+    }
     EyeData& eyeData = (eye == 0) ? xr.GetLeftEye() : xr.GetRightEye();
 
     // Acquire swapchain image
@@ -1019,8 +1086,7 @@ bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* 
     // format, then copy into the runtime-owned image. VDXR/Meta exposes
     // TYPELESS swapchain resources; BFVR uses this same typed-local approach
     // instead of creating application RTVs on runtime resources.
-    D3D11_TEXTURE2D_DESC srcDesc, dstDesc;
-    source->GetDesc(&srcDesc);
+    D3D11_TEXTURE2D_DESC dstDesc = {};
     if (destTex) destTex->GetDesc(&dstDesc);
 
     ID3D11Device* device = nullptr;
@@ -1043,10 +1109,12 @@ bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* 
                 loggedBlitFailure = true;
             }
             copied = false;
-        } else if (hudOverlay && !CompositeHudIntoProjection(
-                       context, hudOverlay, uploadTexture,
-                       sourceEye >= 0 ? sourceEye : eye)) {
-            Log("[HUD] Projection HUD composition failed for eye %d; reverting pair", eye);
+        } else if (hudOverlay && !(theaterHud
+                       ? CompositeHudIntoTheater(context, hudOverlay, uploadTexture)
+                       : CompositeHudIntoProjection(context, hudOverlay, uploadTexture,
+                              sourceEye >= 0 ? sourceEye : eye, hudWorld))) {
+            Log("[HUD] %s HUD composition failed for eye %d; reverting pair",
+                theaterHud ? "Theater" : "Projection", eye);
             copied = false;
         } else {
             context->CopyResource(destTex, uploadTexture);
@@ -1470,6 +1538,8 @@ bool FrameLoop::ValidateHudPair(ID3D11Device* device,
         }
     }
 
+    if (recreate) m_pendingHudValidationPair = 0;
+    if (!m_pendingHudValidationPair) {
     for (UINT y = 0; y < 4; ++y) {
         for (UINT x = 0; x < 4; ++x) {
             constexpr UINT sampleNumerators[4] = {1, 3, 4, 7};
@@ -1486,10 +1556,19 @@ bool FrameLoop::ValidateHudPair(ID3D11Device* device,
         }
     }
     context->CopyResource(m_hudValidationStaging, m_hudValidationTexture);
-    context->Flush();
+    m_pendingHudValidationPair = pairSerial;
+    return false;
+    }
+
+    // Poll on a later Present without flushing or stalling the render thread.
+    // The normal Present/OpenXR submission advances this tiny readback.
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(context->Map(
-            m_hudValidationStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
+    const HRESULT mapResult = context->Map(m_hudValidationStaging, 0,
+        D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (mapResult == DXGI_ERROR_WAS_STILL_DRAWING) return false;
+    const uint64_t sampledPair = m_pendingHudValidationPair;
+    m_pendingHudValidationPair = 0;
+    if (FAILED(mapResult)) {
         m_nextHudValidationPair = pairSerial + 120;
         return false;
     }
@@ -1525,7 +1604,7 @@ bool FrameLoop::ValidateHudPair(ID3D11Device* device,
         changedSamples >= 1 && changedSamples <= 12;
     Log("[HUD] Pre-HUD validation: pair=%llu world=%.4f final=%.4f "
         "difference=%.4f changed=%u/16 valid=%d",
-        static_cast<unsigned long long>(pairSerial), worldAverage, finalAverage,
+        static_cast<unsigned long long>(sampledPair), worldAverage, finalAverage,
         differenceAverage, changedSamples, valid ? 1 : 0);
     if (valid) {
         m_hudWorldValidated = true;
@@ -1537,7 +1616,8 @@ bool FrameLoop::ValidateHudPair(ID3D11Device* device,
 
 bool FrameLoop::CompositeHudIntoProjection(ID3D11DeviceContext* context,
                                            ID3D11Texture2D* hudTexture,
-                                           ID3D11Texture2D* target, int eye) {
+                                           ID3D11Texture2D* target, int eye,
+                                           ID3D11Texture2D* hudWorld) {
     if (!context || !hudTexture || !target || eye < 0 || eye > 1 ||
         !m_submissionViewsValid) return false;
     D3D11_TEXTURE2D_DESC sourceDesc = {}, targetDesc = {};
@@ -1619,10 +1699,14 @@ bool FrameLoop::CompositeHudIntoProjection(ID3D11DeviceContext* context,
 
     ID3D11Device* device = nullptr;
     context->GetDevice(&device);
-    const bool composed = device && render::HudBlitter::Instance().Composite(
+    const bool composed = device && (hudWorld
+        ? render::HudBlitter::Instance().CompositeDifference(
+            device, context, hudTexture, hudWorld, target, viewport, hud.hud_opacity,
+            m_lastDotSettings[eye], static_cast<float>(targetDesc.Width) / targetDesc.Height)
+        : render::HudBlitter::Instance().Composite(
         device, context, hudTexture, target, viewport, hud.hud_opacity,
         m_lastDotSettings[eye],
-        static_cast<float>(targetDesc.Width) / targetDesc.Height);
+        static_cast<float>(targetDesc.Width) / targetDesc.Height));
     if (device) device->Release();
     if (composed) {
         static std::atomic<uint64_t> composeCount{0};
@@ -1637,31 +1721,103 @@ bool FrameLoop::CompositeHudIntoProjection(ID3D11DeviceContext* context,
     return composed;
 }
 
+bool FrameLoop::CompositeHudIntoTheater(ID3D11DeviceContext* context,
+                                        ID3D11Texture2D* hudTexture,
+                                        ID3D11Texture2D* target) {
+    if (!context || !hudTexture || !target) return false;
+    D3D11_TEXTURE2D_DESC targetDesc = {};
+    target->GetDesc(&targetDesc);
+    if (!targetDesc.Width || !targetDesc.Height) return false;
+    D3D11_VIEWPORT viewport = {};
+    viewport.Width = static_cast<float>(targetDesc.Width);
+    viewport.Height = static_cast<float>(targetDesc.Height);
+    viewport.MaxDepth = 1.0f;
+    ID3D11Device* device = nullptr;
+    context->GetDevice(&device);
+    const bool composed = device && render::HudBlitter::Instance().Composite(
+        device, context, hudTexture, target, viewport, 1.0f, nullptr,
+        static_cast<float>(targetDesc.Width) / targetDesc.Height);
+    if (device) device->Release();
+    if (composed) {
+        static std::atomic<bool> loggedTheaterHud{false};
+        if (!loggedTheaterHud.exchange(true, std::memory_order_relaxed))
+            Log("[HUD] Full-screen mono HUD composed over theater eye");
+    }
+    return composed;
+}
+
 bool FrameLoop::TrySubmitTheaterFrame(ID3D11Device* device,
                                       ID3D11DeviceContext* context,
-                                      IDXGISwapChain* swapChain) {
+                                      IDXGISwapChain* swapChain,
+                                      const StereoRenderTicket* stereoTicket) {
     auto& xr = OpenXRContext::Instance();
     if (!device || !context || !swapChain || !xr.IsInitialized() || !m_poseSeeded)
         return false;
 
+    auto copyTheaterSource = [&](ID3D11Texture2D* backbuffer,
+                                 float& submittedAspect) {
+        D3D11_TEXTURE2D_DESC desc = {};
+        backbuffer->GetDesc(&desc);
+        if (!desc.Width || !desc.Height || desc.SampleDesc.Count != 1) return false;
+        submittedAspect = static_cast<float>(desc.Width) / desc.Height;
+
+        ID3D11Texture2D* nativeWorld = nullptr;
+        if (stereoTicket && stereoTicket->valid &&
+            camera::IsNativeMultiviewActive()) {
+            AcquireSRWLockShared(&m_captureLock);
+            if (m_nativeWorldPairSerial == stereoTicket->pairSerial &&
+                m_nativeWorldBeforeHudTexture) {
+                nativeWorld = m_nativeWorldBeforeHudTexture;
+                nativeWorld->AddRef();
+            }
+            ReleaseSRWLockShared(&m_captureLock);
+        }
+
+        bool copied = false;
+        if (nativeWorld) {
+            D3D11_TEXTURE2D_DESC nativeDesc = {};
+            nativeWorld->GetDesc(&nativeDesc);
+            const UINT requiredExtent = display::TargetResolution();
+            if (requiredExtent && (nativeDesc.Width != requiredExtent ||
+                                   nativeDesc.Height != requiredExtent)) {
+                nativeWorld->Release();
+                nativeWorld = nullptr;
+            }
+        }
+        if (nativeWorld) {
+            const bool hudExtracted = EnsureHudExtractionTexture(device, backbuffer) &&
+                render::HudBlitter::Instance().ExtractDifference(
+                    device, context, backbuffer, nativeWorld, m_hudExtractionTexture);
+            if (hudExtracted) {
+                copied = CopyTextureToEye(context, nativeWorld, 0, true, 0,
+                                          m_hudExtractionTexture, false, true);
+                static std::atomic<bool> loggedSbsTheater{false};
+                if (copied && !loggedSbsTheater.exchange(true, std::memory_order_relaxed)) {
+                    Log("[FrameLoop] Theater source reconstructed: left native view + mono HUD "
+                        "pair=%llu aspect=%.3f",
+                        static_cast<unsigned long long>(stereoTicket->pairSerial),
+                        submittedAspect);
+                }
+            }
+            nativeWorld->Release();
+            if (hudExtracted) return copied;
+        }
+        return CopyTextureToEye(context, backbuffer, 0, false, -1, nullptr, true);
+    };
+
     if (xr.IsSteamRuntime() && m_waitWorker) {
         ID3D11Texture2D* backbuffer = d3d11::AcquireCurrentBackbuffer(swapChain);
         if (!backbuffer) return false;
-        D3D11_TEXTURE2D_DESC desc = {};
-        backbuffer->GetDesc(&desc);
         bool copied = false;
-        if (desc.Width && desc.Height && desc.SampleDesc.Count == 1) {
-            AcquireSRWLockExclusive(&m_steamSubmissionLock);
-            copied = CopyTextureToEye(context, backbuffer, 0, false, -1, nullptr, true);
-            if (copied) {
-                context->Flush();
-                m_steamTheaterAspect = static_cast<float>(desc.Width) / desc.Height;
-                m_steamTheaterActive = true;
-            } else {
-                xr.RequestRecovery("SteamVR theater upload failed", XR_ERROR_RUNTIME_FAILURE);
-            }
-            ReleaseSRWLockExclusive(&m_steamSubmissionLock);
+        AcquireSRWLockExclusive(&m_steamSubmissionLock);
+        copied = copyTheaterSource(backbuffer, m_steamTheaterAspect);
+        if (copied) {
+            context->Flush();
+            m_steamTheaterActive = true;
+        } else {
+            xr.RequestRecovery("SteamVR theater upload failed", XR_ERROR_RUNTIME_FAILURE);
         }
+        ReleaseSRWLockExclusive(&m_steamSubmissionLock);
         backbuffer->Release();
         return copied;
     }
@@ -1684,16 +1840,11 @@ bool FrameLoop::TrySubmitTheaterFrame(ID3D11Device* device,
 
     ID3D11Texture2D* backbuffer = d3d11::AcquireCurrentBackbuffer(swapChain);
     if (backbuffer) {
-        D3D11_TEXTURE2D_DESC desc = {};
-        backbuffer->GetDesc(&desc);
-        if (desc.Width && desc.Height && desc.SampleDesc.Count == 1) {
-            const bool copied = CopyTextureToEye(
-                context, backbuffer, 0, false, -1, nullptr, true);
-            if (copied) {
-                context->Flush();
-                submitted = xr.EndFrameTheater(
-                    static_cast<float>(desc.Width) / desc.Height);
-            }
+        float submittedAspect = 1.0f;
+        const bool copied = copyTheaterSource(backbuffer, submittedAspect);
+        if (copied) {
+            context->Flush();
+            submitted = xr.EndFrameTheater(submittedAspect);
         }
         backbuffer->Release();
     }
@@ -1707,11 +1858,28 @@ bool FrameLoop::ConsumeRenderedTicket(StereoRenderTicket& ticket) {
     AcquireSRWLockExclusive(&m_stereoPairLock);
     if (m_renderedTicketCount != 0) {
         ticket = m_renderedTicketQueue[m_renderedTicketRead];
-        m_renderedTicketQueue[m_renderedTicketRead] = {};
+        // Keep consumed entries as a short history. UE3's render thread can
+        // finish a native command one Present later than its game-thread
+        // ticket, especially while leaving loading/theater mode.
         m_renderedTicketRead = (m_renderedTicketRead + 1) % _countof(m_renderedTicketQueue);
         --m_renderedTicketCount;
     }
     ReleaseSRWLockExclusive(&m_stereoPairLock);
+    return ticket.valid;
+}
+
+bool FrameLoop::FindRecentRenderedTicket(uint64_t pairSerial, int eye,
+                                         StereoRenderTicket& ticket) {
+    ticket = {};
+    if (!pairSerial || eye < 0 || eye > 1) return false;
+    AcquireSRWLockShared(&m_stereoPairLock);
+    for (const auto& candidate : m_renderedTicketQueue) {
+        if (!candidate.valid || candidate.pairSerial != pairSerial ||
+            candidate.eye != eye) continue;
+        ticket = candidate;
+        break;
+    }
+    ReleaseSRWLockShared(&m_stereoPairLock);
     return ticket.valid;
 }
 
@@ -1724,11 +1892,38 @@ bool FrameLoop::TrySubmitNativeMultiviewFrame(
 
     D3D11_TEXTURE2D_DESC sourceDesc = {};
     source->GetDesc(&sourceDesc);
+    const UINT requiredExtent = display::TargetResolution();
     if (sourceDesc.Width < 2 || (sourceDesc.Width & 1u) != 0 ||
-        sourceDesc.Height == 0 || sourceDesc.SampleDesc.Count != 1) {
-        Log("[SFR] Native multiview source rejected: %ux%u samples=%u",
-            sourceDesc.Width, sourceDesc.Height, sourceDesc.SampleDesc.Count);
+        sourceDesc.Height == 0 || sourceDesc.SampleDesc.Count != 1 ||
+        (requiredExtent && (sourceDesc.Width != requiredExtent ||
+                            sourceDesc.Height != requiredExtent))) {
+        static uint64_t invalidExtentCount = 0;
+        const uint64_t count = ++invalidExtentCount;
+        if (count <= 3 || count % 300 == 0) {
+            Log("[SFR] Native multiview source rejected: %ux%u samples=%u "
+                "required=%ux%u count=%llu",
+                sourceDesc.Width, sourceDesc.Height, sourceDesc.SampleDesc.Count,
+                requiredExtent, requiredExtent,
+                static_cast<unsigned long long>(count));
+        }
         return false;
+    }
+
+    auto& xr = OpenXRContext::Instance();
+    const bool steamCompositorPump = xr.IsSteamRuntime();
+    bool xrFrameBegun = false;
+    bool preparedWaitConsumed = false;
+    if (!steamCompositorPump) {
+        StartWaitWorker();
+        preparedWaitConsumed = m_waitReadyEvent &&
+            WaitForSingleObject(m_waitReadyEvent, 1) == WAIT_OBJECT_0;
+        if (!preparedWaitConsumed) return false;
+        xrFrameBegun = xr.BeginFrame() && xr.ShouldRender() && xr.LocateViews();
+        if (!xrFrameBegun) {
+            if (xr.IsFrameActive()) xr.EndFrame(false);
+            if (m_waitRequestEvent) SetEvent(m_waitRequestEvent);
+            return false;
+        }
     }
 
     ID3D11Texture2D* nativeWorld = nullptr;
@@ -1740,12 +1935,6 @@ bool FrameLoop::TrySubmitNativeMultiviewFrame(
     }
     ReleaseSRWLockShared(&m_captureLock);
     ID3D11Texture2D* worldSource = nativeWorld ? nativeWorld : source;
-
-    EnsureEyeTextures(device, worldSource, true);
-    if (!m_eyeTextures[0] || !m_eyeTextures[1]) {
-        if (nativeWorld) nativeWorld->Release();
-        return false;
-    }
 
     ID3D11RenderTargetView* boundTarget = nullptr;
     ID3D11DepthStencilView* boundDepth = nullptr;
@@ -1771,42 +1960,18 @@ bool FrameLoop::TrySubmitNativeMultiviewFrame(
     m_submissionProjectionCorrection = ticket.projectionCorrection;
     m_submissionRenderAspect = ticket.renderAspect;
     bool hudExtracted = false;
+    bool directHud = false;
     if (nativeWorld && ValidateHudPair(
-            device, context, source, nativeWorld, ticket.pairSerial) &&
-        EnsureHudExtractionTexture(device, source)) {
-        hudExtracted = render::HudBlitter::Instance().ExtractDifference(
-            device, context, source, nativeWorld, m_hudExtractionTexture);
+            device, context, source, nativeWorld, ticket.pairSerial)) {
+        directHud = xr.ShouldBakeHud() &&
+            (sourceDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+             sourceDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+             sourceDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+             sourceDesc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS);
+        hudExtracted = directHud || (EnsureHudExtractionTexture(device, source) &&
+            render::HudBlitter::Instance().ExtractDifference(
+                device, context, source, nativeWorld, m_hudExtractionTexture));
     }
-    m_submittingNativeEyes = true;
-    const bool leftCaptured = BlitTexture(
-        context, worldSource, m_eyeTextures[0], 0, true, 0, false);
-    const bool rightCaptured = BlitTexture(
-        context, worldSource, m_eyeTextures[1], 1, true, 1, false);
-    m_submittingNativeEyes = false;
-
-    if (sourceBound) context->OMSetRenderTargets(1, &boundTarget, boundDepth);
-    if (boundTarget) boundTarget->Release();
-    if (boundDepth) boundDepth->Release();
-    if (!leftCaptured || !rightCaptured) {
-        if (nativeWorld) nativeWorld->Release();
-        m_submissionViewsValid = false;
-        return false;
-    }
-
-    auto& xr = OpenXRContext::Instance();
-    const bool steamCompositorPump = xr.IsSteamRuntime();
-    bool xrFrameBegun = false;
-    bool preparedWaitConsumed = false;
-    if (!steamCompositorPump) {
-        StartWaitWorker();
-        preparedWaitConsumed = m_waitReadyEvent &&
-            WaitForSingleObject(m_waitReadyEvent, 1) == WAIT_OBJECT_0;
-        if (preparedWaitConsumed && xr.BeginFrame()) {
-            xrFrameBegun = true;
-            if (!xr.ShouldRender() || !xr.LocateViews()) xrFrameBegun = false;
-        }
-    }
-
     const bool reverseEyes = config::Get().reverse_eyes;
     const int leftSource = reverseEyes ? 1 : 0;
     const int rightSource = reverseEyes ? 0 : 1;
@@ -1850,13 +2015,21 @@ bool FrameLoop::TrySubmitNativeMultiviewFrame(
     const bool hudQuadPrepared = hudExtracted && xr.ShouldSeparateHud() &&
         (steamCompositorPump || xrFrameBegun) &&
         xr.PrepareHudTexture(m_hudExtractionTexture, ticket.pairSerial);
-    ID3D11Texture2D* bakedHud = bakeHud ? m_hudExtractionTexture : nullptr;
+    ID3D11Texture2D* bakedHud = bakeHud
+        ? (directHud ? source : m_hudExtractionTexture) : nullptr;
+    m_submittingNativeEyes = true;
     const bool leftOk = (steamCompositorPump || xrFrameBegun) &&
-        CopyTextureToEye(context, m_eyeTextures[leftSource], 0,
-                         false, leftSource, bakedHud, true);
+        CopyTextureToEye(context, worldSource, 0,
+                         true, leftSource, bakedHud, false, false,
+                         directHud ? nativeWorld : nullptr);
     const bool rightOk = leftOk &&
-        CopyTextureToEye(context, m_eyeTextures[rightSource], 1,
-                         false, rightSource, bakedHud, true);
+        CopyTextureToEye(context, worldSource, 1,
+                         true, rightSource, bakedHud, false, false,
+                         directHud ? nativeWorld : nullptr);
+    m_submittingNativeEyes = false;
+    if (sourceBound) context->OMSetRenderTargets(1, &boundTarget, boundDepth);
+    if (boundTarget) boundTarget->Release();
+    if (boundDepth) boundDepth->Release();
     XrView submittedViews[2] = {
         renderedViews[leftSource], renderedViews[rightSource]
     };
@@ -2326,12 +2499,32 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     if (m_poseSeeded && xr.GetPredictedDisplayTime() != 0)
         input::InputHook::Instance().UpdateState(xr.GetPredictedDisplayTime());
     StereoRenderTicket renderedTicket = {};
-    const bool hasRenderedTicket = ConsumeRenderedTicket(renderedTicket);
+    bool hasRenderedTicket = ConsumeRenderedTicket(renderedTicket);
     camera::CompletedNativeMultiviewFrame nativeFrame = {};
     const bool hasNativeFrame = config::Get().same_frame_stereo &&
         camera::ConsumeCompletedNativeMultiviewFrame(nativeFrame);
-    const bool nativeFrameMatches = hasRenderedTicket && hasNativeFrame &&
+    bool nativeFrameMatches = hasRenderedTicket && hasNativeFrame &&
         nativeFrame.pairSerial == renderedTicket.pairSerial;
+
+    if (hasNativeFrame && !nativeFrameMatches) {
+        StereoRenderTicket originatingTicket = {};
+        if (FindRecentRenderedTicket(nativeFrame.pairSerial, nativeFrame.eye,
+                                     originatingTicket)) {
+            renderedTicket = originatingTicket;
+            hasRenderedTicket = true;
+            nativeFrameMatches = true;
+            static uint64_t nativeTicketRealignments = 0;
+            const uint64_t count = ++nativeTicketRealignments;
+            if (count <= 10 || count % 300 == 0) {
+                Log("[SFR] Native frame realigned from ticket history: pair=%llu eye=%d "
+                    "generation=%llu count=%llu",
+                    static_cast<unsigned long long>(nativeFrame.pairSerial),
+                    nativeFrame.eye,
+                    static_cast<unsigned long long>(nativeFrame.generation),
+                    static_cast<unsigned long long>(count));
+            }
+        }
+    }
 
     if (hasNativeFrame && !nativeFrameMatches) {
         static uint64_t nativeTicketMismatches = 0;
@@ -2362,6 +2555,10 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         }
     }
 
+    const bool nativeHoldFrame = config::Get().same_frame_stereo &&
+        camera::IsNativeMultiviewActive() && hasRenderedTicket &&
+        renderedTicket.eye == 1 && !hasNativeFrame;
+
     auto& weaponAim = input::WeaponAimSystem::Instance();
     const bool explicitVehicleTerminalUi = weaponAim.IsVehicleTerminalUiActive();
     const input::PlayerIdentitySnapshot identity = weaponAim.GetPlayerIdentity();
@@ -2373,8 +2570,33 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     } else {
         m_terminalMissingWeaponPresents = 0;
     }
-    const bool flatNonGameplayView = explicitVehicleTerminalUi ||
-        m_terminalMissingWeaponPresents >= 2;
+    DXGI_SWAP_CHAIN_DESC liveSwapDesc = {};
+    const UINT requiredExtent = display::TargetResolution();
+    const bool nativeExtentSafe = SUCCEEDED(swapChain->GetDesc(&liveSwapDesc)) &&
+        (!requiredExtent || (liveSwapDesc.BufferDesc.Width == requiredExtent &&
+                             liveSwapDesc.BufferDesc.Height == requiredExtent));
+    const bool unsafeNativeFrame = nativeFrameMatches && !nativeExtentSafe;
+    if (unsafeNativeFrame) {
+        static uint64_t unsafeNativeFrames = 0;
+        const uint64_t count = ++unsafeNativeFrames;
+        if (count <= 3 || count % 300 == 0) {
+            Log("[SFR] Unsafe native extent blocked before submission: actual=%ux%u "
+                "required=%ux%u count=%llu",
+                liveSwapDesc.BufferDesc.Width, liveSwapDesc.BufferDesc.Height,
+                requiredExtent, requiredExtent,
+                static_cast<unsigned long long>(count));
+        }
+    }
+    const bool nativeNonGameplayStereo = !explicitVehicleTerminalUi &&
+        !identity.pawnValid && (nativeFrameMatches || nativeHoldFrame) && nativeExtentSafe;
+    const bool flatNonGameplayView = explicitVehicleTerminalUi || unsafeNativeFrame ||
+        (m_terminalMissingWeaponPresents >= 2 && !nativeNonGameplayStereo);
+    if (nativeNonGameplayStereo) {
+        static std::atomic<bool> loggedNativeTitleStereo{false};
+        if (!loggedNativeTitleStereo.exchange(true, std::memory_order_relaxed)) {
+            Log("[FrameLoop] Native stereo retained without pawn: title/menu view");
+        }
+    }
     if (flatNonGameplayView) {
         if (!m_theaterFallbackActive) {
             m_theaterFallbackActive = true;
@@ -2386,7 +2608,8 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         // UE3's final AER pass owns the freshest mono UI. Updating the quad
         // from both passes can alternate terminal content at headset rate.
         if (!hasRenderedTicket || renderedTicket.eye == 1)
-            TrySubmitTheaterFrame(device, context, swapChain);
+            TrySubmitTheaterFrame(device, context, swapChain,
+                                  hasRenderedTicket ? &renderedTicket : nullptr);
         ++m_frameCount;
         g_currentEye = -1;
         return;
@@ -2399,7 +2622,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
             m_theaterRecoveryTickets >= kTheaterExitStableTickets &&
             renderedTicket.eye == 1;
         if (!stablePairBoundary) {
-            TrySubmitTheaterFrame(device, context, swapChain);
+            TrySubmitTheaterFrame(device, context, swapChain, &renderedTicket);
             ++m_frameCount;
             g_currentEye = -1;
             return;
@@ -2448,6 +2671,23 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         return;
     }
 
+    const bool nativeSfrMode = config::Get().same_frame_stereo &&
+        camera::IsNativeMultiviewActive();
+    render::FrameProfiler::Scope performance(m_frameProfiler, device, context,
+                                              nativeSfrMode);
+
+    // Native eye 0 already rendered and submitted both eyes. Eye 1 advances
+    // UE3 as one ordinary view while OpenXR retains the coherent pair. Do not
+    // recapture or upload a duplicate frame with the same pose.
+    if (nativeHoldFrame) {
+        static std::atomic<bool> loggedPairPacing{false};
+        if (!loggedPairPacing.exchange(true, std::memory_order_relaxed))
+            Log("[SFR] Pair-paced submission active: one native upload per stereo pair");
+        ++m_frameCount;
+        g_currentEye = -1;
+        return;
+    }
+
     // Get the swapchain backbuffer and inspect the render target left bound by
     // UE3. Gameplay can remain in an intermediate target while menus are
     // composed directly into the backbuffer.
@@ -2475,6 +2715,19 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
             captureMode == 2 ? "tracked SDR target" : "GDI window");
     }
     f8WasDown = f8Down;
+    // Native SFR already identifies the final backbuffer and pre-HUD snapshot.
+    // Avoid per-render-target COM queries/locks used only for capture research.
+    // Use the stable SFR mode (not the per-Present ticket match) so the
+    // inspection state does not thrash between eye0/hold Presents.
+    {
+        static bool lastInspectionEnabled = true;
+        const bool wantInspectionEnabled =
+            !(nativeSfrMode && captureMode == 1);
+        if (wantInspectionEnabled != lastInspectionEnabled) {
+            d3d11::SetCaptureInspectionEnabled(wantInspectionEnabled);
+            lastInspectionEnabled = wantInspectionEnabled;
+        }
+    }
     static bool f10WasDown = false;
     const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     if (f10Down && !f10WasDown) {

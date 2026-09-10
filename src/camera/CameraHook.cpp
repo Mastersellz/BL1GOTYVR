@@ -331,6 +331,7 @@ struct CompletedNativeFrameSlot {
     bool valid = false;
     uint64_t generation = 0;
     uint64_t pairSerial = 0;
+    int eye = -1;
     XrView renderedViews[2] = {};
 };
 static CompletedNativeFrameSlot s_completedNativeFrame;
@@ -566,11 +567,13 @@ bool ConsumeCompletedNativeMultiviewFrame(CompletedNativeMultiviewFrame& frame) 
     if (s_completedNativeFrame.valid) {
         frame.generation = s_completedNativeFrame.generation;
         frame.pairSerial = s_completedNativeFrame.pairSerial;
+        frame.eye = s_completedNativeFrame.eye;
         frame.renderedViews[0] = s_completedNativeFrame.renderedViews[0];
         frame.renderedViews[1] = s_completedNativeFrame.renderedViews[1];
         s_completedNativeFrame.valid = false;
         s_completedNativeFrame.generation = 0;
         s_completedNativeFrame.pairSerial = 0;
+        s_completedNativeFrame.eye = -1;
         available = true;
     }
     ReleaseSRWLockExclusive(&s_completedNativeFrameLock);
@@ -581,6 +584,7 @@ void DiscardCompletedNativeMultiviewFrame() {
     s_completedNativeFrame.valid = false;
     s_completedNativeFrame.generation = 0;
     s_completedNativeFrame.pairSerial = 0;
+    s_completedNativeFrame.eye = -1;
     ReleaseSRWLockExclusive(&s_completedNativeFrameLock);
 }
 void SuspendNativeMultiview() {
@@ -1912,19 +1916,23 @@ static void __fastcall HookedRenderScene(void* renderer) {
         finalPoseCount == 1 && commandViewCount == 1 && appliedPose.xrViewsValid;
     s_originalRenderScene(renderer);
     if (completedAlternateEye) {
-        xr::FrameLoop::Instance().CaptureWorldBeforeHud(
-            appliedPose.pairSerial, appliedPose.eye);
+        if (!config::Get().same_frame_stereo) {
+            xr::FrameLoop::Instance().CaptureWorldBeforeHud(
+                appliedPose.pairSerial, appliedPose.eye);
+        }
         StoreRenderPoseAck(appliedPose, commandGeneration);
     }
     RemoveCommandPose(renderer);
     if (completedNativeMultiview) {
-        xr::FrameLoop::Instance().CaptureNativeWorldBeforeHud(appliedPose.pairSerial);
+        if (appliedPose.eye == 0)
+            xr::FrameLoop::Instance().CaptureNativeWorldBeforeHud(appliedPose.pairSerial);
         AcquireSRWLockExclusive(&s_completedNativeFrameLock);
         if (!s_completedNativeFrame.valid ||
             commandGeneration > s_completedNativeFrame.generation) {
             s_completedNativeFrame.valid = true;
             s_completedNativeFrame.generation = commandGeneration;
             s_completedNativeFrame.pairSerial = appliedPose.pairSerial;
+            s_completedNativeFrame.eye = appliedPose.eye;
             s_completedNativeFrame.renderedViews[0] = appliedPose.xrViews[0];
             s_completedNativeFrame.renderedViews[1] = appliedPose.xrViews[1];
         }
@@ -2040,7 +2048,10 @@ static void* __fastcall HookedRenderCommandConstructor(void* destination, void* 
                         principalWidth, std::memory_order_release);
                     s_principalRenderHeight.store(
                         principalHeight, std::memory_order_release);
-                    if (config::Get().same_frame_stereo) {
+                    // One native frame already contains both eyes. The second
+                    // ticket in the legacy AER pair is a compositor hold frame;
+                    // keep it monoscopic to halve its scene traversal/draw setup.
+                    if (config::Get().same_frame_stereo && commandPose.eye == 0) {
                         memcpy(stereoFamily, sourceViewFamily, sizeof(stereoFamily));
                         memcpy(stereoSourceViews[0], reinterpret_cast<const void*>(sourceView),
                                sizeof(stereoSourceViews[0]));

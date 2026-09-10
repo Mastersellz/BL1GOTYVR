@@ -29,6 +29,7 @@ FARPROC g_real_DXGIReportAdapterConfiguration = nullptr;
 namespace {
 
 HMODULE s_proxyModule = nullptr;
+HMODULE s_modModule = nullptr;
 INIT_ONCE s_modLoadOnce = INIT_ONCE_STATIC_INIT;
 
 void ProxyLog(const wchar_t* message) {
@@ -131,6 +132,7 @@ BOOL CALLBACK LoadModOnce(PINIT_ONCE, PVOID, PVOID*) {
         ProxyLog(L"BL1GOTYVR.dll could not be loaded; continuing with native DXGI");
         return TRUE;
     }
+    s_modModule = mod;
 
     using WaitForDisplayHooksFn = BOOL(WINAPI*)(DWORD);
     auto waitForDisplayHooks = reinterpret_cast<WaitForDisplayHooksFn>(
@@ -142,6 +144,15 @@ BOOL CALLBACK LoadModOnce(PINIT_ONCE, PVOID, PVOID*) {
     return TRUE;
 }
 
+void NotifyModOfFactory(void* factory) {
+    if (!factory || !s_modModule) return;
+    using ObserveFactoryFn = BOOL(WINAPI*)(IUnknown*);
+    auto observe = reinterpret_cast<ObserveFactoryFn>(
+        GetProcAddress(s_modModule, "BL1GOTYVR_ObserveDxgiFactory"));
+    if (!observe || !observe(static_cast<IUnknown*>(factory)))
+        ProxyLog(L"Could not install the DXGI factory resolution guard");
+}
+
 void EnsureModLoaded() {
     InitOnceExecuteOnce(&s_modLoadOnce, LoadModOnce, nullptr, nullptr);
 }
@@ -151,19 +162,25 @@ void EnsureModLoaded() {
 extern "C" HRESULT WINAPI Proxy_CreateDXGIFactory(REFIID riid, void** factory) {
     EnsureModLoaded();
     using Function = HRESULT(WINAPI*)(REFIID, void**);
-    return reinterpret_cast<Function>(g_real_CreateDXGIFactory)(riid, factory);
+    const HRESULT result = reinterpret_cast<Function>(g_real_CreateDXGIFactory)(riid, factory);
+    if (SUCCEEDED(result) && factory) NotifyModOfFactory(*factory);
+    return result;
 }
 
 extern "C" HRESULT WINAPI Proxy_CreateDXGIFactory1(REFIID riid, void** factory) {
     EnsureModLoaded();
     using Function = HRESULT(WINAPI*)(REFIID, void**);
-    return reinterpret_cast<Function>(g_real_CreateDXGIFactory1)(riid, factory);
+    const HRESULT result = reinterpret_cast<Function>(g_real_CreateDXGIFactory1)(riid, factory);
+    if (SUCCEEDED(result) && factory) NotifyModOfFactory(*factory);
+    return result;
 }
 
 extern "C" HRESULT WINAPI Proxy_CreateDXGIFactory2(UINT flags, REFIID riid, void** factory) {
     EnsureModLoaded();
     using Function = HRESULT(WINAPI*)(UINT, REFIID, void**);
-    return reinterpret_cast<Function>(g_real_CreateDXGIFactory2)(flags, riid, factory);
+    const HRESULT result = reinterpret_cast<Function>(g_real_CreateDXGIFactory2)(flags, riid, factory);
+    if (SUCCEEDED(result) && factory) NotifyModOfFactory(*factory);
+    return result;
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {

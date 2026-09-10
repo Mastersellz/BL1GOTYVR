@@ -6,6 +6,8 @@
 #include <atomic>
 
 #include "../input/XRInput.hpp"
+#include "../render/TextureViewCache.hpp"
+#include "../render/FrameProfiler.hpp"
 
 namespace bl1gotyvr { namespace xr {
 
@@ -83,9 +85,10 @@ private:
     bool EnsureEyeTextures(ID3D11Device* device, ID3D11Texture2D* source,
                            bool sideBySideSource = false);
     bool CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* source, int eye,
-                            bool sideBySideSource = false, int sourceEye = -1,
-                            ID3D11Texture2D* hudOverlay = nullptr,
-                            bool flatSource = false);
+                          bool sideBySideSource = false, int sourceEye = -1,
+                          ID3D11Texture2D* hudOverlay = nullptr,
+                          bool flatSource = false, bool theaterHud = false,
+                          ID3D11Texture2D* hudWorld = nullptr);
     bool EnsureSwapchainUploadTexture(ID3D11Device* device,
                                       const D3D11_TEXTURE2D_DESC& destinationDesc,
                                       int eye);
@@ -105,7 +108,8 @@ private:
                           IDXGISwapChain* swapChain);
     void ValidateDesktopStereoPair(ID3D11Device* device, ID3D11DeviceContext* context);
     bool TrySubmitTheaterFrame(ID3D11Device* device, ID3D11DeviceContext* context,
-                               IDXGISwapChain* swapChain);
+                               IDXGISwapChain* swapChain,
+                               const StereoRenderTicket* stereoTicket = nullptr);
     bool TrySubmitNativeMultiviewFrame(ID3D11Device* device,
                                        ID3D11DeviceContext* context,
                                        ID3D11Texture2D* source,
@@ -113,13 +117,19 @@ private:
                                        const XrView renderedViews[2],
                                        uint64_t generation);
     bool ConsumeRenderedTicket(StereoRenderTicket& ticket);
+    bool FindRecentRenderedTicket(uint64_t pairSerial, int eye,
+                                  StereoRenderTicket& ticket);
     bool EnsureHudExtractionTexture(ID3D11Device* device, ID3D11Texture2D* source);
     bool ValidateHudPair(ID3D11Device* device, ID3D11DeviceContext* context,
                          ID3D11Texture2D* finalFrame, ID3D11Texture2D* worldFrame,
                          uint64_t pairSerial);
     bool CompositeHudIntoProjection(ID3D11DeviceContext* context,
                                     ID3D11Texture2D* hudTexture,
-                                    ID3D11Texture2D* target, int eye);
+                                     ID3D11Texture2D* target, int eye,
+                                     ID3D11Texture2D* hudWorld = nullptr);
+    bool CompositeHudIntoTheater(ID3D11DeviceContext* context,
+                                ID3D11Texture2D* hudTexture,
+                                ID3D11Texture2D* target);
     void ResetHudCaptureMetadata();
     void ResetStereoPair();
     void StartWaitWorker();
@@ -197,6 +207,9 @@ private:
     ID3D11Texture2D* m_hudValidationStaging = nullptr;
     bool m_hudWorldValidated = false;
     uint64_t m_nextHudValidationPair = 0;
+    uint64_t m_pendingHudValidationPair = 0;
+    render::TextureViewCache m_blitViews;
+    render::FrameProfiler m_frameProfiler;
     uint64_t m_worldCapturePairSerial = 0;
     uint64_t m_worldCaptureSerial[2] = {};
     uint8_t m_worldCaptureMask = 0;

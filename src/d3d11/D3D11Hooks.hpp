@@ -7,6 +7,7 @@
 namespace bl1gotyvr { namespace d3d11 {
 
 bool InstallSteamVrDeviceCompatibility();
+bool ObserveDxgiFactory(IUnknown* factory);
 bool InstallHooks();
 ID3D11Device* GetGameDevice();
 ID3D11DeviceContext* GetGameContext();
@@ -20,5 +21,6 @@ ID3D11Texture2D* GetLatestTonemapSource();
 ID3D11Texture2D* GetPostTonemapTexture();
 ID3D11Texture2D* AcquireCurrentBackbuffer(IDXGISwapChain* swapChain, UINT* bufferIndex = nullptr);
 uint64_t GetHookFiredCount();
+void SetCaptureInspectionEnabled(bool enabled);
 
 }} // namespace bl1gotyvr::d3d11

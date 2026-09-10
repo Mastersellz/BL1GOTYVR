@@ -49,6 +49,11 @@ using CreateDeviceFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE,
 using CreateDeviceAndSwapChainFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE,
     HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT, const DXGI_SWAP_CHAIN_DESC*,
     IDXGISwapChain**, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
+using FactoryCreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*,
+    DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+using FactoryCreateSwapChainForHwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*,
+    IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*,
+    IDXGIOutput*, IDXGISwapChain1**);
 
 static PresentFn       oPresent = nullptr;
 static ResizeBuffersFn oResizeBuffers = nullptr;
@@ -60,7 +65,11 @@ static IASetIndexBufferFn oIASetIndexBuffer = nullptr;
 static IASetVertexBuffersFn oIASetVertexBuffers = nullptr;
 static CreateDeviceFn oCreateDevice = nullptr;
 static CreateDeviceAndSwapChainFn oCreateDeviceAndSwapChain = nullptr;
+static FactoryCreateSwapChainFn oFactoryCreateSwapChain = nullptr;
+static FactoryCreateSwapChainForHwndFn oFactoryCreateSwapChainForHwnd = nullptr;
 static std::atomic<bool> s_deviceCompatibilityInstalled{false};
+static std::atomic<bool> s_factoryCreateSwapChainInstalled{false};
+static std::atomic<bool> s_factoryCreateSwapChainForHwndInstalled{false};
 
 static UINT SteamVrCompatibleDeviceFlags(UINT flags) {
     if (!xr::IsSteamRuntimeSelected()) return flags;
@@ -69,6 +78,14 @@ static UINT SteamVrCompatibleDeviceFlags(UINT flags) {
         Log("[SteamVR] Removed D3D11_CREATE_DEVICE_SINGLETHREADED from game device");
     }
     return compatible;
+}
+
+static bool IsGameSwapChainWindow(HWND window) {
+    if (!window) return false;
+    char className[64] = {};
+    if (!GetClassNameA(window, className, sizeof(className))) return false;
+    return _stricmp(className, "LaunchUnrealUWindowsClient") == 0 ||
+           _stricmp(className, "WndEngineUnreal") == 0;
 }
 
 static HRESULT WINAPI HookedCreateDevice(IDXGIAdapter* adapter,
@@ -87,9 +104,24 @@ static HRESULT WINAPI HookedCreateDeviceAndSwapChain(IDXGIAdapter* adapter,
     const DXGI_SWAP_CHAIN_DESC* swapChainDesc, IDXGISwapChain** swapChain,
     ID3D11Device** device, D3D_FEATURE_LEVEL* selectedFeatureLevel,
     ID3D11DeviceContext** immediateContext) {
+    DXGI_SWAP_CHAIN_DESC forcedDesc = {};
+    const DXGI_SWAP_CHAIN_DESC* effectiveDesc = swapChainDesc;
+    const UINT target = display::TargetResolution();
+    if (swapChainDesc && target && IsGameSwapChainWindow(swapChainDesc->OutputWindow)) {
+        forcedDesc = *swapChainDesc;
+        if (forcedDesc.BufferDesc.Width != target ||
+            forcedDesc.BufferDesc.Height != target) {
+            Log("[Display] Forcing initial game swapchain: %ux%u -> %ux%u",
+                forcedDesc.BufferDesc.Width, forcedDesc.BufferDesc.Height,
+                target, target);
+        }
+        forcedDesc.BufferDesc.Width = target;
+        forcedDesc.BufferDesc.Height = target;
+        effectiveDesc = &forcedDesc;
+    }
     return oCreateDeviceAndSwapChain(adapter, driverType, software,
         SteamVrCompatibleDeviceFlags(flags), featureLevels, featureLevelCount, sdkVersion,
-        swapChainDesc, swapChain, device, selectedFeatureLevel, immediateContext);
+        effectiveDesc, swapChain, device, selectedFeatureLevel, immediateContext);
 }
 
 static ID3D11Device*        s_gameDevice = nullptr;
@@ -163,6 +195,98 @@ static const HandBufferSignature* FindHandBufferSignature(
             return &signature;
     }
     return nullptr;
+}
+
+static void ForceGameSwapChainExtent(HWND window, UINT& width, UINT& height,
+                                     const char* api) {
+    const UINT target = display::TargetResolution();
+    if (!target || !IsGameSwapChainWindow(window)) return;
+    display::SetGameWindow(window);
+    if (width != target || height != target) {
+        Log("[Display] Forcing %s game swapchain: %ux%u -> %ux%u",
+            api, width, height, target, target);
+    }
+    width = target;
+    height = target;
+}
+
+static HRESULT STDMETHODCALLTYPE HookedFactoryCreateSwapChain(
+        IDXGIFactory* factory, IUnknown* device, DXGI_SWAP_CHAIN_DESC* description,
+        IDXGISwapChain** swapChain) {
+    DXGI_SWAP_CHAIN_DESC forced = {};
+    DXGI_SWAP_CHAIN_DESC* effective = description;
+    if (description) {
+        forced = *description;
+        ForceGameSwapChainExtent(forced.OutputWindow, forced.BufferDesc.Width,
+                                 forced.BufferDesc.Height, "IDXGIFactory::CreateSwapChain");
+        effective = &forced;
+    }
+    return oFactoryCreateSwapChain(factory, device, effective, swapChain);
+}
+
+static HRESULT STDMETHODCALLTYPE HookedFactoryCreateSwapChainForHwnd(
+        IDXGIFactory2* factory, IUnknown* device, HWND window,
+        const DXGI_SWAP_CHAIN_DESC1* description,
+        const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreenDescription,
+        IDXGIOutput* restrictToOutput, IDXGISwapChain1** swapChain) {
+    DXGI_SWAP_CHAIN_DESC1 forced = {};
+    const DXGI_SWAP_CHAIN_DESC1* effective = description;
+    if (description) {
+        forced = *description;
+        ForceGameSwapChainExtent(window, forced.Width, forced.Height,
+                                 "IDXGIFactory2::CreateSwapChainForHwnd");
+        effective = &forced;
+    }
+    return oFactoryCreateSwapChainForHwnd(factory, device, window, effective,
+        fullscreenDescription, restrictToOutput, swapChain);
+}
+
+bool ObserveDxgiFactory(IUnknown* unknownFactory) {
+    if (!unknownFactory) return false;
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) return false;
+
+    bool baseReady = s_factoryCreateSwapChainInstalled.load(std::memory_order_acquire);
+    IDXGIFactory* factory = nullptr;
+    if (!baseReady && SUCCEEDED(unknownFactory->QueryInterface(
+            __uuidof(IDXGIFactory), reinterpret_cast<void**>(&factory))) && factory) {
+        void* target = (*reinterpret_cast<void***>(factory))[10];
+        const MH_STATUS create = MH_CreateHook(target, &HookedFactoryCreateSwapChain,
+            reinterpret_cast<void**>(&oFactoryCreateSwapChain));
+        const MH_STATUS enable = create == MH_OK ? MH_EnableHook(target) : create;
+        baseReady = create == MH_OK &&
+            (enable == MH_OK || enable == MH_ERROR_ENABLED);
+        if (baseReady) {
+            s_factoryCreateSwapChainInstalled.store(true, std::memory_order_release);
+            Log("[Display] IDXGIFactory::CreateSwapChain resolution guard active");
+        } else {
+            Log("[Display] ERROR: IDXGIFactory::CreateSwapChain guard failed: %s/%s",
+                MH_StatusToString(create), MH_StatusToString(enable));
+        }
+        factory->Release();
+    }
+
+    bool hwndReady = s_factoryCreateSwapChainForHwndInstalled.load(
+        std::memory_order_acquire);
+    IDXGIFactory2* factory2 = nullptr;
+    if (!hwndReady && SUCCEEDED(unknownFactory->QueryInterface(
+            __uuidof(IDXGIFactory2), reinterpret_cast<void**>(&factory2))) && factory2) {
+        void* target = (*reinterpret_cast<void***>(factory2))[15];
+        const MH_STATUS create = MH_CreateHook(target, &HookedFactoryCreateSwapChainForHwnd,
+            reinterpret_cast<void**>(&oFactoryCreateSwapChainForHwnd));
+        const MH_STATUS enable = create == MH_OK ? MH_EnableHook(target) : create;
+        hwndReady = create == MH_OK &&
+            (enable == MH_OK || enable == MH_ERROR_ENABLED);
+        if (hwndReady) {
+            s_factoryCreateSwapChainForHwndInstalled.store(true, std::memory_order_release);
+            Log("[Display] IDXGIFactory2::CreateSwapChainForHwnd resolution guard active");
+        } else {
+            Log("[Display] ERROR: IDXGIFactory2::CreateSwapChainForHwnd guard failed: %s/%s",
+                MH_StatusToString(create), MH_StatusToString(enable));
+        }
+        factory2->Release();
+    }
+    return baseReady || hwndReady;
 }
 
 static bool IsKnownHandsIndexBufferSize(UINT size) {
@@ -289,6 +413,26 @@ ID3D11Texture2D* AcquireCurrentBackbuffer(IDXGISwapChain* swapChain, UINT* buffe
 }
 
 static std::atomic<uint64_t> s_hookFiredCount{0};
+static std::atomic<bool> s_captureInspectionEnabled{true};
+
+void SetCaptureInspectionEnabled(bool enabled) {
+    if (s_captureInspectionEnabled.exchange(enabled, std::memory_order_relaxed) == enabled)
+        return;
+    if (!enabled) {
+        AcquireSRWLockExclusive(&s_captureLock);
+        for (auto** texture : {&s_latestComposedTexture, &s_latestSceneRenderTarget,
+                               &s_latestSdrRenderTarget, &s_latestTonemapSource}) {
+            if (*texture) (*texture)->Release();
+            *texture = nullptr;
+        }
+        s_sceneRenderTargetScore = s_tonemapSourceScore = -1;
+        s_backbufferBound = false;
+        ReleaseSRWLockExclusive(&s_captureLock);
+    }
+    Log("[SFR] Capture target inspection %s (native capture uses the final backbuffer)",
+        enabled ? "enabled" : "bypassed");
+}
+
 uint64_t GetHookFiredCount() {
     return s_hookFiredCount.load(std::memory_order_relaxed);
 }
@@ -323,6 +467,7 @@ static void STDMETHODCALLTYPE HookedCopyResource(ID3D11DeviceContext* context,
     oCopyResource(context, destination, source);
     if (s_insidePresent) return;
     s_hookFiredCount.fetch_add(1, std::memory_order_relaxed);
+    if (!s_captureInspectionEnabled.load(std::memory_order_relaxed)) return;
     RememberComposedSource(destination, source);
 }
 
@@ -336,6 +481,7 @@ static void STDMETHODCALLTYPE HookedResolveSubresource(ID3D11DeviceContext* cont
                         source, sourceSubresource, format);
     if (s_insidePresent) return;
     s_hookFiredCount.fetch_add(1, std::memory_order_relaxed);
+    if (!s_captureInspectionEnabled.load(std::memory_order_relaxed)) return;
     RememberComposedSource(destination, source);
 }
 
@@ -415,6 +561,10 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* cont
         return;
     }
     s_hookFiredCount.fetch_add(1, std::memory_order_relaxed);
+    if (!s_captureInspectionEnabled.load(std::memory_order_relaxed)) {
+        oOMSetRenderTargets(context, viewCount, views, depthView);
+        return;
+    }
     bool backbufferBound = false;
     for (UINT i = 0; i < viewCount && views; ++i) {
         if (!views[i]) continue;
@@ -564,6 +714,7 @@ static void STDMETHODCALLTYPE HookedPSSetShaderResources(ID3D11DeviceContext* co
         return;
     }
     oPSSetShaderResources(context, startSlot, viewCount, views);
+    if (!s_captureInspectionEnabled.load(std::memory_order_relaxed)) return;
     AcquireSRWLockShared(&s_captureLock);
     const bool inspect = s_backbufferBound;
     ReleaseSRWLockShared(&s_captureLock);
@@ -1402,10 +1553,6 @@ static HRESULT WINAPI HookedResizeBuffers(IDXGISwapChain* sc, UINT bufferCount, 
 }
 
 bool InstallSteamVrDeviceCompatibility() {
-    if (!xr::IsSteamRuntimeSelected()) {
-        Log("[SteamVR] Early D3D11 compatibility hook not needed for selected runtime");
-        return true;
-    }
     bool expected = false;
     if (!s_deviceCompatibilityInstalled.compare_exchange_strong(expected, true)) return true;
     const MH_STATUS init = MH_Initialize();
@@ -1446,10 +1593,11 @@ bool InstallSteamVrDeviceCompatibility() {
         oCreateDevice = nullptr;
         oCreateDeviceAndSwapChain = nullptr;
         s_deviceCompatibilityInstalled = false;
-        Log("[SteamVR] ERROR: early D3D11 compatibility hook installation failed");
+        Log("[Display] ERROR: early D3D11 creation hook installation failed");
         return false;
     }
-    Log("[SteamVR] Early D3D11 device compatibility active");
+    Log("[Display] Early D3D11 swapchain resolution guard active%s",
+        xr::IsSteamRuntimeSelected() ? " with SteamVR device compatibility" : "");
     return true;
 }
 

@@ -9,6 +9,7 @@ struct UE3Globals;
 struct CompletedNativeMultiviewFrame {
     uint64_t generation = 0;
     uint64_t pairSerial = 0;
+    int eye = -1;
     XrView renderedViews[2] = {};
 };
 
