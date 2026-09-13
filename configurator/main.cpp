@@ -37,7 +37,7 @@ struct Field {
     bool integer;
 };
 
-constexpr std::array<Field, 15> kFields = {{
+constexpr std::array<Field, 18> kFields = {{
     {101, "Render width", "Display", "Width", "2048", 640.0f, 7680.0f, true},
     {102, "Render height", "Display", "Height", "2048", 480.0f, 4320.0f, true},
     {103, "Resolution scale", "Display", "ResolutionScale", "1.00", 0.5f, 2.0f, false},
@@ -53,6 +53,9 @@ constexpr std::array<Field, 15> kFields = {{
     {113, "Arm reach scale", "Hands", "ArmReachScale", "1.60", 1.0f, 2.0f, false},
     {114, "Hand cut position", "Visibility", "VanillaHandsCutThreshold", "70.0", 20.0f, 90.0f, false},
     {115, "Melee range scale", "Melee", "RangeMultiplier", "1.60", 1.0f, 5.0f, false},
+    {116, "HUD size", "HUD", "Scale", "1.00", 0.25f, 2.0f, false},
+    {117, "HUD width (deg)", "HUD", "WidthDegrees", "80.0", 10.0f, 150.0f, false},
+    {118, "HUD distance (m)", "HUD", "Distance", "2.00", 0.5f, 10.0f, false},
 }};
 
 struct RenderPreset {
@@ -322,7 +325,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         CreateWindowExA(0, "BUTTON", "Display and optics", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                         16, 12, 500, 270, window, nullptr, nullptr, nullptr);
         CreateWindowExA(0, "BUTTON", "Tracking and rendering", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                        16, 290, 500, 258, window, nullptr, nullptr, nullptr);
+                        16, 290, 500, 320, window, nullptr, nullptr, nullptr);
 
         CreateLabel(window, "Render preset", 34, 42, 90);
         const char* presetLabels[] = {"Low", "Medium", "High", "Ultra", "Mega"};
@@ -350,24 +353,24 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                             nullptr, nullptr);
         }
 
-        CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 566);
-        CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 566);
-        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 596);
-        CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 596);
-        CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 626);
-        CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 626);
-        CreateCheckbox(window, "Physical crouch", kPhysicalCrouchCheck, 274, 650);
+        CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 628);
+        CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 628);
+        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 658);
+        CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 658);
+        CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 688);
+        CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 688);
+        CreateCheckbox(window, "Physical crouch", kPhysicalCrouchCheck, 274, 718);
         CreateCheckbox(window, "Lock WillowEngine.ini (read-only)", kLockWillowEngineCheck,
-                       34, 650, 238);
+                       34, 718, 238);
 
         CreateWindowExA(0, "BUTTON", "Save settings", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                        154, 668, 110, 34, window,
+                        154, 736, 110, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveButton)), nullptr, nullptr);
         CreateWindowExA(0, "BUTTON", "Defaults", WS_CHILD | WS_VISIBLE,
-                        278, 668, 100, 34, window,
+                        278, 736, 100, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultsButton)), nullptr, nullptr);
         CreateLabel(window, "Convergence 10 = recommended; 0 = parallel. Applies live after Save.",
-                    66, 718, 430);
+                    66, 782, 430);
         LoadSettings(window);
         return 0;
     }
@@ -399,7 +402,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
 
     HWND window = CreateWindowExA(0, windowClass.lpszClassName, "Borderlands GOTY Enhanced VR Config",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 550, 794, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 550, 858, nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
     ShowWindow(window, showCommand);
     UpdateWindow(window);
