@@ -8,6 +8,8 @@
 #include "../input/AimHook.hpp"
 #include "../input/InputHook.hpp"
 #include "../input/WeaponAimSystem.hpp"
+#include "../xr/OpenXRContext.hpp"
+#include "../xr/FrameLoop.hpp"
 #include "../player/ArmIKSystem.hpp"
 #include <cstdio>
 #include <cstdarg>
@@ -74,6 +76,17 @@ static void RegisterCommands() {
         LogInternal("[Command] Camera recentered");
     }, "Recenter camera (integer yaw system)");
 
+    cmd.RegisterCommand("resetstereo", [](::std::string) {
+        // VDXR convergence-break recovery without restarting: drop the
+        // measured source projection (re-measured from the next principal
+        // view), abort the in-flight stereo pair (also clears the latched
+        // projection UVs), and re-seed the 6DoF tracking reference.
+        bl1gotyvr::xr::OpenXRContext::Instance().ResetSourceProjectionTans();
+        bl1gotyvr::xr::FrameLoop::Instance().AbortStereoPair();
+        bl1gotyvr::camera::RequestRecenter();
+        LogInternal("[Command] Stereo reset: source projection, stereo pair, and tracking reference reset");
+    }, "Reset stereo calibration without restarting (VDXR convergence-break recovery)");
+
     cmd.RegisterCommand("aim", [](::std::string args) {
         auto& aim = bl1gotyvr::input::AimHook::Instance();
         if (args == "on") {
@@ -120,6 +133,52 @@ static void RegisterCommands() {
             aim.IsBallisticOverrideEnabled() ? "enabled" : "disabled",
             static_cast<unsigned long long>(aim.GetOverrideCount()));
     }, "Control guarded GetAdjustedAim VR override");
+
+    cmd.RegisterCommand("interact", [](::std::string) {
+        bl1gotyvr::input::WeaponAimSystem::Instance().DumpInteractionCandidates();
+        LogInternal("[Command] Interaction candidate dump requested");
+    }, "Dump interaction UFunction candidates for dot-ray focus work");
+
+    cmd.RegisterCommand("resolve", [](::std::string args) {
+        const uintptr_t address = static_cast<uintptr_t>(
+            _strtoui64(args.c_str(), nullptr, 16));
+        bl1gotyvr::input::WeaponAimSystem::Instance().ResolveAddress(address);
+        LogInternal("[Command] Resolve requested for %p",
+            reinterpret_cast<void*>(address));
+    }, "Resolve a heap pointer to Class::Name (live RE)");
+
+    cmd.RegisterCommand("iprobe", [](::std::string) {
+        bl1gotyvr::input::WeaponAimSystem::Instance().DumpInteractionState();
+        LogInternal("[Command] Interaction state probe requested");
+    }, "Dump interaction proxies and manager slots (live RE)");
+
+    cmd.RegisterCommand("ifind", [](::std::string) {
+        bl1gotyvr::input::WeaponAimSystem::Instance().FindInteractionReferrers();
+        LogInternal("[Command] Interaction referrer search requested");
+    }, "Find holders of live interactive actors (live RE)");
+
+    cmd.RegisterCommand("ifind2", [](::std::string) {
+        bl1gotyvr::input::WeaponAimSystem::Instance().FindInteractionReferrersIndirect();
+        LogInternal("[Command] Indirect referrer search requested");
+    }, "Find indirect (array) holders of live interactives (live RE)");
+
+    cmd.RegisterCommand("tracecall", [](::std::string) {
+        bl1gotyvr::input::WeaponAimSystem::Instance().ScanTraceCalls();
+        LogInternal("[Command] Trace CALL scan requested");
+    }, "Scan execTrace for C++ trace CALL targets (live RE)");
+
+    cmd.RegisterCommand("disasm", [](::std::string args) {
+        const uintptr_t address = static_cast<uintptr_t>(
+            _strtoui64(args.c_str(), nullptr, 16));
+        bl1gotyvr::input::WeaponAimSystem::Instance().DisasmAt(address, "cmd");
+        LogInternal("[Command] Disasm requested for %p",
+            reinterpret_cast<void*>(address));
+    }, "Disassemble 256 bytes at address (live RE)");
+
+    cmd.RegisterCommand("iprops", [](::std::string) {
+        bl1gotyvr::input::WeaponAimSystem::Instance().DumpInteractionProperties();
+        LogInternal("[Command] Interaction property dump requested");
+    }, "Dump reflected interaction-related properties (live RE)");
 
     cmd.RegisterCommand("arms", [](::std::string args) {
         auto& arms = bl1gotyvr::player::ArmIKSystem::Instance();
@@ -276,6 +335,10 @@ static void RegisterCommands() {
         LogInternal("[Command]   Aim: %s", bl1gotyvr::input::AimHook::Instance().IsEnabled() ? "enabled" : "disabled");
         LogInternal("[Command]   IPD: %.1f mm", bl1gotyvr::config::Get().ipd_mm);
         LogInternal("[Command]   FOV: %.1f deg", bl1gotyvr::config::Get().fov_degrees);
+        float srcHalfX = 0.0f, srcHalfY = 0.0f;
+        const bool srcTans = bl1gotyvr::xr::OpenXRContext::Instance().GetSourceProjectionTans(srcHalfX, srcHalfY);
+        LogInternal("[Command]   SourceHalfTans: %s half=(%.4f,%.4f)",
+            srcTans ? "measured" : "unmeasured", srcHalfX, srcHalfY);
         LogInternal("[Command]   HeadYaw: %.2f %s", bl1gotyvr::config::Get().head_yaw_scale,
             bl1gotyvr::config::Get().head_yaw_scale == 0.0f ? "(FREE LOOK)" : "");
         LogInternal("[Command]   HeadPitch: %.2f", bl1gotyvr::config::Get().head_pitch_scale);

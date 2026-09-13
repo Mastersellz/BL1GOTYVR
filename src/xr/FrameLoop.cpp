@@ -666,6 +666,35 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
                 originalOffsetX, originalOffsetY, uvOffsetX, uvOffsetY);
         }
     }
+    // Keep the last working crop per eye and reuse it when the live
+    // computation is rejected. Without this, a single rejected frame falls
+    // back to full-frame UVs + symmetric shift. Placed after containment so
+    // the latch holds the exact sampling UVs.
+    {
+        const int latchEye = (sampledEye >= 0 && sampledEye < 2) ? sampledEye :
+            ((eye >= 0 && eye < 2) ? eye : 0);
+        if (!flatSource && latchEye >= 0 && latchEye < 2) {
+            if (projectionCrop) {
+                m_blitUvScale[latchEye][0] = uvScaleX;
+                m_blitUvScale[latchEye][1] = uvScaleY;
+                m_blitUvOffset[latchEye][0] = uvOffsetX;
+                m_blitUvOffset[latchEye][1] = uvOffsetY;
+                m_blitUvLatchValid[latchEye] = true;
+            } else if (m_blitUvLatchValid[latchEye]) {
+                uvScaleX = m_blitUvScale[latchEye][0];
+                uvScaleY = m_blitUvScale[latchEye][1];
+                uvOffsetX = m_blitUvOffset[latchEye][0];
+                uvOffsetY = m_blitUvOffset[latchEye][1];
+                convergenceShift = 0.0f;
+                static uint64_t latchedUvUses = 0;
+                if (++latchedUvUses == 1 || latchedUvUses % 600 == 0) {
+                    Log("[FrameLoop] Using latched projection UVs for eye %d "
+                        "(live crop rejected, count=%llu)", latchEye,
+                        static_cast<unsigned long long>(latchedUvUses));
+                }
+            }
+        }
+    }
     if (eye == 0) {
         static float loggedConvergence = -1.0f;
         if (loggedConvergence != vrSettings.convergence_m) {
@@ -2094,6 +2123,7 @@ void FrameLoop::ResetStereoPair() {
     m_captureWidth = m_captureHeight = m_captureSamples = 0;
     m_captureFormat = DXGI_FORMAT_UNKNOWN;
     m_submissionRightAimValid = false;
+    m_blitUvLatchValid[0] = m_blitUvLatchValid[1] = false;
     m_capturePairViews[0] = {XR_TYPE_VIEW};
     m_capturePairViews[1] = {XR_TYPE_VIEW};
     ResetHudCaptureMetadata();

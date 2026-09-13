@@ -196,6 +196,13 @@ private:
     bool m_submissionProjectionCorrection = true;
     float m_submissionRenderAspect = 1.0f;
 
+    // Last-good projection-crop UVs per eye. Restored when the live crop is
+    // rejected so stereo keeps working instead of falling back to
+    // full-frame + symmetric UV shift.
+    bool m_blitUvLatchValid[2] = {};
+    float m_blitUvScale[2][2] = {};
+    float m_blitUvOffset[2][2] = {};
+
     // Intermediate textures for stereo capture
     ID3D11Texture2D* m_eyeTextures[2] = {};
     ID3D11Texture2D* m_swapchainUploadTextures[2] = {};

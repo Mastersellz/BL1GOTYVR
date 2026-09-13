@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cwctype>
@@ -107,15 +108,48 @@ bool OpenXRContext::GetProjectionCrop(const XrView& view, float sourceAspect,
     offsetY = (1.0f - scaleY) * 0.5f;
     horizontalFovDegrees = 2.0f * atanf(sourceHalfX) * 57.29577951308232f;
     constexpr float kUvTolerance = 1.0e-4f;
-    return scaleX > 0.0f && scaleX <= 1.0f && scaleY > 0.0f && scaleY <= 1.0f &&
+    const bool cropOk = scaleX > 0.0f && scaleX <= 1.0f && scaleY > 0.0f && scaleY <= 1.0f &&
         offsetX >= -kUvTolerance && offsetY >= -kUvTolerance &&
         offsetX + scaleX <= 1.0f + kUvTolerance &&
         offsetY + scaleY <= 1.0f + kUvTolerance;
+    if (!cropOk) {
+        // A rejected crop used to be completely silent, leaving only a
+        // broken image behind. Log it so the cause stays visible.
+        static std::atomic<uint64_t> rejectedCrops{0};
+        const uint64_t rejectCount = rejectedCrops.fetch_add(1) + 1;
+        if (rejectCount == 1 || rejectCount % 600 == 0) {
+            Log("[OpenXR] Projection crop REJECTED: srcHalf=(%.4f,%.4f) "
+                "eyeTans=(L%.3f R%.3f U%.3f D%.3f) scale=(%.4f,%.4f) "
+                "offset=(%.4f,%.4f) aspect=%.3f count=%llu",
+                sourceHalfX, sourceHalfY, tanLeft, tanRight, tanUp, tanDown,
+                scaleX, scaleY, offsetX, offsetY, sourceAspect,
+                static_cast<unsigned long long>(rejectCount));
+        }
+    }
+    return cropOk;
 }
 
 void OpenXRContext::SetSourceProjectionTans(float halfTanX, float halfTanY) {
     if (!std::isfinite(halfTanX) || !std::isfinite(halfTanY) ||
         halfTanX <= 0.0f || halfTanY <= 0.0f) return;
+    // The global source measurement must track the principal gameplay
+    // projection (config FOV). A single outlier view (zoom/scope/menu)
+    // used to poison stereo permanently until restart.
+    const float expectedHalfTan = tanf(
+        config::Get().fov_degrees * 0.5f * 0.01745329251994329577f);
+    if (std::isfinite(expectedHalfTan) && expectedHalfTan > 0.0f &&
+        (halfTanX < expectedHalfTan * 0.70f || halfTanX > expectedHalfTan * 1.40f ||
+         halfTanY < expectedHalfTan * 0.70f || halfTanY > expectedHalfTan * 1.40f)) {
+        static std::atomic<uint64_t> rejectedSourceTans{0};
+        const uint64_t rejectCount = rejectedSourceTans.fetch_add(1) + 1;
+        if (rejectCount == 1 || rejectCount % 120 == 0) {
+            Log("[OpenXR] Source projection outlier rejected: half=(%.4f,%.4f) "
+                "expected=%.4f (FOV=%.1f) count=%llu",
+                halfTanX, halfTanY, expectedHalfTan, config::Get().fov_degrees,
+                static_cast<unsigned long long>(rejectCount));
+        }
+        return;
+    }
     static std::atomic<bool> loggedSourceTans{false};
     if (!loggedSourceTans.exchange(true)) {
         Log("[OpenXR] Game source projection half-tans measured: "
@@ -131,6 +165,12 @@ bool OpenXRContext::GetSourceProjectionTans(float& halfTanX, float& halfTanY) co
     halfTanX = m_sourceHalfTanX.load(std::memory_order_relaxed);
     halfTanY = m_sourceHalfTanY.load(std::memory_order_relaxed);
     return halfTanX > 0.0f && halfTanY > 0.0f;
+}
+
+void OpenXRContext::ResetSourceProjectionTans() {
+    m_sourceHalfTanX.store(0.0f, std::memory_order_relaxed);
+    m_sourceHalfTanY.store(0.0f, std::memory_order_relaxed);
+    Log("[OpenXR] Source projection tans reset; re-measuring from next principal view");
 }
 
 void OpenXRContext::MarkEyeRendered(int eye) {

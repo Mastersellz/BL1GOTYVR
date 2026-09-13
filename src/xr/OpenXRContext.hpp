@@ -94,6 +94,7 @@ public:
                            float& horizontalFovDegrees) const;
     void SetSourceProjectionTans(float halfTanX, float halfTanY);
     bool GetSourceProjectionTans(float& halfTanX, float& halfTanY) const;
+    void ResetSourceProjectionTans();
     void MarkEyeRendered(int eye);
     void SetUseRenderedViewPoses(bool enabled) { m_useRenderedViewPoses = enabled; }
     DXGI_FORMAT GetSwapchainFormat() const { return m_swapchainFormat; }

@@ -768,7 +768,11 @@ static bool ApplyDownedFirstPersonOverride(
             memcpy(outputLocation, expectedLocation, sizeof(expectedLocation));
         }
         ReleaseSRWLockShared(&s_firstPersonCameraLock);
-        memcpy(outputRotation, expectedRotation, sizeof(expectedRotation));
+        // Keep the anchored first-person position, but always output the live
+        // game rotation so the right stick can turn the view even when this
+        // recovery anchor engages during a crouch/stand transition.
+        (void)expectedRotation;
+        memcpy(outputRotation, gameRotation, sizeof(int32_t) * 3);
         return true;
     }
     return false;
@@ -1295,6 +1299,18 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                            sizeof(canonicalWeaponForward));
                     memcpy(canonicalWeaponUp, weaponUp, sizeof(canonicalWeaponUp));
                     canonicalWeaponTarget = true;
+                }
+                if (!canonicalWeaponTarget &&
+                    input::InputHook::Instance().IsMotionControlsEnabled()) {
+                    static std::atomic<uint64_t> nextAimSkipLogMs{0};
+                    const uint64_t nowSkip = GetTickCount64();
+                    uint64_t nextSkip = nextAimSkipLogMs.load(std::memory_order_relaxed);
+                    if (nowSkip >= nextSkip &&
+                        nextAimSkipLogMs.compare_exchange_strong(
+                            nextSkip, nowSkip + 2000, std::memory_order_relaxed)) {
+                        Log("[Camera] Aim/dot update skipped: no right-hand target "
+                            "(simulated=%d)", simulatedPose ? 1 : 0);
+                    }
                 }
                 if (input::InputHook::Instance().IsMotionControlsEnabled() &&
                     canonicalWeaponTarget) {

@@ -467,9 +467,16 @@ void InputHook::UpdateState(XrTime displayTime) {
     m_weaponGrabHeld.store(weaponGrabHeld, std::memory_order_release);
     constexpr bool adsActive = false;
     const bool vehicleSecondaryFire = vehicleMode && m_rightGripDown;
+    const bool fireOutput = m_rightTriggerDown || vehicleSecondaryFire;
     WeaponAimSystem::Instance().SetVehicleSecondaryFireActive(vehicleSecondaryFire);
-    WeaponAimSystem::Instance().SetFireActive(
-        m_rightTriggerDown || vehicleSecondaryFire);
+    WeaponAimSystem::Instance().SetFireActive(fireOutput);
+    static bool lastFireOutput = false;
+    if (fireOutput != lastFireOutput) {
+        lastFireOutput = fireOutput;
+        Log("[Input] Fire trigger %s (RT=%.2f vehicle=%d)",
+            fireOutput ? "pressed" : "released", right.trigger,
+            vehicleSecondaryFire ? 1 : 0);
+    }
 
     const auto playerIdentity = WeaponAimSystem::Instance().GetPlayerIdentity();
     const bool brickRigActive =
