@@ -19,6 +19,7 @@ constexpr int kLoggingCheck = 205;
 constexpr int kDotCheck = 206;
 constexpr int kHmdDirectionCheck = 207;
 constexpr int kPhysicalCrouchCheck = 208;
+constexpr int kLockWillowEngineCheck = 209;
 constexpr int kLowPreset = 210;
 constexpr int kMediumPreset = 211;
 constexpr int kHighPreset = 212;
@@ -89,6 +90,7 @@ void SetDefaults(HWND window) {
     CheckDlgButton(window, kDotCheck, BST_CHECKED);
     CheckDlgButton(window, kHmdDirectionCheck, BST_UNCHECKED);
     CheckDlgButton(window, kPhysicalCrouchCheck, BST_CHECKED);
+    CheckDlgButton(window, kLockWillowEngineCheck, BST_CHECKED);
 }
 
 void ApplyRenderPreset(HWND window, int id) {
@@ -124,6 +126,9 @@ void LoadSettings(HWND window) {
     CheckDlgButton(window, kPhysicalCrouchCheck,
         GetPrivateProfileIntA("Input", "PhysicalCrouch", 1, path.c_str())
             ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(window, kLockWillowEngineCheck,
+        GetPrivateProfileIntA("Configurator", "LockWillowEngineIni", 1, path.c_str())
+            ? BST_CHECKED : BST_UNCHECKED);
 }
 
 bool ReadField(HWND window, const Field& field, std::string& text, int& integerValue) {
@@ -150,7 +155,15 @@ bool ReplaceIniValue(std::vector<std::string>& lines, const char* key, int value
     return false;
 }
 
-bool UpdateGameResolution(int width, int height) {
+void SetIniReadOnly(const std::string& path, bool readOnly) {
+    const DWORD attributes = GetFileAttributesA(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) return;
+    const DWORD updated = readOnly ? (attributes | FILE_ATTRIBUTE_READONLY)
+                                   : (attributes & ~FILE_ATTRIBUTE_READONLY);
+    if (updated != attributes) SetFileAttributesA(path.c_str(), updated);
+}
+
+bool UpdateGameResolution(int width, int height, bool lockAfterWrite) {
     char documents[MAX_PATH] = {};
     if (FAILED(SHGetFolderPathA(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, documents))) {
         return false;
@@ -171,9 +184,19 @@ bool UpdateGameResolution(int width, int height) {
         const bool foundWidth = ReplaceIniValue(lines, "ResX", width);
         const bool foundHeight = ReplaceIniValue(lines, "ResY", height);
         if (!foundWidth || !foundHeight) continue;
+        // The configurator must stay able to rewrite a previously locked file.
+        const DWORD attributes = GetFileAttributesA(path.c_str());
+        const bool wasReadOnly = attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_READONLY) != 0;
+        SetIniReadOnly(path, false);
         std::ofstream output(path, std::ios::trunc);
-        if (!output) return false;
+        if (!output) {
+            if (wasReadOnly) SetIniReadOnly(path, true);
+            return false;
+        }
         for (const auto& outputLine : lines) output << outputLine << "\n";
+        output.close();
+        if (lockAfterWrite) SetIniReadOnly(path, true);
         return true;
     }
     return false;
@@ -263,12 +286,22 @@ void SaveSettings(HWND window) {
         IsDlgButtonChecked(window, kPhysicalCrouchCheck) == BST_CHECKED ? "1" : "0",
         path.c_str());
 
-    const bool gameIniUpdated = UpdateGameResolution(width, height);
+    const bool lockWillowEngine =
+        IsDlgButtonChecked(window, kLockWillowEngineCheck) == BST_CHECKED;
+    WritePrivateProfileStringA("Configurator", "LockWillowEngineIni",
+        lockWillowEngine ? "1" : "0", path.c_str());
+
+    const bool gameIniUpdated = UpdateGameResolution(width, height, lockWillowEngine);
     const bool weaponBobDisabled = DisableGameWeaponBob();
-    const char* message = gameIniUpdated && weaponBobDisabled
+    std::string message = gameIniUpdated && weaponBobDisabled
         ? "Settings saved. Native weapon bob is disabled. Restart the game after changing display settings."
         : "Settings saved. A game INI was not found; verify resolution and bWeaponBob=false before restarting.";
-    MessageBoxA(window, message, "BL1 GOTY VR Config", MB_OK | MB_ICONINFORMATION);
+    if (lockWillowEngine) {
+        message += gameIniUpdated
+            ? "\n\nWillowEngine.ini locked read-only so the game cannot reset the resolution."
+            : "\n\nWillowEngine.ini was not found; nothing was locked.";
+    }
+    MessageBoxA(window, message.c_str(), "BL1 GOTY VR Config", MB_OK | MB_ICONINFORMATION);
 }
 
 void CreateLabel(HWND window, const char* text, int x, int y, int width) {
@@ -276,9 +309,10 @@ void CreateLabel(HWND window, const char* text, int x, int y, int width) {
                     x, y, width, 22, window, nullptr, nullptr, nullptr);
 }
 
-void CreateCheckbox(HWND window, const char* text, int id, int x, int y) {
+void CreateCheckbox(HWND window, const char* text, int id, int x, int y,
+                    int width = 190) {
     CreateWindowExA(0, "BUTTON", text, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                    x, y, 190, 24, window,
+                    x, y, width, 24, window,
                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
 }
 
@@ -288,7 +322,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         CreateWindowExA(0, "BUTTON", "Display and optics", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                         16, 12, 500, 270, window, nullptr, nullptr, nullptr);
         CreateWindowExA(0, "BUTTON", "Tracking and rendering", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                        16, 290, 500, 226, window, nullptr, nullptr, nullptr);
+                        16, 290, 500, 258, window, nullptr, nullptr, nullptr);
 
         CreateLabel(window, "Render preset", 34, 42, 90);
         const char* presetLabels[] = {"Low", "Medium", "High", "Ultra", "Mega"};
@@ -316,22 +350,24 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                             nullptr, nullptr);
         }
 
-        CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 534);
-        CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 534);
-        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 564);
-        CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 564);
-        CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 594);
-        CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 594);
-        CreateCheckbox(window, "Physical crouch", kPhysicalCrouchCheck, 274, 618);
+        CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 566);
+        CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 566);
+        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 596);
+        CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 596);
+        CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 626);
+        CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 626);
+        CreateCheckbox(window, "Physical crouch", kPhysicalCrouchCheck, 274, 650);
+        CreateCheckbox(window, "Lock WillowEngine.ini (read-only)", kLockWillowEngineCheck,
+                       34, 650, 238);
 
         CreateWindowExA(0, "BUTTON", "Save settings", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                        154, 636, 110, 34, window,
+                        154, 668, 110, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveButton)), nullptr, nullptr);
         CreateWindowExA(0, "BUTTON", "Defaults", WS_CHILD | WS_VISIBLE,
-                        278, 636, 100, 34, window,
+                        278, 668, 100, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultsButton)), nullptr, nullptr);
         CreateLabel(window, "Convergence 10 = recommended; 0 = parallel. Applies live after Save.",
-                    66, 686, 430);
+                    66, 718, 430);
         LoadSettings(window);
         return 0;
     }
@@ -363,7 +399,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
 
     HWND window = CreateWindowExA(0, windowClass.lpszClassName, "Borderlands GOTY Enhanced VR Config",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 550, 762, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 550, 794, nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
     ShowWindow(window, showCommand);
     UpdateWindow(window);

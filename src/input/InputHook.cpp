@@ -104,7 +104,8 @@ void InputHook::Install() {
         config::Get().snap_turn_angle, config::Get().locomotion_deadzone,
         config::Get().weapon_position_scale);
     Log("[Input] Map: sticks analog, RT fire, LT ADS, A jump, B Esc/back, "
-        "X use/reload, Y cycle, LB skill, RB grenade, L3 sprint, R3 crouch");
+        "X use/reload (contextual), Y cycle, LB skill, RB grenade, L3 sprint, "
+        "R3 crouch");
     Log("[Input] Y chord: tap=Y, hold 400ms=Back/ECHO, hold+left stick=D-pad");
     Log("[Input] UI navigation: left stick vertical=D-pad up/down; melee=physical VR swing");
     Log("[Input] Calibration: Ctrl+Numpad 1=global left hand, 3=active weapon, "
@@ -713,8 +714,14 @@ void InputHook::UpdateState(XrTime displayTime) {
             m_prevButtonA);
         setKey(VK_SPACE, right.buttonA, m_prevJump);
         setKey('C', crouchPulse, m_prevCrouch);
-        setKey('E', left.buttonX, m_prevUse);
-        setKey('R', left.buttonX, m_prevReload);
+        // X is shared between use/pickup and reload; latch the purpose on press
+        // so the game never receives both keys at once.
+        if (left.buttonX && !m_prevUse && !m_prevReload) {
+            m_buttonXPurpose = WeaponAimSystem::Instance().HasInteractionFocus() ? 1 : 2;
+        }
+        if (!left.buttonX) m_buttonXPurpose = 0;
+        setKey('E', left.buttonX && m_buttonXPurpose == 1, m_prevUse);
+        setKey('R', left.buttonX && m_buttonXPurpose == 2, m_prevReload);
         setKey('F', m_leftGripDown, m_prevGrip);
         setKey('G', m_rightGripDown && !vehicleMode, m_prevGrenade);
         setKey(VK_LSHIFT, left.thumbstickClick && !suppressStickClicks, m_prevSprint);

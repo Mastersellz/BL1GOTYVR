@@ -135,6 +135,7 @@ private:
     int m_prevGrip = 0, m_prevW = 0, m_prevA = 0, m_prevS = 0, m_prevD = 0;
     int m_prevSprint = 0, m_prevJump = 0, m_prevMelee = 0;
     int m_prevCrouch = 0, m_prevUse = 0, m_prevReload = 0;
+    int m_buttonXPurpose = 0;
     int m_prevGrenade = 0, m_prevMenu = 0, m_prevEcho = 0;
     int m_prevDpadUp = 0, m_prevDpadDown = 0;
     int m_prevDpadLeft = 0, m_prevDpadRight = 0;

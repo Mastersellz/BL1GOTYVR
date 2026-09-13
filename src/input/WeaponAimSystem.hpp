@@ -184,6 +184,17 @@ private:
     std::atomic<uintptr_t> m_sampledTouchedObject{0};
     std::atomic<uintptr_t> m_sampledSeenObject{0};
     std::atomic<uintptr_t> m_sampledUsableObject{0};
+
+public:
+    // True while the game has a usable object or a nearby pickup focus. Used to
+    // route the shared X button to use/pickup instead of reload.
+    bool HasInteractionFocus() const {
+        return m_sampledUsableObject.load(std::memory_order_acquire) != 0 ||
+            m_sampledTouchedObject.load(std::memory_order_acquire) != 0 ||
+            m_sampledSeenObject.load(std::memory_order_acquire) != 0;
+    }
+
+private:
     std::atomic<uintptr_t> m_sampledInteractionClient{0};
     std::atomic<uintptr_t> m_sampledInteractionsData{0};
     std::atomic<int32_t> m_sampledInteractionsCount{-1};
