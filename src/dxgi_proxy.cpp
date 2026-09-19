@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <dxgi.h>
 
+#include <cstdio>
 #include <cwchar>
 
 extern "C" {
@@ -36,6 +37,26 @@ void ProxyLog(const wchar_t* message) {
     OutputDebugStringW(L"[BL1GOTYVR Proxy] ");
     OutputDebugStringW(message);
     OutputDebugStringW(L"\n");
+
+    // Mirror to a file next to the proxy so chain decisions are diagnosable
+    // without a debugger attached.
+    wchar_t logPath[MAX_PATH] = {};
+    if (s_proxyModule && GetModuleFileNameW(s_proxyModule, logPath, MAX_PATH)) {
+        wchar_t* filename = wcsrchr(logPath, L'\\');
+        if (filename &&
+            swprintf_s(filename + 1,
+                       MAX_PATH - static_cast<size_t>(filename + 1 - logPath),
+                       L"BL1GOTYVR.proxy.log") >= 0) {
+            FILE* file = nullptr;
+            if (_wfopen_s(&file, logPath, L"a, ccs=UTF-8") == 0 && file) {
+                SYSTEMTIME time = {};
+                GetLocalTime(&time);
+                fwprintf(file, L"[%02u:%02u:%02u.%03u] %s\n", time.wHour,
+                         time.wMinute, time.wSecond, time.wMilliseconds, message);
+                fclose(file);
+            }
+        }
+    }
 }
 
 bool SyncGameResolution() {
@@ -83,39 +104,163 @@ bool SyncGameResolution() {
     return updated;
 }
 
+struct ForwardExport {
+    const char* name;
+    FARPROC* slot;
+};
+
+// Every DXGI export this proxy forwards. The forward target is either the
+// System32 dxgi.dll or, when present, a mods\ proxy (ReShade/Luma) so both
+// loaders coexist: the game sees one dxgi.dll and the chain forwards in order.
+const ForwardExport kForwardExports[] = {
+    {"ApplyCompatResolutionQuirking", &g_real_ApplyCompatResolutionQuirking},
+    {"CompatString", &g_real_CompatString},
+    {"CompatValue", &g_real_CompatValue},
+    {"DXGIDumpJournal", &g_real_DXGIDumpJournal},
+    {"PIXBeginCapture", &g_real_PIXBeginCapture},
+    {"PIXEndCapture", &g_real_PIXEndCapture},
+    {"PIXGetCaptureState", &g_real_PIXGetCaptureState},
+    {"SetAppCompatStringPointer", &g_real_SetAppCompatStringPointer},
+    {"UpdateHMDEmulationStatus", &g_real_UpdateHMDEmulationStatus},
+    {"CreateDXGIFactory", &g_real_CreateDXGIFactory},
+    {"CreateDXGIFactory1", &g_real_CreateDXGIFactory1},
+    {"CreateDXGIFactory2", &g_real_CreateDXGIFactory2},
+    {"DXGID3D10CreateDevice", &g_real_DXGID3D10CreateDevice},
+    {"DXGID3D10CreateLayeredDevice", &g_real_DXGID3D10CreateLayeredDevice},
+    {"DXGID3D10GetLayeredDeviceSize", &g_real_DXGID3D10GetLayeredDeviceSize},
+    {"DXGID3D10RegisterLayers", &g_real_DXGID3D10RegisterLayers},
+    {"DXGIDeclareAdapterRemovalSupport", &g_real_DXGIDeclareAdapterRemovalSupport},
+    {"DXGIDisableVBlankVirtualization", &g_real_DXGIDisableVBlankVirtualization},
+    {"DXGIGetDebugInterface1", &g_real_DXGIGetDebugInterface1},
+    {"DXGIReportAdapterConfiguration", &g_real_DXGIReportAdapterConfiguration},
+};
+
+HMODULE s_forwardModule = nullptr;
+HMODULE s_systemModule = nullptr;
+
+void ProxyLogJoined(const wchar_t* prefix, const wchar_t* path) {
+    wchar_t buffer[MAX_PATH * 2] = {};
+    if (swprintf_s(buffer, L"%s%s", prefix, path) >= 0) ProxyLog(buffer);
+}
+
+bool BuildProxyRelativePath(wchar_t (&path)[MAX_PATH], const wchar_t* relative) {
+    if (!GetModuleFileNameW(s_proxyModule, path, MAX_PATH)) return false;
+    wchar_t* filename = wcsrchr(path, L'\\');
+    if (!filename) return false;
+    return swprintf_s(filename + 1, MAX_PATH - static_cast<size_t>(filename + 1 - path),
+                      relative) >= 0;
+}
+
+// Resolves the forward table, preferring `chainPath` per export and falling
+// back to the System32 module for any export the chain does not provide.
+// Chain proxies (ReShade/Luma) export only what they need, so requiring the
+// full table used to unload them mid-startup. Only if a core factory export
+// is missing is the chain dropped entirely.
+bool ResolveForwardTable(const wchar_t* chainPath, const wchar_t* systemPath) {
+    HMODULE system = LoadLibraryW(systemPath);
+    if (!system || system == s_proxyModule) {
+        if (system) FreeLibrary(system);
+        return false;
+    }
+
+    HMODULE chain = nullptr;
+    if (chainPath) {
+        chain = LoadLibraryW(chainPath);
+        if (chain == s_proxyModule) chain = nullptr;
+        if (chain) {
+            constexpr const char* kCoreExports[] = {
+                "CreateDXGIFactory", "CreateDXGIFactory1", "CreateDXGIFactory2"};
+            for (const char* core : kCoreExports) {
+                if (!GetProcAddress(chain, core)) {
+                    ProxyLog(L"Chain proxy lacks a core factory export; dropping it");
+                    FreeLibrary(chain);
+                    chain = nullptr;
+                    break;
+                }
+            }
+        }
+    }
+
+    FARPROC resolved[_countof(kForwardExports)] = {};
+    size_t chainProvided = 0;
+    for (size_t index = 0; index < _countof(kForwardExports); ++index) {
+        FARPROC proc = chain ? GetProcAddress(chain, kForwardExports[index].name)
+                             : nullptr;
+        if (proc) {
+            ++chainProvided;
+        } else {
+            proc = GetProcAddress(system, kForwardExports[index].name);
+        }
+        if (!proc) {
+            if (chain) FreeLibrary(chain);
+            FreeLibrary(system);
+            return false;
+        }
+        resolved[index] = proc;
+    }
+    for (size_t index = 0; index < _countof(kForwardExports); ++index)
+        *kForwardExports[index].slot = resolved[index];
+
+    s_forwardModule = chain ? chain : system;
+    s_systemModule = system;
+    if (chain) {
+        wchar_t counts[96] = {};
+        swprintf_s(counts, L"Chain proxy provided %zu of %zu exports",
+                   chainProvided, _countof(kForwardExports));
+        ProxyLog(counts);
+    }
+    return true;
+}
+
+bool TryChainModsProxy(const wchar_t* relative, const wchar_t* systemPath) {
+    wchar_t path[MAX_PATH] = {};
+    if (!BuildProxyRelativePath(path, relative)) return false;
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return false;
+    if (!ResolveForwardTable(path, systemPath)) {
+        ProxyLogJoined(L"Chain candidate unusable, ignoring: ", path);
+        return false;
+    }
+    ProxyLogJoined(L"Chained DXGI forwarding through ", path);
+    return true;
+}
+
 bool ResolveRealDxgi() {
+    // Optional chain: when a ReShade/Luma proxy sits in mods\, forward through
+    // it so it initializes as if it were the root dxgi.dll. Controlled by
+    // [Compat] ChainProxy in BL1GOTYVR.ini: auto (default) | kuma | reshade | none.
+    wchar_t preference[32] = {};
+    wchar_t iniPath[MAX_PATH] = {};
+    if (BuildProxyRelativePath(iniPath, L"BL1GOTYVR.ini"))
+        GetPrivateProfileStringW(L"Compat", L"ChainProxy", L"auto", preference,
+                                 _countof(preference), iniPath);
+
     wchar_t systemDirectory[MAX_PATH] = {};
     if (!GetSystemDirectoryW(systemDirectory, MAX_PATH)) return false;
+    wchar_t systemPath[MAX_PATH] = {};
+    if (swprintf_s(systemPath, L"%s\\dxgi.dll", systemDirectory) < 0) return false;
 
-    wchar_t path[MAX_PATH] = {};
-    if (swprintf_s(path, L"%s\\dxgi.dll", systemDirectory) < 0) return false;
-    HMODULE realDxgi = LoadLibraryW(path);
-    if (!realDxgi || realDxgi == s_proxyModule) return false;
+    const bool disabled = _wcsicmp(preference, L"none") == 0;
+    const bool preferReshade = _wcsicmp(preference, L"reshade") == 0;
+    const bool preferKuma = _wcsicmp(preference, L"kuma") == 0;
+    const bool automatic = !disabled && !preferReshade && !preferKuma;
+    if (!disabled) {
+        // Kuma/Luma first, then the ReShade layouts (reshade-shaders is the
+        // folder ReShade finds its own ReShade.ini and presets in).
+        const wchar_t* kumaPath = L"mods\\kuma\\dxgi.dll";
+        const wchar_t* reshadeShadersPath = L"mods\\reshade-shaders\\dxgi.dll";
+        const wchar_t* reshadePath = L"mods\\reshade\\dxgi.dll";
+        if (preferReshade) {
+            if (TryChainModsProxy(reshadeShadersPath, systemPath)) return true;
+            if (TryChainModsProxy(reshadePath, systemPath)) return true;
+        } else {
+            if (TryChainModsProxy(kumaPath, systemPath)) return true;
+            if (automatic && TryChainModsProxy(reshadeShadersPath, systemPath)) return true;
+            if (automatic && TryChainModsProxy(reshadePath, systemPath)) return true;
+        }
+    }
 
-#define RESOLVE_DXGI(name) \
-    g_real_##name = GetProcAddress(realDxgi, #name); \
-    if (!g_real_##name) return false
-    RESOLVE_DXGI(ApplyCompatResolutionQuirking);
-    RESOLVE_DXGI(CompatString);
-    RESOLVE_DXGI(CompatValue);
-    RESOLVE_DXGI(DXGIDumpJournal);
-    RESOLVE_DXGI(PIXBeginCapture);
-    RESOLVE_DXGI(PIXEndCapture);
-    RESOLVE_DXGI(PIXGetCaptureState);
-    RESOLVE_DXGI(SetAppCompatStringPointer);
-    RESOLVE_DXGI(UpdateHMDEmulationStatus);
-    RESOLVE_DXGI(CreateDXGIFactory);
-    RESOLVE_DXGI(CreateDXGIFactory1);
-    RESOLVE_DXGI(CreateDXGIFactory2);
-    RESOLVE_DXGI(DXGID3D10CreateDevice);
-    RESOLVE_DXGI(DXGID3D10CreateLayeredDevice);
-    RESOLVE_DXGI(DXGID3D10GetLayeredDeviceSize);
-    RESOLVE_DXGI(DXGID3D10RegisterLayers);
-    RESOLVE_DXGI(DXGIDeclareAdapterRemovalSupport);
-    RESOLVE_DXGI(DXGIDisableVBlankVirtualization);
-    RESOLVE_DXGI(DXGIGetDebugInterface1);
-    RESOLVE_DXGI(DXGIReportAdapterConfiguration);
-#undef RESOLVE_DXGI
+    if (!ResolveForwardTable(nullptr, systemPath)) return false;
+    ProxyLogJoined(L"Forwarding DXGI to ", systemPath);
     return true;
 }
 
@@ -158,6 +303,17 @@ void EnsureModLoaded() {
 }
 
 } // namespace
+
+// Lets the loaded mod create its temporary probe swapchain through the SYSTEM
+// dxgi instead of a chained ReShade/Luma proxy. Creating it through a chain
+// proxy installs that proxy's Present wrapper in the probe's vtable, which
+// made the mod hook the proxy wrapper (outermost) and capture frames before
+// the post-processing pass. With the real present, the proxy wrapper stays
+// outermost and the mod captures the already processed image.
+extern "C" __declspec(dllexport) FARPROC WINAPI BL1GOTYVR_GetSystemDxgiProc(const char* name) {
+    if (!name || !s_systemModule) return nullptr;
+    return GetProcAddress(s_systemModule, name);
+}
 
 extern "C" HRESULT WINAPI Proxy_CreateDXGIFactory(REFIID riid, void** factory) {
     EnsureModLoaded();

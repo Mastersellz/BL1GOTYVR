@@ -144,6 +144,22 @@ void Load(const char* path) {
         ReadFloat("HUD", "Scale", s_settings.hud_scale, path), 0.25f, 2.0f);
     s_settings.hud_opacity = std::clamp(
         ReadFloat("HUD", "Opacity", s_settings.hud_opacity, path), 0.0f, 1.0f);
+
+    /* Native post-processing (blit shader) */
+    s_settings.postfx_enabled = GetPrivateProfileIntA(
+        "PostFx", "Enabled", s_settings.postfx_enabled ? 1 : 0, path) != 0;
+    s_settings.postfx_fsr = GetPrivateProfileIntA(
+        "PostFx", "FsrUpscale", s_settings.postfx_fsr ? 1 : 0, path) != 0;
+    s_settings.postfx_sharpen = std::clamp(
+        ReadFloat("PostFx", "Sharpen", s_settings.postfx_sharpen, path), 0.0f, 1.0f);
+    s_settings.postfx_contrast = std::clamp(
+        ReadFloat("PostFx", "Contrast", s_settings.postfx_contrast, path), 0.5f, 2.0f);
+    s_settings.postfx_saturation = std::clamp(
+        ReadFloat("PostFx", "Saturation", s_settings.postfx_saturation, path), 0.0f, 2.0f);
+    s_settings.postfx_brightness = std::clamp(
+        ReadFloat("PostFx", "Brightness", s_settings.postfx_brightness, path), -0.5f, 0.5f);
+    s_settings.postfx_gamma = std::clamp(
+        ReadFloat("PostFx", "Gamma", s_settings.postfx_gamma, path), 0.5f, 2.0f);
     s_settings.hud_horizontal_offset = std::clamp(
         ReadFloat("HUD", "HorizontalOffset", s_settings.hud_horizontal_offset, path), -2.0f, 2.0f);
     s_settings.hud_vertical_offset = std::clamp(
@@ -270,18 +286,25 @@ void Load(const char* path) {
     s_settings.vanilla_hands_filter = GetPrivateProfileIntA(
         "Visibility", "VanillaHandsFilter",
         s_settings.vanilla_hands_filter ? 1 : 0, path) != 0;
-    s_settings.vanilla_hands_cut_threshold = std::clamp(ReadFloat(
+    const float cutThresholdValue = ReadFloat(
         "Visibility", "VanillaHandsCutThreshold",
-        s_settings.vanilla_hands_cut_threshold, path), 20.0f, 90.0f);
+        s_settings.vanilla_hands_cut_threshold, path);
+    if (cutThresholdValue < 20.0f || cutThresholdValue > 90.0f) {
+        s_settings.vanilla_hands_cut_threshold = 70.0f;
+        Log("[Config] VanillaHandsCutThreshold=%.2f is outside 20-90; using 70.0",
+            cutThresholdValue);
+    } else {
+        s_settings.vanilla_hands_cut_threshold = cutThresholdValue;
+    }
 
     Log("[Config] Loaded %s: %dx%d scale=%.2f FOV=%.1f IPD=%.1fmm "
-        "convergenceShift=%.2f%% refresh=%.1fHz SFR=%s aim=(%.2f,%.2f) dot=%.1fm",
+        "convergenceShift=%.2f%% refresh=%.1fHz SFR=%s aim=(%.2f,%.2f) dot=%.1fm cut=%.1f",
         path, s_settings.render_width, s_settings.render_height, s_settings.resolution_scale,
         s_settings.fov_degrees, s_settings.ipd_mm, s_settings.convergence_m,
         s_settings.openxr_refresh_rate_hz,
         s_settings.same_frame_stereo_requested ? "requested" : "off",
         s_settings.aim_pitch_degrees, s_settings.aim_yaw_degrees,
-        s_settings.dot_distance_m);
+        s_settings.dot_distance_m, s_settings.vanilla_hands_cut_threshold);
     WIN32_FILE_ATTRIBUTE_DATA attributes = {};
     if (GetFileAttributesExA(path, GetFileExInfoStandard, &attributes))
         s_lastWriteTime = attributes.ftLastWriteTime;
@@ -335,6 +358,17 @@ void Save(const char* path) {
     WriteFloat("HUD", "Distance", s_settings.hud_distance, path);
     WriteFloat("HUD", "WidthDegrees", s_settings.hud_width_degrees, path);
     WriteFloat("HUD", "Scale", s_settings.hud_scale, path);
+
+    /* Native post-processing (blit shader) */
+    WritePrivateProfileStringA("PostFx", "Enabled",
+        s_settings.postfx_enabled ? "1" : "0", path);
+    WritePrivateProfileStringA("PostFx", "FsrUpscale",
+        s_settings.postfx_fsr ? "1" : "0", path);
+    WriteFloat("PostFx", "Sharpen", s_settings.postfx_sharpen, path);
+    WriteFloat("PostFx", "Contrast", s_settings.postfx_contrast, path);
+    WriteFloat("PostFx", "Saturation", s_settings.postfx_saturation, path);
+    WriteFloat("PostFx", "Brightness", s_settings.postfx_brightness, path);
+    WriteFloat("PostFx", "Gamma", s_settings.postfx_gamma, path);
     WriteFloat("HUD", "Opacity", s_settings.hud_opacity, path);
     WriteFloat("HUD", "HorizontalOffset", s_settings.hud_horizontal_offset, path);
     WriteFloat("HUD", "VerticalOffset", s_settings.hud_vertical_offset, path);

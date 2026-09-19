@@ -32,6 +32,15 @@ struct Settings {
     float hud_distance = 2.0f;
     float hud_width_degrees = 80.0f;
     float hud_scale = 1.0f;
+
+    /* Native post-processing applied in the per-eye blit shader. */
+    bool postfx_enabled = false;
+    bool postfx_fsr = true;
+    float postfx_sharpen = 0.35f;
+    float postfx_contrast = 1.0f;
+    float postfx_saturation = 1.0f;
+    float postfx_brightness = 0.0f;
+    float postfx_gamma = 1.0f;
     float hud_opacity = 1.0f;
 float hud_horizontal_offset = 0.0f;
     float hud_vertical_offset = -0.35f;

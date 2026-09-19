@@ -20,6 +20,8 @@ constexpr int kDotCheck = 206;
 constexpr int kHmdDirectionCheck = 207;
 constexpr int kPhysicalCrouchCheck = 208;
 constexpr int kLockWillowEngineCheck = 209;
+constexpr int kPostFxCheck = 220;
+constexpr int kFsrCheck = 221;
 constexpr int kLowPreset = 210;
 constexpr int kMediumPreset = 211;
 constexpr int kHighPreset = 212;
@@ -37,7 +39,7 @@ struct Field {
     bool integer;
 };
 
-constexpr std::array<Field, 18> kFields = {{
+constexpr std::array<Field, 23> kFields = {{
     {101, "Render width", "Display", "Width", "2048", 640.0f, 7680.0f, true},
     {102, "Render height", "Display", "Height", "2048", 480.0f, 4320.0f, true},
     {103, "Resolution scale", "Display", "ResolutionScale", "1.00", 0.5f, 2.0f, false},
@@ -56,6 +58,11 @@ constexpr std::array<Field, 18> kFields = {{
     {116, "HUD size", "HUD", "Scale", "1.00", 0.25f, 2.0f, false},
     {117, "HUD width (deg)", "HUD", "WidthDegrees", "80.0", 10.0f, 150.0f, false},
     {118, "HUD distance (m)", "HUD", "Distance", "2.00", 0.5f, 10.0f, false},
+    {120, "Post FX sharpen", "PostFx", "Sharpen", "0.35", 0.0f, 1.0f, false},
+    {121, "Post FX contrast", "PostFx", "Contrast", "1.00", 0.5f, 2.0f, false},
+    {122, "Post FX saturation", "PostFx", "Saturation", "1.00", 0.0f, 2.0f, false},
+    {123, "Post FX brightness", "PostFx", "Brightness", "0.00", -0.5f, 0.5f, false},
+    {124, "Post FX gamma", "PostFx", "Gamma", "1.00", 0.5f, 2.0f, false},
 }};
 
 struct RenderPreset {
@@ -94,6 +101,8 @@ void SetDefaults(HWND window) {
     CheckDlgButton(window, kHmdDirectionCheck, BST_UNCHECKED);
     CheckDlgButton(window, kPhysicalCrouchCheck, BST_CHECKED);
     CheckDlgButton(window, kLockWillowEngineCheck, BST_CHECKED);
+    CheckDlgButton(window, kPostFxCheck, BST_UNCHECKED);
+    CheckDlgButton(window, kFsrCheck, BST_CHECKED);
 }
 
 void ApplyRenderPreset(HWND window, int id) {
@@ -131,6 +140,12 @@ void LoadSettings(HWND window) {
             ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(window, kLockWillowEngineCheck,
         GetPrivateProfileIntA("Configurator", "LockWillowEngineIni", 1, path.c_str())
+            ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(window, kPostFxCheck,
+        GetPrivateProfileIntA("PostFx", "Enabled", 0, path.c_str())
+            ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(window, kFsrCheck,
+        GetPrivateProfileIntA("PostFx", "FsrUpscale", 1, path.c_str())
             ? BST_CHECKED : BST_UNCHECKED);
 }
 
@@ -288,7 +303,33 @@ void SaveSettings(HWND window) {
     WritePrivateProfileStringA("Input", "PhysicalCrouch",
         IsDlgButtonChecked(window, kPhysicalCrouchCheck) == BST_CHECKED ? "1" : "0",
         path.c_str());
-
+    // Post-processing values imply intent: enabling the effect when any value
+    // is non-neutral avoids saving a tuned preset that silently does nothing
+    // (the checkbox stays a hard off-switch only when everything is neutral).
+    char postFxValues[5][32] = {};
+    GetDlgItemTextA(window, 120, postFxValues[0], sizeof(postFxValues[0]));
+    GetDlgItemTextA(window, 121, postFxValues[1], sizeof(postFxValues[1]));
+    GetDlgItemTextA(window, 122, postFxValues[2], sizeof(postFxValues[2]));
+    GetDlgItemTextA(window, 123, postFxValues[3], sizeof(postFxValues[3]));
+    GetDlgItemTextA(window, 124, postFxValues[4], sizeof(postFxValues[4]));
+    const float postFxSharpen = strtof(postFxValues[0], nullptr);
+    const float postFxContrast = strtof(postFxValues[1], nullptr);
+    const float postFxSaturation = strtof(postFxValues[2], nullptr);
+    const float postFxBrightness = strtof(postFxValues[3], nullptr);
+    const float postFxGamma = strtof(postFxValues[4], nullptr);
+    const bool postFxValuesActive = postFxSharpen > 0.001f ||
+        std::fabs(postFxContrast - 1.0f) > 0.001f ||
+        std::fabs(postFxSaturation - 1.0f) > 0.001f ||
+        std::fabs(postFxBrightness) > 0.001f ||
+        std::fabs(postFxGamma - 1.0f) > 0.001f;
+    const bool postFxEnabled = postFxValuesActive ||
+        IsDlgButtonChecked(window, kPostFxCheck) == BST_CHECKED;
+    WritePrivateProfileStringA("PostFx", "Enabled",
+        postFxEnabled ? "1" : "0", path.c_str());
+    CheckDlgButton(window, kPostFxCheck, postFxEnabled ? BST_CHECKED : BST_UNCHECKED);
+    WritePrivateProfileStringA("PostFx", "FsrUpscale",
+        IsDlgButtonChecked(window, kFsrCheck) == BST_CHECKED ? "1" : "0",
+        path.c_str());
     const bool lockWillowEngine =
         IsDlgButtonChecked(window, kLockWillowEngineCheck) == BST_CHECKED;
     WritePrivateProfileStringA("Configurator", "LockWillowEngineIni",
@@ -337,13 +378,18 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
 
         for (size_t i = 0; i < kFields.size(); ++i) {
-            const bool lowerGroup = i >= 6;
-            const bool rightColumn = i >= 9;
-            const int localIndex = lowerGroup
-                ? (rightColumn ? static_cast<int>(i) - 9 : static_cast<int>(i) - 6)
-                : static_cast<int>(i);
-            const int x = rightColumn ? 274 : 34;
-            const int y = lowerGroup ? 322 + localIndex * 32 : 78 + localIndex * 32;
+            int x = 34;
+            int y = 78 + static_cast<int>(i) * 32;
+            if (i >= 18) {
+                const int postIndex = static_cast<int>(i) - 18;
+                x = (postIndex / 3) ? 274 : 34;
+                y = 646 + (postIndex % 3) * 32;
+            } else if (i >= 9) {
+                x = 274;
+                y = 322 + (static_cast<int>(i) - 9) * 32;
+            } else if (i >= 6) {
+                y = 322 + (static_cast<int>(i) - 6) * 32;
+            }
             CreateLabel(window, kFields[i].label, x, y, 128);
             CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
                             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL |
@@ -353,24 +399,29 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                             nullptr, nullptr);
         }
 
-        CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 628);
-        CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 628);
-        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 658);
-        CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 658);
-        CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 688);
-        CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 688);
-        CreateCheckbox(window, "Physical crouch", kPhysicalCrouchCheck, 274, 718);
+        CreateWindowExA(0, "BUTTON", "Post-processing (native)", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                        16, 616, 500, 136, window, nullptr, nullptr, nullptr);
+        CreateCheckbox(window, "Post FX enabled", kPostFxCheck, 34, 724);
+        CreateCheckbox(window, "FSR1 upscale", kFsrCheck, 274, 724);
+
+        CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 772);
+        CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 772);
+        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 802);
+        CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 802);
+        CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 832);
+        CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 832);
+        CreateCheckbox(window, "Physical crouch", kPhysicalCrouchCheck, 274, 862);
         CreateCheckbox(window, "Lock WillowEngine.ini (read-only)", kLockWillowEngineCheck,
-                       34, 718, 238);
+                       34, 862, 238);
 
         CreateWindowExA(0, "BUTTON", "Save settings", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                        154, 736, 110, 34, window,
+                        154, 890, 110, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveButton)), nullptr, nullptr);
         CreateWindowExA(0, "BUTTON", "Defaults", WS_CHILD | WS_VISIBLE,
-                        278, 736, 100, 34, window,
+                        278, 890, 100, 34, window,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultsButton)), nullptr, nullptr);
         CreateLabel(window, "Convergence 10 = recommended; 0 = parallel. Applies live after Save.",
-                    66, 782, 430);
+                    66, 936, 430);
         LoadSettings(window);
         return 0;
     }
@@ -402,7 +453,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
 
     HWND window = CreateWindowExA(0, windowClass.lpszClassName, "Borderlands GOTY Enhanced VR Config",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 550, 858, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 550, 1006, nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
     ShowWindow(window, showCommand);
     UpdateWindow(window);

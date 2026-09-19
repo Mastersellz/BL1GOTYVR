@@ -73,6 +73,7 @@ add_library(BL1GOTYVR SHARED
     src/stereo/EyeManager.cpp
     src/xr/OpenXRContext.cpp
     src/xr/FrameLoop.cpp
+    src/xr/ReShadeFrameBridge.cpp
     src/input/InputHook.cpp
     src/input/XRInput.cpp
     src/input/XInputBridge.cpp
@@ -129,3 +130,16 @@ if(BL1GOTYVR_BUILD_RENDER_TESTS)
     target_link_libraries(hud_render_tests PRIVATE d3d11 dxgi d3dcompiler)
     add_test(NAME hud_render_tests COMMAND hud_render_tests)
 endif()
+
+# ReShade add-on that publishes the post-effect back buffer for the VR
+# capture path (loaded by ReShade from its folder as a *.addon).
+add_library(bl1gotyvr_reshade_capture SHARED
+    tools/reshade_capture/addon.cpp)
+target_include_directories(bl1gotyvr_reshade_capture PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/reshade-addon/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(bl1gotyvr_reshade_capture PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(bl1gotyvr_reshade_capture PRIVATE d3d11)
+set_target_properties(bl1gotyvr_reshade_capture PROPERTIES
+    OUTPUT_NAME "BL1GOTYVR_ReShadeCapture")

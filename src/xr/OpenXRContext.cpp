@@ -1609,6 +1609,17 @@ bool OpenXRContext::EndFrame(bool submitProjectionLayer,
                 reticleLayer.subImage.imageArrayIndex = 0;
                 reticleLayer.pose = m_reticlePose;
                 reticleLayer.size = {m_reticleSize, m_reticleSize};
+                {
+                    static std::atomic<uint64_t> reticleProbe{0};
+                    if ((reticleProbe.fetch_add(1, std::memory_order_relaxed) % 600) == 0) {
+                        Log("[ReticleProbe] pos=(%.3f,%.3f,%.3f) size=%.4fm "
+                            "q=(%.3f,%.3f,%.3f,%.3f)",
+                            m_reticlePose.position.x, m_reticlePose.position.y,
+                            m_reticlePose.position.z, m_reticleSize,
+                            m_reticlePose.orientation.x, m_reticlePose.orientation.y,
+                            m_reticlePose.orientation.z, m_reticlePose.orientation.w);
+                    }
+                }
                 layers[endInfo.layerCount++] =
                     reinterpret_cast<const XrCompositionLayerBaseHeader*>(
                         &reticleLayer);

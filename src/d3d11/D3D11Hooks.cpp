@@ -1365,9 +1365,57 @@ static bool IsDesktopTestForced() {
         value[0] != '0';
 }
 
+// Present-chain diagnostics: names the module that owns an address so the log
+// can show whether a chained post-processing proxy (ReShade/Luma) sits before
+// or after our Present hook.
+static const char* DescribeModuleForAddress(const void* address, char* storage,
+                                            size_t storageSize) {
+    if (storage && storageSize) storage[0] = '\0';
+    if (!address || !storage || !storageSize) return storage ? storage : "";
+    HMODULE owner = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(address), &owner) || !owner)
+        return storage;
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(owner, path, MAX_PATH)) return storage;
+    const char* name = strrchr(path, '\\');
+    name = name ? name + 1 : path;
+    // Both a mods\ post-processing proxy and the system DXGI are named
+    // "dxgi.dll"; mark modules loaded from the mods tree so the log shows
+    // where the chain sits.
+    if (strstr(path, "\\mods\\"))
+        _snprintf_s(storage, storageSize, _TRUNCATE, "mods:%s", name);
+    else
+        strncpy_s(storage, storageSize, name, _TRUNCATE);
+    return storage;
+}
+
+__declspec(noinline) static void* CapturePresentCallerAddress() {
+    return _ReturnAddress();
+}
+
+static void* s_presentEntryTarget = nullptr;
+
 static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT flags) {
     const bool forceDesktopTest = IsDesktopTestForced();
     s_insidePresent = true;
+    static uint64_t presentChainProbe = 0;
+    if ((++presentChainProbe % 300) == 1 && sc) {
+        void** swapVtable = *reinterpret_cast<void***>(sc);
+        const void* entry = swapVtable ? swapVtable[8] : nullptr;
+        char callerModule[64] = {};
+        char entryModule[64] = {};
+        char trampolineModule[64] = {};
+        Log("[PresentChain] caller=%s entry=%s(%p) ownTarget=%p trampoline=%s(%p)",
+            DescribeModuleForAddress(CapturePresentCallerAddress(), callerModule,
+                                     sizeof(callerModule)),
+            DescribeModuleForAddress(entry, entryModule, sizeof(entryModule)), entry,
+            s_presentEntryTarget,
+            DescribeModuleForAddress(reinterpret_cast<void*>(oPresent), trampolineModule,
+                                     sizeof(trampolineModule)),
+            reinterpret_cast<void*>(oPresent));
+    }
     __try {
         SwapChainObservation* observation = nullptr;
         for (auto& current : s_observations) {
@@ -1420,7 +1468,15 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
             config::Get().vanilla_hands_filter &&
                 s_handGeometryHooksReady.load(std::memory_order_acquire),
             std::memory_order_release);
-        const float cutThreshold = config::Get().vanilla_hands_cut_threshold;
+        float cutThreshold = config::Get().vanilla_hands_cut_threshold;
+        if (cutThreshold < 20.0f || cutThreshold > 90.0f) {
+            static std::atomic<uint64_t> rejectedCutThreshold{0};
+            if (rejectedCutThreshold.fetch_add(1, std::memory_order_relaxed) == 0) {
+                Log("[VanillaHands] Ignoring out-of-range cut threshold %.2f "
+                    "(valid 20-90); using 70.0", cutThreshold);
+            }
+            cutThreshold = 70.0f;
+        }
         const float previousCutThreshold = s_vanillaHandsCutThreshold.exchange(
             cutThreshold, std::memory_order_acq_rel);
         if (std::fabs(previousCutThreshold - cutThreshold) > 0.01f) {
@@ -1635,14 +1691,85 @@ bool InstallHooks() {
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     D3D_FEATURE_LEVEL featureLevel = {};
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        nullptr, 0, D3D11_SDK_VERSION, &desc, &swapChain, &device, &featureLevel, &context);
-    if (FAILED(hr)) {
-        Log("[BL1GOTYVR] Hardware temp swapchain failed: 0x%08X; trying WARP", hr);
-        hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
-            nullptr, 0, D3D11_SDK_VERSION, &desc, &swapChain, &device, &featureLevel, &context);
+    HRESULT hr = E_FAIL;
+    // Prefer creating the probe swapchain through the system DXGI factory the
+    // root proxy exposes. A chained post-processing proxy (ReShade/Luma) wraps
+    // any swapchain created through its own wrappers; hooking that wrapper
+    // would make our Present hook run BEFORE the post-processing pass and the
+    // captured VR image would miss the effects. The system factory keeps the
+    // probe vtable clean, so our hook wraps the real present instead.
+    bool probeCreated = false;
+    {
+        HMODULE proxy = GetModuleHandleA("dxgi.dll");
+        using GetSystemProcFn = FARPROC(WINAPI*)(const char*);
+        auto getSystemProc = proxy ? reinterpret_cast<GetSystemProcFn>(
+            GetProcAddress(proxy, "BL1GOTYVR_GetSystemDxgiProc")) : nullptr;
+        FARPROC systemFactory = getSystemProc ? getSystemProc("CreateDXGIFactory1") : nullptr;
+        FARPROC systemFactory2 = getSystemProc ? getSystemProc("CreateDXGIFactory2") : nullptr;
+        using CreateFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);
+        using CreateFactory2Fn = HRESULT(WINAPI*)(UINT, REFIID, void**);
+        IDXGIFactory1* factory = nullptr;
+        if (systemFactory &&
+            SUCCEEDED(reinterpret_cast<CreateFactory1Fn>(systemFactory)(
+                __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory) {
+            const HRESULT deviceResult = D3D11CreateDevice(nullptr,
+                D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                D3D11_SDK_VERSION, &device, &featureLevel, &context);
+            if (SUCCEEDED(deviceResult) && device && context) {
+                // Prefer the ForHwnd creation path: chained proxies hook the
+                // plain CreateSwapChain, so a swapchain created there already
+                // carries their Present wrapper. ForHwnd usually stays clean,
+                // which exposes the real Present implementation for our hook.
+                IDXGIFactory2* factory2 = nullptr;
+                if (systemFactory2 &&
+                    SUCCEEDED(factory->QueryInterface(
+                        __uuidof(IDXGIFactory2), reinterpret_cast<void**>(&factory2))) && factory2) {
+                    DXGI_SWAP_CHAIN_DESC1 desc1 = {};
+                    desc1.Width = desc.BufferDesc.Width;
+                    desc1.Height = desc.BufferDesc.Height;
+                    desc1.Format = desc.BufferDesc.Format;
+                    desc1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                    desc1.BufferCount = desc.BufferCount;
+                    desc1.SampleDesc.Count = 1;
+                    desc1.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+                    IDXGISwapChain1* swapChain1 = nullptr;
+                    if (SUCCEEDED(factory2->CreateSwapChainForHwnd(
+                            device, window, &desc1, nullptr, nullptr, &swapChain1)) && swapChain1) {
+                        swapChain = swapChain1;
+                        probeCreated = true;
+                        Log("[BL1GOTYVR] Probe swapchain created via CreateSwapChainForHwnd");
+                    }
+                    factory2->Release();
+                }
+                if (!probeCreated) {
+                    DXGI_SWAP_CHAIN_DESC swapDesc = desc;
+                    if (SUCCEEDED(factory->CreateSwapChain(device, &swapDesc, &swapChain)) &&
+                        swapChain) {
+                        probeCreated = true;
+                        Log("[BL1GOTYVR] Probe swapchain created through the system DXGI factory");
+                    }
+                }
+                if (!probeCreated) {
+                    context->Release(); context = nullptr;
+                    device->Release(); device = nullptr;
+                }
+            }
+            factory->Release();
+        }
     }
-    if (FAILED(hr) || !swapChain) {
+    if (!probeCreated) {
+        hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+            nullptr, 0, D3D11_SDK_VERSION, &desc, &swapChain, &device, &featureLevel, &context);
+        if (FAILED(hr)) {
+            Log("[BL1GOTYVR] Hardware temp swapchain failed: 0x%08X; trying WARP", hr);
+            hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
+                nullptr, 0, D3D11_SDK_VERSION, &desc, &swapChain, &device, &featureLevel, &context);
+        }
+        if (SUCCEEDED(hr) && swapChain) {
+            probeCreated = true;
+        }
+    }
+    if (!probeCreated || !swapChain) {
         Log("[BL1GOTYVR] ERROR: Temporary D3D11 swapchain creation failed: 0x%08X", hr);
         if (context) context->Release();
         if (device) device->Release();
@@ -1654,6 +1781,7 @@ bool InstallHooks() {
     void** vtable = *reinterpret_cast<void***>(swapChain);
     void** contextVtable = *reinterpret_cast<void***>(context);
     void* presentTarget = vtable[8];
+    s_presentEntryTarget = presentTarget;
     void* resizeTarget = vtable[13];
     void* copyResourceTarget = contextVtable[47];
     void* resolveTarget = contextVtable[57];

@@ -1358,6 +1358,21 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                                 trackingForward[axis];
                         }
                         renderTicket.aimDotLocalValid = true;
+                        static std::atomic<uint64_t> aimDotSourceProbe{0};
+                        if ((aimDotSourceProbe.fetch_add(1, std::memory_order_relaxed) % 300) == 0) {
+                            Log("[AimDotSource] distanceCfg=%.2f aimPos=(%.3f,%.3f,%.3f) "
+                                "dotPos=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f)",
+                                settings.dot_distance_m,
+                                renderTicket.rightAimPosition[0],
+                                renderTicket.rightAimPosition[1],
+                                renderTicket.rightAimPosition[2],
+                                renderTicket.aimDotLocalPosition[0],
+                                renderTicket.aimDotLocalPosition[1],
+                                renderTicket.aimDotLocalPosition[2],
+                                renderTicket.aimDotLocalForward[0],
+                                renderTicket.aimDotLocalForward[1],
+                                renderTicket.aimDotLocalForward[2]);
+                        }
                     } while (false);
                 } else {
                     input::InputHook::Instance().ClearCanonicalWeaponPose();
