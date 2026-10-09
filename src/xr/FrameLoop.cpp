@@ -1,5 +1,6 @@
 #include "FrameLoop.hpp"
 #include "OpenXRContext.hpp"
+#include "FsrEasuShaderSource.h"
 #include "../core/VRMod.hpp"
 #include "../core/globals.hpp"
 #include "../core/CommandSystem.hpp"
@@ -20,6 +21,43 @@
 #include <vector>
 
 namespace bl1gotyvr { namespace xr {
+
+namespace {
+
+uint32_t AsUintBits(float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+// Mirrors FsrEasuConOffset() from FidelityFX FSR1 (MIT) so the shader constants
+// match the reference implementation bit for bit.
+void ComputeFsrEasuCon(uint32_t con[4][4], float viewportX, float viewportY,
+                       float inputX, float inputY, float outputX, float outputY,
+                       float offsetX, float offsetY) {
+    const float rcpOutX = 1.0f / outputX;
+    const float rcpOutY = 1.0f / outputY;
+    const float rcpInX = 1.0f / inputX;
+    const float rcpInY = 1.0f / inputY;
+    con[0][0] = AsUintBits(viewportX * rcpOutX);
+    con[0][1] = AsUintBits(viewportY * rcpOutY);
+    con[0][2] = AsUintBits(0.5f * viewportX * rcpOutX - 0.5f + offsetX);
+    con[0][3] = AsUintBits(0.5f * viewportY * rcpOutY - 0.5f + offsetY);
+    con[1][0] = AsUintBits(rcpInX);
+    con[1][1] = AsUintBits(rcpInY);
+    con[1][2] = AsUintBits(1.0f * rcpInX);
+    con[1][3] = AsUintBits(-1.0f * rcpInY);
+    con[2][0] = AsUintBits(-1.0f * rcpInX);
+    con[2][1] = AsUintBits(2.0f * rcpInY);
+    con[2][2] = AsUintBits(1.0f * rcpInX);
+    con[2][3] = AsUintBits(2.0f * rcpInY);
+    con[3][0] = AsUintBits(0.0f);
+    con[3][1] = AsUintBits(4.0f * rcpInY);
+    con[3][2] = 0;
+    con[3][3] = 0;
+}
+
+} // namespace
 
 FrameLoop& FrameLoop::Instance() {
     static FrameLoop fl;
@@ -356,19 +394,44 @@ Output main(uint id : SV_VertexID) {
     output.position = float4(output.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
     return output;
 })";
-    static constexpr char pixelShader[] = R"(
+    static constexpr char pixelShaderPrologue[] = R"(
 Texture2D sourceTexture : register(t0);
 SamplerState sourceSampler : register(s0);
+    float4 FsrEasuRF(float2 p);
+    float4 FsrEasuGF(float2 p);
+    float4 FsrEasuBF(float2 p);
+)";
+    static constexpr char pixelShaderGather[] = R"(
+    AF4 FsrEasuRF(AF2 p) { return sourceTexture.GatherRed(sourceSampler, p); }
+    AF4 FsrEasuGF(AF2 p) { return sourceTexture.GatherGreen(sourceSampler, p); }
+    AF4 FsrEasuBF(AF2 p) { return sourceTexture.GatherBlue(sourceSampler, p); }
+)";
+    static constexpr char pixelShaderMain[] = R"(
     cbuffer BlitSettings : register(b0) {
         float hdrSource; float eyeShift; float2 uvScale;
         float2 uvOffset; float2 padding;
         float4 dotSettings;
         float4 outputSettings;
+        float4 postFx;   // x=sharpen y=contrast z=saturation w=enabled
+        float4 postFx2;  // x=brightness y=gamma z=texelX w=texelY
+        float4 postFx3;  // x=FSR1 EASU upscale enabled
+        uint4 easuCon0;
+        uint4 easuCon1;
+        uint4 easuCon2;
+        uint4 easuCon3;
     };
     float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         float2 screenUv = uv;
-        uv = saturate(uv * uvScale + uvOffset + float2(eyeShift, 0.0));
-    float4 color = sourceTexture.Sample(sourceSampler, uv);
+        float2 sampleUv = saturate(uv * uvScale + uvOffset + float2(eyeShift, 0.0));
+    float4 color;
+    if (postFx3.x > 0.5) {
+        // FidelityFX FSR1 EASU edge-adaptive upscale of the cropped viewport.
+        AF3 pix;
+        FsrEasuF(pix, AU2(position.xy), easuCon0, easuCon1, easuCon2, easuCon3);
+        color = AF4(pix, 1.0);
+    } else {
+        color = sourceTexture.Sample(sourceSampler, sampleUv);
+    }
     if (hdrSource > 0.5) {
         float3 x = max(color.rgb, 0.0);
         color.rgb = saturate((x * (2.51 * x + 0.03)) /
@@ -377,6 +440,27 @@ SamplerState sourceSampler : register(s0);
         float3 low = color.rgb / 12.92;
         float3 high = pow((color.rgb + 0.055) / 1.055, 2.4);
         color.rgb = lerp(high, low, step(color.rgb, 0.04045));
+    }
+    if (postFx.w > 0.5) {
+        // Color grade: saturation, contrast, gamma, brightness.
+        float luma = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+        color.rgb = lerp(luma.xxx, color.rgb, postFx.z);
+        color.rgb = (color.rgb - 0.5) * postFx.y + 0.5;
+        if (abs(postFx2.y - 1.0) > 0.001)
+            color.rgb = pow(max(color.rgb, 0.0), 1.0 / postFx2.y);
+        color.rgb = saturate(color.rgb + postFx2.x);
+        // CAS-like sharpen, clamped to the local neighborhood to avoid halos.
+        // Skipped under FSR1, which already applies edge-adaptive filtering.
+        if (postFx3.x < 0.5 && postFx.x > 0.001) {
+            float3 n = sourceTexture.Sample(sourceSampler, sampleUv + float2(0.0, -postFx2.w)).rgb;
+            float3 s = sourceTexture.Sample(sourceSampler, sampleUv + float2(0.0, postFx2.w)).rgb;
+            float3 e = sourceTexture.Sample(sourceSampler, sampleUv + float2(postFx2.z, 0.0)).rgb;
+            float3 w = sourceTexture.Sample(sourceSampler, sampleUv + float2(-postFx2.z, 0.0)).rgb;
+            float3 blur = (n + s + e + w) * 0.25;
+            float3 mn = min(min(min(n, s), min(e, w)), color.rgb);
+            float3 mx = max(max(max(n, s), max(e, w)), color.rgb);
+            color.rgb = clamp(color.rgb + (color.rgb - blur) * (postFx.x * 1.5), mn, mx);
+        }
     }
     if (dotSettings.w > 0.5) {
         float2 delta = screenUv - dotSettings.xy;
@@ -402,7 +486,9 @@ SamplerState sourceSampler : register(s0);
         return false;
     }
     if (errors) { errors->Release(); errors = nullptr; }
-    hr = D3DCompile(pixelShader, sizeof(pixelShader), nullptr, nullptr, nullptr,
+    const std::string pixelShaderText = std::string(pixelShaderPrologue) +
+        kFsrEasuSource + std::string(pixelShaderGather) + pixelShaderMain;
+    hr = D3DCompile(pixelShaderText.c_str(), pixelShaderText.size(), nullptr, nullptr, nullptr,
                     "main", "ps_5_0", 0, 0, &pixelBlob, &errors);
     if (FAILED(hr)) {
         Log("[FrameLoop] D3DCompile(PS) failed: 0x%08X%s%s", hr,
@@ -435,7 +521,7 @@ SamplerState sourceSampler : register(s0);
     if (FAILED(hr)) Log("[FrameLoop] CreateSamplerState failed: 0x%08X", hr);
     if (FAILED(hr)) return false;
     D3D11_BUFFER_DESC constantsDesc = {};
-    constantsDesc.ByteWidth = 64;
+    constantsDesc.ByteWidth = 176;
     constantsDesc.Usage = D3D11_USAGE_DEFAULT;
     constantsDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     hr = device->CreateBuffer(&constantsDesc, nullptr, &m_blitConstants);
@@ -789,6 +875,25 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
             }
         }
     }
+    // FSR1 EASU upscale: only when the destination is larger than the source
+    // (a true upscale) and the source is a single non-SBS view, so the viewport
+    // mapping stays exact.
+    bool fsrUpscale = false;
+    uint32_t easuCon[4][4] = {};
+    if (config::Get().postfx_fsr && !sideBySideSource && !flatSource &&
+        destinationDesc.Width > sourceDesc.Width &&
+        destinationDesc.Height > sourceDesc.Height) {
+        ComputeFsrEasuCon(easuCon,
+            uvScaleX * static_cast<float>(sourceDesc.Width),
+            uvScaleY * static_cast<float>(sourceDesc.Height),
+            static_cast<float>(sourceDesc.Width),
+            static_cast<float>(sourceDesc.Height),
+            static_cast<float>(destinationDesc.Width),
+            static_cast<float>(destinationDesc.Height),
+            (uvOffsetX + convergenceShift) * static_cast<float>(sourceDesc.Width),
+            uvOffsetY * static_cast<float>(sourceDesc.Height));
+        fsrUpscale = true;
+    }
     const bool selectedSwapchainIsSrgb =
         selectedSwapchainFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
         selectedSwapchainFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
@@ -800,14 +905,27 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
         sourceDesc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
         sourceDesc.Format == DXGI_FORMAT_B8G8R8X8_UNORM ||
         sourceDesc.Format == DXGI_FORMAT_B8G8R8X8_TYPELESS;
-    const float settings[16] = {
+    const bool postFxEnabled = config::Get().postfx_enabled;
+    const float postFxTexelX = uvScaleX /
+        static_cast<float>((std::max)(1u, destinationDesc.Width));
+    const float postFxTexelY = uvScaleY /
+        static_cast<float>((std::max)(1u, destinationDesc.Height));
+    float settings[44] = {
         sourceDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1.0f : 0.0f,
         convergenceShift, uvScaleX, uvScaleY, uvOffsetX, uvOffsetY, 0.0f, 0.0f,
         dotU, dotV, 0.006f, dotEnabled,
         static_cast<float>(destinationDesc.Width) / destinationDesc.Height,
         selectedSwapchainIsSrgb && sourceIsDisplayEncodedUnorm ? 1.0f : 0.0f,
-        0.0f, 0.0f
+        0.0f, 0.0f,
+        config::Get().postfx_sharpen, config::Get().postfx_contrast,
+        config::Get().postfx_saturation, postFxEnabled ? 1.0f : 0.0f,
+        config::Get().postfx_brightness, config::Get().postfx_gamma,
+        postFxTexelX, postFxTexelY,
+        fsrUpscale ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
     };
+    memcpy(settings + 28, easuCon, sizeof(easuCon));
     if (sampledEye >= 0 && sampledEye < 2) {
         m_lastDotSettings[sampledEye][0] = dotU;
         m_lastDotSettings[sampledEye][1] = dotV;

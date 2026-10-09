@@ -144,6 +144,22 @@ void Load(const char* path) {
         ReadFloat("HUD", "Scale", s_settings.hud_scale, path), 0.25f, 2.0f);
     s_settings.hud_opacity = std::clamp(
         ReadFloat("HUD", "Opacity", s_settings.hud_opacity, path), 0.0f, 1.0f);
+
+    /* Native post-processing (blit shader) */
+    s_settings.postfx_enabled = GetPrivateProfileIntA(
+        "PostFx", "Enabled", s_settings.postfx_enabled ? 1 : 0, path) != 0;
+    s_settings.postfx_fsr = GetPrivateProfileIntA(
+        "PostFx", "FsrUpscale", s_settings.postfx_fsr ? 1 : 0, path) != 0;
+    s_settings.postfx_sharpen = std::clamp(
+        ReadFloat("PostFx", "Sharpen", s_settings.postfx_sharpen, path), 0.0f, 1.0f);
+    s_settings.postfx_contrast = std::clamp(
+        ReadFloat("PostFx", "Contrast", s_settings.postfx_contrast, path), 0.5f, 2.0f);
+    s_settings.postfx_saturation = std::clamp(
+        ReadFloat("PostFx", "Saturation", s_settings.postfx_saturation, path), 0.0f, 2.0f);
+    s_settings.postfx_brightness = std::clamp(
+        ReadFloat("PostFx", "Brightness", s_settings.postfx_brightness, path), -0.5f, 0.5f);
+    s_settings.postfx_gamma = std::clamp(
+        ReadFloat("PostFx", "Gamma", s_settings.postfx_gamma, path), 0.5f, 2.0f);
     s_settings.hud_horizontal_offset = std::clamp(
         ReadFloat("HUD", "HorizontalOffset", s_settings.hud_horizontal_offset, path), -2.0f, 2.0f);
     s_settings.hud_vertical_offset = std::clamp(
@@ -335,6 +351,17 @@ void Save(const char* path) {
     WriteFloat("HUD", "Distance", s_settings.hud_distance, path);
     WriteFloat("HUD", "WidthDegrees", s_settings.hud_width_degrees, path);
     WriteFloat("HUD", "Scale", s_settings.hud_scale, path);
+
+    /* Native post-processing (blit shader) */
+    WritePrivateProfileStringA("PostFx", "Enabled",
+        s_settings.postfx_enabled ? "1" : "0", path);
+    WritePrivateProfileStringA("PostFx", "FsrUpscale",
+        s_settings.postfx_fsr ? "1" : "0", path);
+    WriteFloat("PostFx", "Sharpen", s_settings.postfx_sharpen, path);
+    WriteFloat("PostFx", "Contrast", s_settings.postfx_contrast, path);
+    WriteFloat("PostFx", "Saturation", s_settings.postfx_saturation, path);
+    WriteFloat("PostFx", "Brightness", s_settings.postfx_brightness, path);
+    WriteFloat("PostFx", "Gamma", s_settings.postfx_gamma, path);
     WriteFloat("HUD", "Opacity", s_settings.hud_opacity, path);
     WriteFloat("HUD", "HorizontalOffset", s_settings.hud_horizontal_offset, path);
     WriteFloat("HUD", "VerticalOffset", s_settings.hud_vertical_offset, path);
