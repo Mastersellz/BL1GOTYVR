@@ -471,6 +471,11 @@ SamplerState sourceSampler : register(s0);
                 ? float4(1.0, 1.0, 1.0, 1.0)
                 : float4(0.0, 0.0, 0.0, 1.0);
     }
+    // Eye images must stay fully opaque: Meta/VDXR-style compositors blend
+    // projection layers by source alpha, and the game backbuffer alpha is not
+    // meaningful. Without this the world vanishes and only alpha=1 pixels
+    // (the aim dot) remain visible on those runtimes.
+    color.a = 1.0;
     return color;
 })";
 
@@ -1189,16 +1194,17 @@ bool FrameLoop::CopyTextureToEye(ID3D11DeviceContext* context, ID3D11Texture2D* 
     if (!context || !source || xr.NeedsRecovery()) return false;
     D3D11_TEXTURE2D_DESC srcDesc = {};
     source->GetDesc(&srcDesc);
-    const UINT requiredExtent = display::TargetResolution();
-    if (!flatSource && requiredExtent &&
-        (srcDesc.Width != requiredExtent || srcDesc.Height != requiredExtent)) {
+    // The game owns its resolution (the mod never forces the swapchain), so the
+    // projection upload accepts whatever extent the live source has; only
+    // degenerate sizes are rejected (the SBS split needs an even width).
+    if (!flatSource && (srcDesc.Width < 2 || (srcDesc.Width & 1u) != 0 ||
+                        srcDesc.Height == 0)) {
         static uint64_t rejectedProjectionExtents = 0;
         const uint64_t count = ++rejectedProjectionExtents;
         if (count <= 3 || count % 300 == 0) {
-            Log("[FrameLoop] Projection upload blocked: mode=%s source=%ux%u "
-                "required=%ux%u count=%llu",
+            Log("[FrameLoop] Projection upload blocked: mode=%s source=%ux%u invalid count=%llu",
                 sideBySideSource ? "SFR" : "AFR",
-                srcDesc.Width, srcDesc.Height, requiredExtent, requiredExtent,
+                srcDesc.Width, srcDesc.Height,
                 static_cast<unsigned long long>(count));
         }
         return false;
@@ -1924,9 +1930,8 @@ bool FrameLoop::TrySubmitTheaterFrame(ID3D11Device* device,
         if (nativeWorld) {
             D3D11_TEXTURE2D_DESC nativeDesc = {};
             nativeWorld->GetDesc(&nativeDesc);
-            const UINT requiredExtent = display::TargetResolution();
-            if (requiredExtent && (nativeDesc.Width != requiredExtent ||
-                                   nativeDesc.Height != requiredExtent)) {
+            if (nativeDesc.Width < 2 || (nativeDesc.Width & 1u) != 0 ||
+                nativeDesc.Height == 0) {
                 nativeWorld->Release();
                 nativeWorld = nullptr;
             }
@@ -2039,18 +2044,14 @@ bool FrameLoop::TrySubmitNativeMultiviewFrame(
 
     D3D11_TEXTURE2D_DESC sourceDesc = {};
     source->GetDesc(&sourceDesc);
-    const UINT requiredExtent = display::TargetResolution();
+    // The game owns its resolution; accept any sane live source extent.
     if (sourceDesc.Width < 2 || (sourceDesc.Width & 1u) != 0 ||
-        sourceDesc.Height == 0 || sourceDesc.SampleDesc.Count != 1 ||
-        (requiredExtent && (sourceDesc.Width != requiredExtent ||
-                            sourceDesc.Height != requiredExtent))) {
+        sourceDesc.Height == 0 || sourceDesc.SampleDesc.Count != 1) {
         static uint64_t invalidExtentCount = 0;
         const uint64_t count = ++invalidExtentCount;
         if (count <= 3 || count % 300 == 0) {
-            Log("[SFR] Native multiview source rejected: %ux%u samples=%u "
-                "required=%ux%u count=%llu",
+            Log("[SFR] Native multiview source rejected: %ux%u samples=%u count=%llu",
                 sourceDesc.Width, sourceDesc.Height, sourceDesc.SampleDesc.Count,
-                requiredExtent, requiredExtent,
                 static_cast<unsigned long long>(count));
         }
         return false;
@@ -2720,9 +2721,12 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     }
     DXGI_SWAP_CHAIN_DESC liveSwapDesc = {};
     const UINT requiredExtent = display::TargetResolution();
+    // The game owns its resolution (the mod no longer forces the swapchain), so
+    // the capture stays consistent with whatever extent the live swapchain has.
+    // Only an unreadable swapchain is unsafe; a preset mismatch is expected and
+    // must not latch the flat theater view.
     const bool nativeExtentSafe = SUCCEEDED(swapChain->GetDesc(&liveSwapDesc)) &&
-        (!requiredExtent || (liveSwapDesc.BufferDesc.Width == requiredExtent &&
-                             liveSwapDesc.BufferDesc.Height == requiredExtent));
+        liveSwapDesc.BufferDesc.Width != 0 && liveSwapDesc.BufferDesc.Height != 0;
     const bool unsafeNativeFrame = nativeFrameMatches && !nativeExtentSafe;
     if (unsafeNativeFrame) {
         static uint64_t unsafeNativeFrames = 0;

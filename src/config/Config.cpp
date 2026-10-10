@@ -30,6 +30,12 @@ bool IsSupportedRenderResolution(int width, int height) {
     return false;
 }
 
+static std::atomic<bool> s_gameResolutionSynced{false};
+
+bool GameResolutionSynced() {
+    return s_gameResolutionSynced.load(std::memory_order_acquire);
+}
+
 bool EnforceGameResolution() {
     char userProfile[MAX_PATH] = {};
     if (!GetEnvironmentVariableA("USERPROFILE", userProfile, MAX_PATH)) return false;
@@ -39,6 +45,8 @@ bool EnforceGameResolution() {
     };
     char value[16] = {};
     sprintf_s(value, "%d", s_settings.render_width);
+    bool anyWritten = false;
+    bool anyMatched = false;
     for (const char* suffix : suffixes) {
         char gameIni[MAX_PATH] = {};
         strcpy_s(gameIni, userProfile);
@@ -51,21 +59,41 @@ bool EnforceGameResolution() {
             "SystemSettings", "ResY", 0, gameIni);
         if (currentWidth == s_settings.render_width &&
             currentHeight == s_settings.render_height) {
-            Log("[Config] Game resolution already matches preset: %dx%d",
-                currentWidth, currentHeight);
-            return true;
+            Log("[Config] Game resolution already matches preset: %dx%d (%s)",
+                currentWidth, currentHeight, gameIni);
+            anyMatched = true;
+            continue;
         }
+        // Players commonly lock the game config read-only so the game cannot
+        // rewrite video settings; clear the attribute, write, and restore it.
+        const DWORD attributes = GetFileAttributesA(gameIni);
+        if ((attributes & FILE_ATTRIBUTE_READONLY) != 0)
+            SetFileAttributesA(gameIni, attributes & ~FILE_ATTRIBUTE_READONLY);
         const BOOL widthWritten = WritePrivateProfileStringA(
             "SystemSettings", "ResX", value, gameIni);
         const BOOL heightWritten = WritePrivateProfileStringA(
             "SystemSettings", "ResY", value, gameIni);
-        Log("[Config] Game resolution enforced: %dx%d previous=%dx%d result=%d/%d",
+        const int verifyWidth = GetPrivateProfileIntA(
+            "SystemSettings", "ResX", 0, gameIni);
+        const int verifyHeight = GetPrivateProfileIntA(
+            "SystemSettings", "ResY", 0, gameIni);
+        if ((attributes & FILE_ATTRIBUTE_READONLY) != 0)
+            SetFileAttributesA(gameIni, attributes);
+        Log("[Config] Game resolution enforced: %dx%d previous=%dx%d result=%d/%d verify=%dx%d file=%s",
             s_settings.render_width, s_settings.render_height,
-            currentWidth, currentHeight, widthWritten, heightWritten);
-        return widthWritten && heightWritten;
+            currentWidth, currentHeight, widthWritten, heightWritten,
+            verifyWidth, verifyHeight, gameIni);
+        if (verifyWidth == s_settings.render_width &&
+            verifyHeight == s_settings.render_height)
+            anyWritten = true;
     }
-    Log("[Config] WARNING: WillowEngine.ini not found; game resolution was not synchronized");
-    return false;
+    if (!anyWritten && !anyMatched) {
+        Log("[Config] WARNING: game resolution not synchronized; "
+            "no writable WillowEngine.ini found");
+    }
+    s_gameResolutionSynced.store(anyWritten || anyMatched,
+        std::memory_order_release);
+    return anyWritten || anyMatched;
 }
 
 static float ReadFloat(const char* section, const char* key, float fallback, const char* path) {

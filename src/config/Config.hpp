@@ -116,6 +116,7 @@ Settings& Get();
 float GetMeleeRangeMultiplier();
 bool IsSupportedRenderResolution(int width, int height);
 bool EnforceGameResolution();
+bool GameResolutionSynced();
 void Load(const char* path);
 void Save(const char* path);
 bool SaveLoaded();

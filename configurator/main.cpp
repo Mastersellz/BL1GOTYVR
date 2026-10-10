@@ -165,6 +165,27 @@ bool ReplaceIniValue(std::vector<std::string>& lines, const char* key, int value
     return false;
 }
 
+bool WriteIniLines(const std::string& path, const std::vector<std::string>& lines) {
+    // Players commonly lock the game configs read-only; write through the
+    // attribute and restore it afterwards.
+    const DWORD attributes = GetFileAttributesA(path.c_str());
+    const bool wasReadonly = attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_READONLY) != 0;
+    if (wasReadonly)
+        SetFileAttributesA(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+    bool written = false;
+    {
+        std::ofstream output(path, std::ios::trunc);
+        if (output) {
+            for (const auto& outputLine : lines) output << outputLine << "\n";
+            written = true;
+        }
+    }
+    if (wasReadonly)
+        SetFileAttributesA(path.c_str(), attributes);
+    return written;
+}
+
 bool UpdateGameResolution(int width, int height) {
     char documents[MAX_PATH] = {};
     if (FAILED(SHGetFolderPathA(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, documents))) {
@@ -186,10 +207,7 @@ bool UpdateGameResolution(int width, int height) {
         const bool foundWidth = ReplaceIniValue(lines, "ResX", width);
         const bool foundHeight = ReplaceIniValue(lines, "ResY", height);
         if (!foundWidth || !foundHeight) continue;
-        std::ofstream output(path, std::ios::trunc);
-        if (!output) return false;
-        for (const auto& outputLine : lines) output << outputLine << "\n";
-        return true;
+        return WriteIniLines(path, lines);
     }
     return false;
 }
@@ -214,10 +232,7 @@ bool DisableGameWeaponBob() {
             lines.push_back(line);
         }
         if (!ReplaceIniValue(lines, "bWeaponBob", 0)) continue;
-        std::ofstream output(path, std::ios::trunc);
-        if (!output) return false;
-        for (const auto& outputLine : lines) output << outputLine << "\n";
-        return true;
+        return WriteIniLines(path, lines);
     }
     return false;
 }

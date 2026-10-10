@@ -424,6 +424,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
                      "BL1GOTYVR.ini");
         }
         bl1gotyvr::config::Load(configPath);
+        // The game reads its own config very early; the async init thread races
+        // with that read, so enforce the preset resolution synchronously here.
+        bl1gotyvr::config::EnforceGameResolution();
 
         HANDLE initThread = CreateThread(nullptr, 0, InitializeThread, nullptr, 0, nullptr);
         if (initThread) CloseHandle(initThread);

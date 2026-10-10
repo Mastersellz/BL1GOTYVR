@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <intrin.h>
 #include <unordered_map>
 #include <vector>
 
@@ -54,6 +55,8 @@ using FactoryCreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnk
 using FactoryCreateSwapChainForHwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*,
     IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*,
     IDXGIOutput*, IDXGISwapChain1**);
+using CreateDeferredContextFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, UINT,
+    ID3D11DeviceContext**);
 
 static PresentFn       oPresent = nullptr;
 static ResizeBuffersFn oResizeBuffers = nullptr;
@@ -67,6 +70,15 @@ static CreateDeviceFn oCreateDevice = nullptr;
 static CreateDeviceAndSwapChainFn oCreateDeviceAndSwapChain = nullptr;
 static FactoryCreateSwapChainFn oFactoryCreateSwapChain = nullptr;
 static FactoryCreateSwapChainForHwndFn oFactoryCreateSwapChainForHwnd = nullptr;
+static CreateDeferredContextFn oCreateDeferredContext = nullptr;
+
+// The engine can create several devices (feature-level variants) whose context
+// vtables expose different IA function implementations than the temporary
+// device used at install time; those binds would be invisible to the
+// function-level hooks. Every device's context functions are hooked at birth.
+static void InstallContextFunctionHooksFromContext(ID3D11DeviceContext* context);
+static void* s_tempIaSetIndexBufferTarget = nullptr;
+static void* s_tempIaSetVertexBuffersTarget = nullptr;
 static std::atomic<bool> s_deviceCompatibilityInstalled{false};
 static std::atomic<bool> s_factoryCreateSwapChainInstalled{false};
 static std::atomic<bool> s_factoryCreateSwapChainForHwndInstalled{false};
@@ -88,14 +100,48 @@ static bool IsGameSwapChainWindow(HWND window) {
            _stricmp(className, "WndEngineUnreal") == 0;
 }
 
+static HRESULT STDMETHODCALLTYPE HookedCreateDeferredContext(
+    ID3D11Device* device, UINT flags, ID3D11DeviceContext** context);
+
+// Deferred contexts are created during engine RHI init, often before the
+// deferred-context function hook is installed. Patch each device's vtable slot
+// the moment the device is created so every later context is covered.
+static void PatchDeviceDeferredContextSlot(ID3D11Device* device) {
+    if (!device) return;
+    void** vtable = *reinterpret_cast<void***>(device);
+    if (!vtable) return;
+    if (vtable[31] == reinterpret_cast<void*>(&HookedCreateDeferredContext)) return;
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(&vtable[31], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        Log("[VanillaHands] ERROR: device vtable not writable: device=%p", device);
+        return;
+    }
+    if (!oCreateDeferredContext)
+        oCreateDeferredContext = reinterpret_cast<CreateDeferredContextFn>(vtable[31]);
+    vtable[31] = reinterpret_cast<void*>(&HookedCreateDeferredContext);
+    DWORD ignored = 0;
+    VirtualProtect(&vtable[31], sizeof(void*), oldProtect, &ignored);
+    Log("[VanillaHands] Device CreateDeferredContext slot patched: device=%p", device);
+}
+
 static HRESULT WINAPI HookedCreateDevice(IDXGIAdapter* adapter,
     D3D_DRIVER_TYPE driverType, HMODULE software, UINT flags,
     const D3D_FEATURE_LEVEL* featureLevels, UINT featureLevelCount, UINT sdkVersion,
     ID3D11Device** device, D3D_FEATURE_LEVEL* selectedFeatureLevel,
     ID3D11DeviceContext** immediateContext) {
-    return oCreateDevice(adapter, driverType, software, SteamVrCompatibleDeviceFlags(flags),
-        featureLevels, featureLevelCount, sdkVersion, device, selectedFeatureLevel,
-        immediateContext);
+    const HRESULT result = oCreateDevice(adapter, driverType, software,
+        SteamVrCompatibleDeviceFlags(flags), featureLevels, featureLevelCount, sdkVersion,
+        device, selectedFeatureLevel, immediateContext);
+    if (SUCCEEDED(result) && device && *device) {
+        Log("[VanillaHands] CreateDevice -> device=%p ctx=%p flags=0x%X",
+            *device, (immediateContext && *immediateContext) ? *immediateContext : nullptr,
+            flags);
+        PatchDeviceDeferredContextSlot(*device);
+    }
+    if (SUCCEEDED(result) && immediateContext && *immediateContext) {
+        InstallContextFunctionHooksFromContext(*immediateContext);
+    }
+    return result;
 }
 
 static HRESULT WINAPI HookedCreateDeviceAndSwapChain(IDXGIAdapter* adapter,
@@ -104,24 +150,21 @@ static HRESULT WINAPI HookedCreateDeviceAndSwapChain(IDXGIAdapter* adapter,
     const DXGI_SWAP_CHAIN_DESC* swapChainDesc, IDXGISwapChain** swapChain,
     ID3D11Device** device, D3D_FEATURE_LEVEL* selectedFeatureLevel,
     ID3D11DeviceContext** immediateContext) {
-    DXGI_SWAP_CHAIN_DESC forcedDesc = {};
-    const DXGI_SWAP_CHAIN_DESC* effectiveDesc = swapChainDesc;
-    const UINT target = display::TargetResolution();
-    if (swapChainDesc && target && IsGameSwapChainWindow(swapChainDesc->OutputWindow)) {
-        forcedDesc = *swapChainDesc;
-        if (forcedDesc.BufferDesc.Width != target ||
-            forcedDesc.BufferDesc.Height != target) {
-            Log("[Display] Forcing initial game swapchain: %ux%u -> %ux%u",
-                forcedDesc.BufferDesc.Width, forcedDesc.BufferDesc.Height,
-                target, target);
-        }
-        forcedDesc.BufferDesc.Width = target;
-        forcedDesc.BufferDesc.Height = target;
-        effectiveDesc = &forcedDesc;
-    }
-    return oCreateDeviceAndSwapChain(adapter, driverType, software,
+    // Keep the game's requested extent (see ForceGameSwapChainExtent) so the
+    // scene targets and the stereo capture stay consistent.
+    const HRESULT result = oCreateDeviceAndSwapChain(adapter, driverType, software,
         SteamVrCompatibleDeviceFlags(flags), featureLevels, featureLevelCount, sdkVersion,
-        effectiveDesc, swapChain, device, selectedFeatureLevel, immediateContext);
+        swapChainDesc, swapChain, device, selectedFeatureLevel, immediateContext);
+    if (SUCCEEDED(result) && device && *device) {
+        Log("[VanillaHands] CreateDeviceAndSwapChain -> device=%p ctx=%p flags=0x%X",
+            *device, (immediateContext && *immediateContext) ? *immediateContext : nullptr,
+            flags);
+        PatchDeviceDeferredContextSlot(*device);
+    }
+    if (SUCCEEDED(result) && immediateContext && *immediateContext) {
+        InstallContextFunctionHooksFromContext(*immediateContext);
+    }
+    return result;
 }
 
 static ID3D11Device*        s_gameDevice = nullptr;
@@ -155,6 +198,66 @@ static std::atomic<bool>     s_handGeometryHooksReady{false};
 static std::atomic<float>    s_vanillaHandsCutThreshold{70.0f};
 static std::atomic<bool>     s_handOnlyBufferAttempted{false};
 static std::atomic<uint64_t> s_handGeometryGeneration{0};
+
+// Overlays and driver layers can rewrite MinHook's entry patch after install,
+// silently disabling the capture and geometry hooks (observed in user logs
+// where the vanilla-hands cut never activates and hookFired stops growing).
+// Snapshot the prologue MinHook wrote and restore it when it changes.
+struct HookPrologueSnapshot {
+    void* target = nullptr;
+    const char* name = nullptr;
+    unsigned char bytes[16] = {};
+};
+static constexpr int kMaxHookPrologues = 12;
+static HookPrologueSnapshot s_hookPrologues[kMaxHookPrologues];
+static int s_hookPrologueCount = 0;
+static std::atomic<uint64_t> s_prologueCheckCounter{0};
+
+// TEMP DIAG SteamVR hand-cut: per-condition rejection counters so the exact
+// gate clause that kills detection is visible in the log.
+static std::atomic<uint64_t> s_ibRejectInsidePresent{0};
+static std::atomic<uint64_t> s_ibRejectContext{0};
+static std::atomic<uint64_t> s_ibRejectDisabled{0};
+static std::atomic<uint64_t> s_ibRejectNull{0};
+static std::atomic<uint64_t> s_ibRejectFormat{0};
+static std::atomic<uint64_t> s_ibRejectOffset{0};
+static std::atomic<uint64_t> s_ibAccepted{0};
+
+static void AddHookPrologueSnapshot(void* target, const char* name) {
+    if (!target || s_hookPrologueCount >= kMaxHookPrologues) return;
+    for (int i = 0; i < s_hookPrologueCount; ++i) {
+        if (s_hookPrologues[i].target == target) return;
+    }
+    HookPrologueSnapshot& snapshot = s_hookPrologues[s_hookPrologueCount++];
+    snapshot.target = target;
+    snapshot.name = name;
+    memcpy(snapshot.bytes, target, sizeof(snapshot.bytes));
+}
+
+static void VerifyHandGeometryHookPrologues() {
+    if (!s_handGeometryHooksReady.load(std::memory_order_acquire)) return;
+    const uint64_t check = s_prologueCheckCounter.fetch_add(1, std::memory_order_relaxed);
+    if (check % 600 != 0) return;
+    for (int i = 0; i < s_hookPrologueCount; ++i) {
+        HookPrologueSnapshot& snapshot = s_hookPrologues[i];
+        if (!snapshot.target || !snapshot.name) continue;
+        unsigned char current[16] = {};
+        memcpy(current, snapshot.target, sizeof(current));
+        if (memcmp(current, snapshot.bytes, sizeof(current)) == 0) continue;
+        DWORD oldProtect = 0;
+        if (VirtualProtect(snapshot.target, sizeof(current), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            memcpy(snapshot.target, snapshot.bytes, sizeof(current));
+            FlushInstructionCache(GetCurrentProcess(), snapshot.target, sizeof(current));
+            DWORD ignored = 0;
+            VirtualProtect(snapshot.target, sizeof(current), oldProtect, &ignored);
+            Log("[VanillaHands] WARNING: %s entry patch was trampled "
+                "(%02X %02X %02X %02X -> restored); another overlay/driver rewrote it",
+                snapshot.name, current[0], current[1], current[2], current[3]);
+        } else {
+            Log("[VanillaHands] ERROR: could not restore %s entry patch", snapshot.name);
+        }
+    }
+}
 
 static constexpr UINT kHandsVertexStride = 32;
 
@@ -199,15 +302,22 @@ static const HandBufferSignature* FindHandBufferSignature(
 
 static void ForceGameSwapChainExtent(HWND window, UINT& width, UINT& height,
                                      const char* api) {
+    (void)api;
     const UINT target = display::TargetResolution();
     if (!target || !IsGameSwapChainWindow(window)) return;
     display::SetGameWindow(window);
+    // Never override the game's requested extent: the engine renders its scene
+    // at its own resolution, so a forced swapchain desyncs it from the scene
+    // render targets and breaks the SBS stereo capture. The preset is applied
+    // through the game ini instead (written before the game starts).
     if (width != target || height != target) {
-        Log("[Display] Forcing %s game swapchain: %ux%u -> %ux%u",
-            api, width, height, target, target);
+        static bool logged = false;
+        if (!logged) {
+            Log("[Display] Game swapchain %ux%u (preset %ux%u); keeping the game "
+                "extent to preserve stereo", width, height, target, target);
+            logged = true;
+        }
     }
-    width = target;
-    height = target;
 }
 
 static HRESULT STDMETHODCALLTYPE HookedFactoryCreateSwapChain(
@@ -1136,16 +1246,24 @@ static void QueueHandOnlyIndexBuffer(ID3D11Buffer* vertexBuffer,
     ReleaseSRWLockExclusive(&s_handFilterLock);
 }
 
-static void STDMETHODCALLTYPE HookedIASetVertexBuffers(
+static void HandleIASetVertexBuffers(
         ID3D11DeviceContext* context, UINT startSlot, UINT bufferCount,
         ID3D11Buffer* const* vertexBuffers, const UINT* strides,
-        const UINT* offsets) {
-    if (s_insidePresent || !IsGameDeviceContext(context) || startSlot != 0 ||
+        const UINT* offsets, IASetVertexBuffersFn passthrough) {
+    // TEMP DIAG SteamVR hand-cut: VB hook heartbeat.
+    {
+        static std::atomic<uint64_t> vbHookCalls{0};
+        const uint64_t vbCall = vbHookCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (vbCall % 50000 == 1) {
+            Log("[VanillaHands] VB hook alive: calls=%llu", vbCall);
+        }
+    }
+    if (!IsGameDeviceContext(context) || startSlot != 0 ||
         bufferCount == 0 ||
         bufferCount > D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT || !vertexBuffers ||
         !s_vanillaHandsFilterEnabled.load(std::memory_order_acquire)) {
-        oIASetVertexBuffers(context, startSlot, bufferCount, vertexBuffers,
-                            strides, offsets);
+        passthrough(context, startSlot, bufferCount, vertexBuffers,
+                    strides, offsets);
         return;
     }
 
@@ -1154,28 +1272,104 @@ static void STDMETHODCALLTYPE HookedIASetVertexBuffers(
     AcquireSRWLockShared(&s_handFilterLock);
     if (s_handOnlyVertexBuffer && replacements[0] == s_targetVertexBuffer)
         replacements[0] = s_handOnlyVertexBuffer;
-    oIASetVertexBuffers(context, startSlot, bufferCount, replacements,
-                        strides, offsets);
+    passthrough(context, startSlot, bufferCount, replacements,
+                strides, offsets);
     ReleaseSRWLockShared(&s_handFilterLock);
 }
 
-static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* context,
-                                                      ID3D11Buffer* indexBuffer,
-                                                      DXGI_FORMAT format, UINT offset) {
+static void HandleIASetIndexBuffer(ID3D11DeviceContext* context,
+                                   ID3D11Buffer* indexBuffer,
+                                   DXGI_FORMAT format, UINT offset,
+                                   IASetIndexBufferFn passthrough,
+                                   void* caller) {
+    // TEMP DIAG SteamVR hand-cut: hook heartbeat independent of all gates.
+    {
+        static std::atomic<uint64_t> ibHookCalls{0};
+        const uint64_t ibCall = ibHookCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ibCall % 50000 == 1) {
+            Log("[VanillaHands] IB hook alive: calls=%llu", ibCall);
+        }
+    }
     const bool gameContext = IsGameDeviceContext(context);
     if (context == s_gameContext) ReleaseReplacedSourceIndexBuffer();
-    if (s_insidePresent || !gameContext ||
-        !s_vanillaHandsFilterEnabled.load(std::memory_order_acquire) ||
-        !indexBuffer ||
-        format != DXGI_FORMAT_R16_UINT || offset != 0) {
-        oIASetIndexBuffer(context, indexBuffer, format, offset);
+    // TEMP DIAG SteamVR hand-cut: capture raw gate inputs before any filter so
+    // the rejecting condition is visible even when no probe fires.
+    {
+        static std::atomic<uint32_t> gateProbe{0};
+        const uint32_t probe = gateProbe.fetch_add(1, std::memory_order_relaxed);
+        if (probe < 25 || probe % 500 == 0) {
+            D3D11_BUFFER_DESC gateDesc = {};
+            if (indexBuffer) indexBuffer->GetDesc(&gateDesc);
+            Log("[VanillaHands] IB gate #%u: insidePresent=%d gameCtx=%d enabled=%d buf=%p fmt=%u off=%u bytes=%u ctx=%p s_gameCtx=%p s_gameDev=%p caller=%p",
+                probe + 1, (int)s_insidePresent, (int)gameContext,
+                (int)s_vanillaHandsFilterEnabled.load(std::memory_order_relaxed),
+                static_cast<void*>(indexBuffer), static_cast<unsigned>(format), offset,
+                gateDesc.ByteWidth, static_cast<void*>(context),
+                static_cast<void*>(s_gameContext), static_cast<void*>(s_gameDevice),
+                caller);
+        }
+    }
+    // The game executes its frame draws inside some present paths (SteamVR
+    // causal capture), so inside-present calls must still reach the cut
+    // detection; only the capture-tracking hooks skip them.
+    if (s_insidePresent)
+        s_ibRejectInsidePresent.fetch_add(1, std::memory_order_relaxed);
+    if (!gameContext) {
+        s_ibRejectContext.fetch_add(1, std::memory_order_relaxed);
+        passthrough(context, indexBuffer, format, offset);
         return;
     }
+    if (!s_vanillaHandsFilterEnabled.load(std::memory_order_acquire)) {
+        s_ibRejectDisabled.fetch_add(1, std::memory_order_relaxed);
+        passthrough(context, indexBuffer, format, offset);
+        return;
+    }
+    if (!indexBuffer) {
+        s_ibRejectNull.fetch_add(1, std::memory_order_relaxed);
+        passthrough(context, indexBuffer, format, offset);
+        return;
+    }
+    if (format != DXGI_FORMAT_R16_UINT) {
+        s_ibRejectFormat.fetch_add(1, std::memory_order_relaxed);
+        passthrough(context, indexBuffer, format, offset);
+        return;
+    }
+    if (offset != 0) {
+        s_ibRejectOffset.fetch_add(1, std::memory_order_relaxed);
+        passthrough(context, indexBuffer, format, offset);
+        return;
+    }
+    s_ibAccepted.fetch_add(1, std::memory_order_relaxed);
 
     D3D11_BUFFER_DESC indexDesc = {};
     indexBuffer->GetDesc(&indexDesc);
+    // TEMP DIAG SteamVR hand-cut: sample the first decision-point binds plus
+    // every hands-scale buffer so we can see which criterion fails.
+    {
+        static std::atomic<uint32_t> smallProbe{0};
+        static std::atomic<uint32_t> largeProbe{0};
+        const bool probeFirst = smallProbe.fetch_add(1, std::memory_order_relaxed) < 40;
+        const bool probeLarge = indexDesc.ByteWidth >= 16000 &&
+            largeProbe.fetch_add(1, std::memory_order_relaxed) < 60;
+        if (probeFirst || probeLarge) {
+            ID3D11Buffer* probeVB = nullptr;
+            UINT probeStride = 0;
+            UINT probeOffset = 0;
+            context->IAGetVertexBuffers(0, 1, &probeVB, &probeStride, &probeOffset);
+            D3D11_BUFFER_DESC probeVBDesc = {};
+            if (probeVB) probeVB->GetDesc(&probeVBDesc);
+            const bool probeKnown = IsKnownHandsIndexBufferSize(indexDesc.ByteWidth);
+            const HandBufferSignature* probeSig = probeKnown && probeVB && probeStride == kHandsVertexStride
+                ? FindHandBufferSignature(probeVBDesc.ByteWidth, probeStride, indexDesc.ByteWidth)
+                : nullptr;
+            Log("[VanillaHands] IB probe: ib=%u vb=%u stride=%u known=%d sig=%s",
+                indexDesc.ByteWidth, probeVBDesc.ByteWidth, probeStride,
+                probeKnown ? 1 : 0, probeSig ? probeSig->character : "-");
+            if (probeVB) probeVB->Release();
+        }
+    }
     if (!IsKnownHandsIndexBufferSize(indexDesc.ByteWidth)) {
-        oIASetIndexBuffer(context, indexBuffer, format, offset);
+        passthrough(context, indexBuffer, format, offset);
         return;
     }
 
@@ -1232,7 +1426,7 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
             rigIdentityValid ? rig.component : 0,
             rigIdentityValid ? rig.skeletalMesh : 0);
         if (vertexBuffer) vertexBuffer->Release();
-        oIASetIndexBuffer(context, indexBuffer, format, offset);
+        passthrough(context, indexBuffer, format, offset);
         return;
     }
     if (identityMatches && (targetMissing ? signatureMatches : true)) {
@@ -1241,7 +1435,7 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
                 rigIdentityValid ? rig.component : 0,
                 rigIdentityValid ? rig.skeletalMesh : 0);
             vertexBuffer->Release();
-            oIASetIndexBuffer(context, indexBuffer, format, offset);
+            passthrough(context, indexBuffer, format, offset);
             return;
         } else if (replacement) {
             if (rigIdentityValid && !targetComponent && !targetSkeletalMesh) {
@@ -1267,15 +1461,211 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* contex
                     indexDesc.ByteWidth / static_cast<UINT>(sizeof(uint16_t)));
             }
             if (vertexBuffer) vertexBuffer->Release();
-            oIASetIndexBuffer(context, replacement, format, 0);
+            passthrough(context, replacement, format, 0);
             replacement->Release();
             return;
         }
     }
     if (replacement) replacement->Release();
     if (vertexBuffer) vertexBuffer->Release();
-    oIASetIndexBuffer(context, indexBuffer, format, offset);
+    passthrough(context, indexBuffer, format, offset);
 }
+
+// Deferred-context routing: UE3 records draws into command lists through
+// deferred contexts whose vtable methods are different implementations than
+// the immediate context, so function-level hooks never see those binds. The
+// detours below are installed per deferred-context vtable entry.
+static IASetIndexBufferFn   oIASetIndexBufferDeferred = nullptr;
+static IASetVertexBuffersFn oIASetVertexBuffersDeferred = nullptr;
+
+static void STDMETHODCALLTYPE HookedIASetIndexBuffer(ID3D11DeviceContext* context,
+                                                      ID3D11Buffer* indexBuffer,
+                                                      DXGI_FORMAT format, UINT offset) {
+    HandleIASetIndexBuffer(context, indexBuffer, format, offset, oIASetIndexBuffer,
+        _ReturnAddress());
+}
+
+static void STDMETHODCALLTYPE HookedIASetVertexBuffers(
+        ID3D11DeviceContext* context, UINT startSlot, UINT bufferCount,
+        ID3D11Buffer* const* vertexBuffers, const UINT* strides,
+        const UINT* offsets) {
+    HandleIASetVertexBuffers(context, startSlot, bufferCount, vertexBuffers,
+                             strides, offsets, oIASetVertexBuffers);
+}
+
+static void STDMETHODCALLTYPE HookedIASetIndexBufferDeferred(
+        ID3D11DeviceContext* context, ID3D11Buffer* indexBuffer,
+        DXGI_FORMAT format, UINT offset) {
+    HandleIASetIndexBuffer(context, indexBuffer, format, offset,
+        oIASetIndexBufferDeferred ? oIASetIndexBufferDeferred : oIASetIndexBuffer,
+        _ReturnAddress());
+}
+
+static void STDMETHODCALLTYPE HookedIASetVertexBuffersDeferred(
+        ID3D11DeviceContext* context, UINT startSlot, UINT bufferCount,
+        ID3D11Buffer* const* vertexBuffers, const UINT* strides,
+        const UINT* offsets) {
+    HandleIASetVertexBuffers(context, startSlot, bufferCount, vertexBuffers,
+                             strides, offsets,
+        oIASetVertexBuffersDeferred ? oIASetVertexBuffersDeferred : oIASetVertexBuffers);
+}
+
+static void PatchDeferredContextVtable(ID3D11DeviceContext* context) {
+    if (!context) return;
+    void** vtable = *reinterpret_cast<void***>(context);
+    if (!vtable) return;
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(&vtable[18], sizeof(void*) * 2, PAGE_EXECUTE_READWRITE,
+                        &oldProtect)) {
+        Log("[VanillaHands] ERROR: deferred context vtable not writable: ctx=%p",
+            context);
+        return;
+    }
+    if (!oIASetVertexBuffersDeferred) {
+        oIASetVertexBuffersDeferred = reinterpret_cast<IASetVertexBuffersFn>(vtable[18]);
+        oIASetIndexBufferDeferred = reinterpret_cast<IASetIndexBufferFn>(vtable[19]);
+        Log("[VanillaHands] Deferred context discovered: ctx=%p IASetVB=%p IASetIB=%p "
+            "immediateIB=%p",
+            context, reinterpret_cast<void*>(oIASetVertexBuffersDeferred),
+            reinterpret_cast<void*>(oIASetIndexBufferDeferred),
+            reinterpret_cast<void*>(oIASetIndexBuffer));
+    }
+    if (vtable[18] == reinterpret_cast<void*>(oIASetVertexBuffersDeferred))
+        vtable[18] = reinterpret_cast<void*>(&HookedIASetVertexBuffersDeferred);
+    if (vtable[19] == reinterpret_cast<void*>(oIASetIndexBufferDeferred))
+        vtable[19] = reinterpret_cast<void*>(&HookedIASetIndexBufferDeferred);
+    DWORD ignored = 0;
+    VirtualProtect(&vtable[18], sizeof(void*) * 2, oldProtect, &ignored);
+    static std::atomic<uint64_t> patchedContexts{0};
+    const uint64_t count = patchedContexts.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 8) {
+        Log("[VanillaHands] Deferred context vtable patched (%llu): ctx=%p",
+            count, context);
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreateDeferredContext(
+        ID3D11Device* device, UINT flags, ID3D11DeviceContext** context) {
+    const HRESULT result = oCreateDeferredContext(device, flags, context);
+    if (SUCCEEDED(result) && context && *context) {
+        PatchDeferredContextVtable(*context);
+    }
+    return result;
+}
+
+static IASetIndexBufferFn   oIASetIndexBufferDevice = nullptr;
+static IASetVertexBuffersFn oIASetVertexBuffersDevice = nullptr;
+
+static IASetIndexBufferFn   oIASetIndexBufferSlot = nullptr;
+static IASetVertexBuffersFn oIASetVertexBuffersSlot = nullptr;
+
+static void STDMETHODCALLTYPE HookedIASetIndexBufferSlot(
+        ID3D11DeviceContext* context, ID3D11Buffer* indexBuffer,
+        DXGI_FORMAT format, UINT offset) {
+    HandleIASetIndexBuffer(context, indexBuffer, format, offset,
+        oIASetIndexBufferSlot ? oIASetIndexBufferSlot : oIASetIndexBuffer,
+        _ReturnAddress());
+}
+
+static void STDMETHODCALLTYPE HookedIASetVertexBuffersSlot(
+        ID3D11DeviceContext* context, UINT startSlot, UINT bufferCount,
+        ID3D11Buffer* const* vertexBuffers, const UINT* strides,
+        const UINT* offsets) {
+    HandleIASetVertexBuffers(context, startSlot, bufferCount, vertexBuffers,
+                             strides, offsets,
+        oIASetVertexBuffersSlot ? oIASetVertexBuffersSlot : oIASetVertexBuffers);
+}
+
+// d3d11 can retarget the context's IA vtable slots after creation (observed:
+// slot19 FA F10 -> 92 C0 shortly after FirstPresent under SteamVR), silently
+// rerouting the game's binds around the function-level hook. Re-check the live
+// slots each frame and hook whatever they currently point at.
+static void EnsureRuntimeContextSlotHooks() {
+    if (!s_gameContext) return;
+    void** vt = *reinterpret_cast<void***>(s_gameContext);
+    if (!vt) return;
+    void* ibTarget = vt[19];
+    void* vbTarget = vt[18];
+    static void* lastIb = nullptr;
+    static void* lastVb = nullptr;
+    if (ibTarget && ibTarget != lastIb && ibTarget != s_tempIaSetIndexBufferTarget) {
+        const MH_STATUS create = MH_CreateHook(ibTarget, &HookedIASetIndexBufferSlot,
+            reinterpret_cast<void**>(&oIASetIndexBufferSlot));
+        const MH_STATUS enable = create == MH_OK ? MH_EnableHook(ibTarget) : create;
+        Log("[VanillaHands] Runtime IB slot hook: target=%p status=%s",
+            ibTarget, MH_StatusToString(enable));
+        if (enable == MH_OK)
+            AddHookPrologueSnapshot(ibTarget, "IASetIndexBuffer(runtime-slot)");
+        lastIb = ibTarget;
+    }
+    if (vbTarget && vbTarget != lastVb && vbTarget != s_tempIaSetVertexBuffersTarget) {
+        const MH_STATUS create = MH_CreateHook(vbTarget, &HookedIASetVertexBuffersSlot,
+            reinterpret_cast<void**>(&oIASetVertexBuffersSlot));
+        const MH_STATUS enable = create == MH_OK ? MH_EnableHook(vbTarget) : create;
+        Log("[VanillaHands] Runtime VB slot hook: target=%p status=%s",
+            vbTarget, MH_StatusToString(enable));
+        if (enable == MH_OK)
+            AddHookPrologueSnapshot(vbTarget, "IASetVertexBuffers(runtime-slot)");
+        lastVb = vbTarget;
+    }
+}
+
+static void STDMETHODCALLTYPE HookedIASetIndexBufferDevice(
+        ID3D11DeviceContext* context, ID3D11Buffer* indexBuffer,
+        DXGI_FORMAT format, UINT offset) {
+    HandleIASetIndexBuffer(context, indexBuffer, format, offset,
+        oIASetIndexBufferDevice ? oIASetIndexBufferDevice : oIASetIndexBuffer,
+        _ReturnAddress());
+}
+
+static void STDMETHODCALLTYPE HookedIASetVertexBuffersDevice(
+        ID3D11DeviceContext* context, UINT startSlot, UINT bufferCount,
+        ID3D11Buffer* const* vertexBuffers, const UINT* strides,
+        const UINT* offsets) {
+    HandleIASetVertexBuffers(context, startSlot, bufferCount, vertexBuffers,
+                             strides, offsets,
+        oIASetVertexBuffersDevice ? oIASetVertexBuffersDevice : oIASetVertexBuffers);
+}
+
+static void InstallContextFunctionHooksFromContext(ID3D11DeviceContext* context) {
+    if (!context) return;
+    void** vtable = *reinterpret_cast<void***>(context);
+    if (!vtable) return;
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) return;
+    void* ibTarget = vtable[19];
+    void* vbTarget = vtable[18];
+    Log("[VanillaHands] Device context functions: IASetIB=%p (install=%p) "
+        "IASetVB=%p (install=%p)",
+        ibTarget, s_tempIaSetIndexBufferTarget, vbTarget, s_tempIaSetVertexBuffersTarget);
+    if (ibTarget) {
+        const MH_STATUS create = MH_CreateHook(ibTarget, &HookedIASetIndexBufferDevice,
+            reinterpret_cast<void**>(&oIASetIndexBufferDevice));
+        if (create == MH_OK) {
+            if (MH_EnableHook(ibTarget) == MH_OK) {
+                AddHookPrologueSnapshot(ibTarget, "IASetIndexBuffer(device)");
+                Log("[VanillaHands] Device IASetIndexBuffer hook installed (%p)", ibTarget);
+            }
+        } else if (create != MH_ERROR_ALREADY_CREATED) {
+            Log("[VanillaHands] Device IASetIndexBuffer hook failed: %s",
+                MH_StatusToString(create));
+        }
+    }
+    if (vbTarget) {
+        const MH_STATUS create = MH_CreateHook(vbTarget, &HookedIASetVertexBuffersDevice,
+            reinterpret_cast<void**>(&oIASetVertexBuffersDevice));
+        if (create == MH_OK) {
+            if (MH_EnableHook(vbTarget) == MH_OK) {
+                AddHookPrologueSnapshot(vbTarget, "IASetVertexBuffers(device)");
+                Log("[VanillaHands] Device IASetVertexBuffers hook installed (%p)", vbTarget);
+            }
+        } else if (create != MH_ERROR_ALREADY_CREATED) {
+            Log("[VanillaHands] Device IASetVertexBuffers hook failed: %s",
+                MH_StatusToString(create));
+        }
+    }
+}
+
 
 static void EnsureHandOnlyIndexBuffer(ID3D11Device* device) {
     if (!device ||
@@ -1420,6 +1810,60 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
             config::Get().vanilla_hands_filter &&
                 s_handGeometryHooksReady.load(std::memory_order_acquire),
             std::memory_order_release);
+        // TEMP DIAG SteamVR hand-cut: report gate transitions once each.
+        {
+            static std::atomic<int> loggedGate{-1};
+            const int gate = s_vanillaHandsFilterEnabled.load(std::memory_order_acquire) ? 1 : 0;
+            if (loggedGate.exchange(gate, std::memory_order_relaxed) != gate) {
+                Log("[VanillaHands] Gate -> %d (config=%d hooksReady=%d)",
+                    gate, config::Get().vanilla_hands_filter ? 1 : 0,
+                    s_handGeometryHooksReady.load(std::memory_order_acquire) ? 1 : 0);
+            }
+        }
+        VerifyHandGeometryHookPrologues();
+        // TEMP DIAG SteamVR hand-cut: dump gate rejection counters periodically.
+        {
+            static std::atomic<uint64_t> rejectDumpCounter{0};
+            if (rejectDumpCounter.fetch_add(1, std::memory_order_relaxed) % 600 == 0) {
+                // TEMP DIAG: does the game context's vtable slot diverge from the
+                // hooked function, and what does the context think is bound right
+                // now (engine binds that bypass the hook would show up here)?
+                void* slot19 = nullptr;
+                void* slot18 = nullptr;
+                void* slot33 = nullptr;
+                void* slot47 = nullptr;
+                void* boundAddr = nullptr;
+                unsigned boundFmt = 0;
+                UINT boundOff = 0;
+                if (s_gameContext) {
+                    void** vt = *reinterpret_cast<void***>(s_gameContext);
+                    if (vt) {
+                        slot19 = vt[19];
+                        slot18 = vt[18];
+                        slot33 = vt[33];
+                        slot47 = vt[47];
+                    }
+                    ID3D11Buffer* boundBuf = nullptr;
+                    DXGI_FORMAT boundFormat = DXGI_FORMAT_UNKNOWN;
+                    UINT boundOffset = 0;
+                    s_gameContext->IAGetIndexBuffer(&boundBuf, &boundFormat, &boundOffset);
+                    boundAddr = static_cast<void*>(boundBuf);
+                    boundFmt = static_cast<unsigned>(boundFormat);
+                    boundOff = boundOffset;
+                    if (boundBuf) boundBuf->Release();
+                }
+                Log("[VanillaHands] IB gate stats: accepted=%llu insidePresent=%llu ctx=%llu disabled=%llu null=%llu fmt=%llu off=%llu v19=%p v18=%p v33=%p v47=%p bound=%p bfmt=%u boff=%u",
+                    s_ibAccepted.load(std::memory_order_relaxed),
+                    s_ibRejectInsidePresent.load(std::memory_order_relaxed),
+                    s_ibRejectContext.load(std::memory_order_relaxed),
+                    s_ibRejectDisabled.load(std::memory_order_relaxed),
+                    s_ibRejectNull.load(std::memory_order_relaxed),
+                    s_ibRejectFormat.load(std::memory_order_relaxed),
+                    s_ibRejectOffset.load(std::memory_order_relaxed),
+                    slot19, slot18, slot33, slot47, boundAddr, boundFmt, boundOff);
+            }
+        }
+        EnsureRuntimeContextSlotHooks();
         const float cutThreshold = config::Get().vanilla_hands_cut_threshold;
         const float previousCutThreshold = s_vanillaHandsCutThreshold.exchange(
             cutThreshold, std::memory_order_acq_rel);
@@ -1449,6 +1893,7 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain* sc, UINT syncInterval, UINT 
             if (s_gameDevice) {
                 s_gameDevice->GetImmediateContext(&s_gameContext);
                 Log("[BL1GOTYVR] Captured D3D11 device: %p, context: %p", s_gameDevice, s_gameContext);
+                InstallContextFunctionHooksFromContext(s_gameContext);
 
                 // Initialize FrameLoop
                 Log("[BL1GOTYVR] Initializing FrameLoop...");
@@ -1653,6 +2098,7 @@ bool InstallHooks() {
 
     void** vtable = *reinterpret_cast<void***>(swapChain);
     void** contextVtable = *reinterpret_cast<void***>(context);
+    void** deviceVtable = *reinterpret_cast<void***>(device);
     void* presentTarget = vtable[8];
     void* resizeTarget = vtable[13];
     void* copyResourceTarget = contextVtable[47];
@@ -1660,6 +2106,9 @@ bool InstallHooks() {
     void* omSetRenderTargetsTarget = contextVtable[33];
     void* iaSetVertexBuffersTarget = contextVtable[18];
     void* iaSetIndexBufferTarget = contextVtable[19];
+    s_tempIaSetVertexBuffersTarget = iaSetVertexBuffersTarget;
+    s_tempIaSetIndexBufferTarget = iaSetIndexBufferTarget;
+    void* createDeferredContextTarget = deviceVtable[31];
     Log("[BL1GOTYVR] DXGI targets: Present=%p ResizeBuffers=%p", presentTarget, resizeTarget);
 
     // Tear down the temporary swapchain before patching global DXGI methods.
@@ -1753,18 +2202,36 @@ bool InstallHooks() {
     MH_STATUS indexBufferStatus = MH_CreateHook(
         iaSetIndexBufferTarget, &HookedIASetIndexBuffer,
         reinterpret_cast<void**>(&oIASetIndexBuffer));
+    if (indexBufferStatus == MH_ERROR_ALREADY_CREATED) {
+        if (!oIASetIndexBuffer) oIASetIndexBuffer = oIASetIndexBufferDevice;
+        indexBufferStatus = MH_OK;
+    }
     if (indexBufferStatus == MH_OK)
         indexBufferStatus = MH_QueueEnableHook(iaSetIndexBufferTarget);
     MH_STATUS vertexBufferStatus = MH_CreateHook(
         iaSetVertexBuffersTarget, &HookedIASetVertexBuffers,
         reinterpret_cast<void**>(&oIASetVertexBuffers));
+    if (vertexBufferStatus == MH_ERROR_ALREADY_CREATED) {
+        if (!oIASetVertexBuffers) oIASetVertexBuffers = oIASetVertexBuffersDevice;
+        vertexBufferStatus = MH_OK;
+    }
     if (vertexBufferStatus == MH_OK)
         vertexBufferStatus = MH_QueueEnableHook(iaSetVertexBuffersTarget);
+    MH_STATUS deferredContextStatus = MH_CreateHook(
+        createDeferredContextTarget, &HookedCreateDeferredContext,
+        reinterpret_cast<void**>(&oCreateDeferredContext));
+    if (deferredContextStatus == MH_OK)
+        deferredContextStatus = MH_QueueEnableHook(createDeferredContextTarget);
     const MH_STATUS applyStatus = MH_ApplyQueued();
     s_handGeometryHooksReady.store(
         vertexBufferStatus == MH_OK && indexBufferStatus == MH_OK &&
             applyStatus == MH_OK,
         std::memory_order_release);
+    AddHookPrologueSnapshot(iaSetIndexBufferTarget, "IASetIndexBuffer");
+    AddHookPrologueSnapshot(iaSetVertexBuffersTarget, "IASetVertexBuffers");
+    AddHookPrologueSnapshot(omSetRenderTargetsTarget, "OMSetRenderTargets");
+    AddHookPrologueSnapshot(copyResourceTarget, "CopyResource");
+    AddHookPrologueSnapshot(resolveTarget, "ResolveSubresource");
     if (presentStatus == MH_OK && applyStatus != MH_OK) presentStatus = applyStatus;
     if (presentStatus != MH_OK) {
         Log("[BL1GOTYVR] ERROR: Present hook failed: %s", MH_StatusToString(presentStatus));
@@ -1773,8 +2240,9 @@ bool InstallHooks() {
     Log("[BL1GOTYVR] Composition hooks queued: CopyResource=%s ResolveSubresource=%s OMSetRT=%s Apply=%s",
         MH_StatusToString(copyStatus), MH_StatusToString(resolveStatus), MH_StatusToString(omStatus),
         MH_StatusToString(applyStatus));
-    Log("[VanillaHands] Geometry hooks queued: IASetVB=%s IASetIB=%s",
-        MH_StatusToString(vertexBufferStatus), MH_StatusToString(indexBufferStatus));
+    Log("[VanillaHands] Geometry hooks queued: IASetVB=%s IASetIB=%s Deferred=%s",
+        MH_StatusToString(vertexBufferStatus), MH_StatusToString(indexBufferStatus),
+        MH_StatusToString(deferredContextStatus));
     Log("[BL1GOTYVR] ResizeBuffers hook deferred until Present path is stable (target=%p)",
         resizeTarget);
     Log("[BL1GOTYVR] Real DXGI Present hook installed");
