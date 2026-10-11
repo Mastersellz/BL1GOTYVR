@@ -27,6 +27,7 @@ bool GetPrincipalRenderExtent(uint32_t& width, uint32_t& height);
 void DiscardCompletedNativeMultiviewFrame();
 void SuspendNativeMultiview();
 float* GetCameraLocation();   // float[3]
+bool GetPoseReference(float position[3], float rotation[4]);
 int32_t* GetCameraRotation(); // int[3] in Unis
 UE3Globals GetUE3GlobalsSnapshot();
 void RequestRecenter();  // Request camera recenter (integer yaw system)

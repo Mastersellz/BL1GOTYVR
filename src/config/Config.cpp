@@ -318,6 +318,10 @@ void Load(const char* path) {
         "Visibility", "VanillaHandsCutThreshold",
         s_settings.vanilla_hands_cut_threshold, path), 20.0f, 90.0f);
 
+    s_settings.manual_reload_shotgun = GetPrivateProfileIntA(
+        "Gameplay", "ManualReloadShotgun",
+        s_settings.manual_reload_shotgun ? 1 : 0, path) != 0;
+
     Log("[Config] Loaded %s: %dx%d scale=%.2f FOV=%.1f IPD=%.1fmm "
         "convergenceShift=%.2f%% refresh=%.1fHz SFR=%s aim=(%.2f,%.2f) dot=%.1fm",
         path, s_settings.render_width, s_settings.render_height, s_settings.resolution_scale,
@@ -465,6 +469,8 @@ void Save(const char* path) {
         s_settings.vanilla_hands_filter ? "1" : "0", path);
     WriteFloat("Visibility", "VanillaHandsCutThreshold",
         s_settings.vanilla_hands_cut_threshold, path);
+    WritePrivateProfileStringA("Gameplay", "ManualReloadShotgun",
+        s_settings.manual_reload_shotgun ? "1" : "0", path);
     WritePrivateProfileStringA(nullptr, nullptr, nullptr, path);
 
     WIN32_FILE_ATTRIBUTE_DATA attributes = {};

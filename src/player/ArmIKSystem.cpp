@@ -1485,6 +1485,16 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
                             inventoryEntry.role = ComponentRole::PawnBody;
                         }
                         recordInventoryEntry(inventoryEntry);
+                        if (exactWeaponOuter) {
+                            input::WeaponAimSystem::Instance().NoteEquippedWeaponMesh(
+                                outer, mesh, meshName);
+                        }
+                        if (inventoryEntry.role ==
+                                ComponentRole::ProbableFirstPersonArms &&
+                            inventoryEntry.skeletalMesh >= 0x10000) {
+                            input::WeaponAimSystem::Instance().DumpHandsBonesOnce(
+                                inventoryEntry.skeletalMesh);
+                        }
                         if (rightChain || leftChain) {
                             static std::atomic<uint32_t> armLayoutLogs{0};
                             const uint32_t logIndex = armLayoutLogs.fetch_add(
@@ -1569,6 +1579,10 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
                         entry.skeletalMeshOffset = pointerOffset;
                         ReadObjectName(globals, mesh, entry.meshName,
                                        sizeof(entry.meshName));
+                        if (entry.meshName[0]) {
+                            input::WeaponAimSystem::Instance().NoteEquippedWeaponMesh(
+                                identity.weapon, entry.skeletalMesh, entry.meshName);
+                        }
                         break;
                     }
                 }
@@ -2396,14 +2410,15 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
     bool weaponContact = false;
     if (weaponFrameValid && snapshot.valid[0] &&
         inputHook.IsMotionControlsEnabled() && inputHook.IsWeaponPoseActive()) {
+        // The whole weapon body is grabbable: distance from the left hand to
+        // the weapon axis, from the receiver to past the muzzle.
         const Vec3 relative = snapshot.position[0] - weaponPosition;
         float along = relative.x * weaponForward.x +
             relative.y * weaponForward.y + relative.z * weaponForward.z;
-        along = (std::max)(4.0f, (std::min)(along, 48.0f));
-        const Vec3 gripPoint = weaponPosition + weaponForward * along +
-            weaponRight * -8.0f + weaponUp * -6.0f;
-        constexpr float kContactRadiusUe = 10.0f;
-        weaponContact = (snapshot.position[0] - gripPoint).lengthSq() <=
+        along = (std::max)(0.0f, (std::min)(along, 90.0f));
+        const Vec3 axisPoint = weaponPosition + weaponForward * along;
+        constexpr float kContactRadiusUe = 16.0f;
+        weaponContact = (snapshot.position[0] - axisPoint).lengthSq() <=
             kContactRadiusUe * kContactRadiusUe;
     }
     inputHook.SetWeaponGrabArmed(weaponContact);
@@ -2534,6 +2549,10 @@ bool ArmIKSystem::ReapplyRenderPalette() {
         Apply(renderGeneration, targetGeneration, false);
 }
 
+// Curl the LEFT hand fingers around the carried magazine. Runs after the IK
+// palette write so the closure survives the arm solve.
+static void ApplyMagCarryFingerCurl(uintptr_t component);
+
 bool ArmIKSystem::ApplyPostAnimation(void* component) {
     if (!component || !m_poseHookInstalled.load(std::memory_order_acquire)) return false;
     uintptr_t targetComponent = 0;
@@ -2543,8 +2562,145 @@ bool ArmIKSystem::ApplyPostAnimation(void* component) {
     if (reinterpret_cast<uintptr_t>(component) != targetComponent) return false;
     const uint64_t renderGeneration = m_renderGeneration.load(std::memory_order_acquire);
     const uint64_t targetGeneration = m_renderTargetGeneration.load(std::memory_order_acquire);
-    return renderGeneration != 0 && targetGeneration != 0 &&
+    const bool applied = renderGeneration != 0 && targetGeneration != 0 &&
         Apply(renderGeneration, targetGeneration, false);
+    static constexpr bool kMagFingerCurlEnabled = false;
+    if (kMagFingerCurlEnabled && applied &&
+        input::InputHook::Instance().IsMagCarried())
+        ApplyMagCarryFingerCurl(targetComponent);
+    return applied;
+}
+
+static void ApplyMagCarryFingerCurl(uintptr_t component) {
+    if (component < 0x10000) return;
+    constexpr uintptr_t kSpaceBasesOffset = 0x330;
+    constexpr uint64_t kBoneMatrixStride = 0x40;
+    struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
+    TArrayPose poses = {};
+    if (!ReadMemory(component + kSpaceBasesOffset, &poses, sizeof(poses)) ||
+        !poses.data || poses.count < 41 || poses.count > 256 ||
+        poses.capacity < poses.count)
+        return;
+    auto readMatrix = [&](int bone, float out[16]) {
+        return ReadMemory(poses.data +
+                              static_cast<uint64_t>(bone) * kBoneMatrixStride,
+                          out, sizeof(float) * 16);
+    };
+    float wrist[16] = {};
+    if (!readMatrix(19, wrist)) return;
+    const float wristPosition[3] = {wrist[12], wrist[13], wrist[14]};
+    // Knuckle line (index proximal to pinky proximal) is the shared bend axis
+    // for the four fingers; per-chain cross products are noise on straight
+    // fingers and mangle the hand.
+    float indexProximal[16] = {};
+    float pinkyProximal[16] = {};
+    if (!readMatrix(24, indexProximal) || !readMatrix(36, pinkyProximal)) return;
+    float knuckleAxis[3] = {
+        indexProximal[12] - pinkyProximal[12],
+        indexProximal[13] - pinkyProximal[13],
+        indexProximal[14] - pinkyProximal[14]};
+    const float knuckleLength = sqrtf(knuckleAxis[0] * knuckleAxis[0] +
+        knuckleAxis[1] * knuckleAxis[1] + knuckleAxis[2] * knuckleAxis[2]);
+    if (!std::isfinite(knuckleLength) || knuckleLength < 1.0e-5f) return;
+    knuckleAxis[0] /= knuckleLength;
+    knuckleAxis[1] /= knuckleLength;
+    knuckleAxis[2] /= knuckleLength;
+    struct Finger { int bones[4]; float cumulativeDegrees[4]; };
+    static const Finger fingers[5] = {
+        {{20, 21, 22, 23}, {0.0f, 0.0f, 0.0f, 0.0f}},
+        {{24, 25, 26, 27}, {15.0f, 30.0f, 45.0f, 45.0f}},
+        {{28, 29, 30, 31}, {15.0f, 30.0f, 45.0f, 45.0f}},
+        {{32, 33, 34, 35}, {15.0f, 30.0f, 45.0f, 45.0f}},
+        {{36, 37, 38, 39}, {15.0f, 30.0f, 45.0f, 45.0f}}
+    };
+    constexpr float kDegreesToRadians = 0.01745329251994329577f;
+    for (const Finger& finger : fingers) {
+        float matrices[4][16] = {};
+        if (!readMatrix(finger.bones[0], matrices[0]) ||
+            !readMatrix(finger.bones[1], matrices[1]) ||
+            !readMatrix(finger.bones[2], matrices[2]) ||
+            !readMatrix(finger.bones[3], matrices[3]))
+            continue;
+        float positions[4][3] = {};
+        for (int joint = 0; joint < 4; ++joint) {
+            positions[joint][0] = matrices[joint][12];
+            positions[joint][1] = matrices[joint][13];
+            positions[joint][2] = matrices[joint][14];
+        }
+        const float d01[3] = {
+            positions[1][0] - positions[0][0],
+            positions[1][1] - positions[0][1],
+            positions[1][2] - positions[0][2]};
+        float axis[3] = {knuckleAxis[0], knuckleAxis[1], knuckleAxis[2]};
+        const float toWrist[3] = {
+            wristPosition[0] - positions[2][0],
+            wristPosition[1] - positions[2][1],
+            wristPosition[2] - positions[2][2]};
+        // Positive rotation moves each bone's tip along axis x direction; flip
+        // the axis when that moves the finger away from the palm.
+        const float tangent[3] = {
+            axis[1] * d01[2] - axis[2] * d01[1],
+            axis[2] * d01[0] - axis[0] * d01[2],
+            axis[0] * d01[1] - axis[1] * d01[0]};
+        if (tangent[0] * toWrist[0] + tangent[1] * toWrist[1] +
+            tangent[2] * toWrist[2] < 0.0f) {
+            axis[0] = -axis[0];
+            axis[1] = -axis[1];
+            axis[2] = -axis[2];
+        }
+        for (int joint = 0; joint < 4; ++joint) {
+            const float angle = finger.cumulativeDegrees[joint] *
+                kDegreesToRadians;
+            const float c = cosf(angle);
+            const float s = sinf(angle);
+            const float t = 1.0f - c;
+            const float x = axis[0];
+            const float y = axis[1];
+            const float z = axis[2];
+            const float columnRotation[3][3] = {
+                {t * x * x + c, t * x * y - s * z, t * x * z + s * y},
+                {t * x * y + s * z, t * y * y + c, t * y * z - s * x},
+                {t * x * z - s * y, t * y * z + s * x, t * z * z + c}};
+            float rotation[3][3] = {};
+            for (int row = 0; row < 3; ++row)
+                for (int column = 0; column < 3; ++column)
+                    rotation[row][column] = columnRotation[column][row];
+            // Proper FK: the whole chain rotates about the finger's base
+            // knuckle with cumulative angles, so the bases fold instead of
+            // only the tips spinning in place.
+            const float* pivot = positions[0];
+            float pivotRotated[3] = {};
+            for (int column = 0; column < 3; ++column)
+                for (int row = 0; row < 3; ++row)
+                    pivotRotated[column] += pivot[row] * rotation[row][column];
+            float pivotMatrix[16] = {};
+            for (int row = 0; row < 3; ++row)
+                for (int column = 0; column < 3; ++column)
+                    pivotMatrix[row * 4 + column] = rotation[row][column];
+            pivotMatrix[12] = pivot[0] - pivotRotated[0];
+            pivotMatrix[13] = pivot[1] - pivotRotated[1];
+            pivotMatrix[14] = pivot[2] - pivotRotated[2];
+            pivotMatrix[15] = 1.0f;
+            float result[16] = {};
+            for (int row = 0; row < 4; ++row) {
+                for (int column = 0; column < 4; ++column) {
+                    float sum = 0.0f;
+                    for (int index = 0; index < 4; ++index)
+                        sum += matrices[joint][row * 4 + index] *
+                            pivotMatrix[index * 4 + column];
+                    result[row * 4 + column] = sum;
+                }
+            }
+            result[12] = pivot[0];
+            result[13] = pivot[1];
+            result[14] = pivot[2];
+            WriteProcessMemory(GetCurrentProcess(),
+                reinterpret_cast<void*>(poses.data +
+                    static_cast<uint64_t>(finger.bones[joint]) *
+                        kBoneMatrixStride),
+                result, sizeof(result), nullptr);
+        }
+    }
 }
 
 bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,

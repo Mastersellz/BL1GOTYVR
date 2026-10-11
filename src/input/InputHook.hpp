@@ -89,6 +89,9 @@ public:
         return m_nativeCrouchCameraActive.load(std::memory_order_acquire);
     }
     bool IsAimDotVisible() const;
+    bool GetReloadHighlight(float worldOut[3], float* radiusMeters) const;
+    bool GetWeaponClipWorldPosition(float out[3]) const;
+    bool IsMagCarried() const;
     bool GetWeaponBarrelLocalDirection(float direction[3]);
     bool GetDrivenWeaponFrame(float position[3], float forward[3],
                               float up[3]) const;
@@ -115,6 +118,13 @@ private:
     bool UpdatePhysicalMelee(const ControllerState& controller, int hand,
                              uint64_t nowMs, bool fistMode);
     void ResetPhysicalMelee(int hand = -1);
+    bool UpdateShotgunReloadSequence(const ControllerState controllers[2],
+                                     bool xDown, bool usableTargeted,
+                                     bool actionDown, uint64_t nowMs);
+    void ResetManualReload();
+    // True while the left hand is inside a mag-action zone (mag well or
+    // pouch); the left trigger is captured for the grab during these phases.
+    bool IsLeftGripCaptured() const { return m_shotgunReload.gripCaptured; }
     void ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
                                   const char* characterMeshName,
                                   const char* outerName, const char* meshName,
@@ -175,6 +185,45 @@ private:
         bool ready = true;
     };
     PhysicalMeleeTracker m_melee[2] = {};
+
+    /* Manual shotgun reload: X releases the mag, left hand extracts it,
+       grabs a fresh one from the left-hip pouch and seats it -> R pulse. */
+    struct ShotgunReloadSequencer {
+        enum class Phase : uint8_t { Idle = 0, MagReleased, MagOut, NeedMag, NewMag };
+        Phase phase = Phase::Idle;
+        bool wellLatched = false;
+        bool pouchLatched = false;
+        bool xWasDown = false;
+        bool gripWasDown = false;
+        bool gripCaptured = false;
+        bool forwardCurrentPress = true;
+        bool wellAnchorValid = false;
+        float wellAnchor[3] = {};
+        uint64_t enteredPhaseMs = 0;
+        uint64_t cooldownUntilMs = 0;
+        uint64_t keyboardReloadPulseUntilMs = 0;
+    };
+    ShotgunReloadSequencer m_shotgunReload = {};
+    /* Visible mag: drives the weapon mesh b_clip bone from the render path. */
+    struct MagHoldParams {
+        int32_t mode = 0;   // 0=game control, 1=in left hand, 2=thrown
+        bool grabRotationValid = false;
+        uint64_t throwStartMs = 0;
+        float throwOrigin[3] = {};
+        float throwVelocity[3] = {};
+        float grabHandRotation[9] = {};  // hand world rotation at grab (row-vector)
+        float grabMagRotation[9] = {};   // mag world rotation at grab (row-vector)
+    };
+    mutable SRWLOCK m_magHoldLock = SRWLOCK_INIT;
+    MagHoldParams m_magHold = {};
+    void PublishMagHold(int32_t mode);
+    void PublishMagThrow(const float originWorld[3], const float velocityWorld[3]);
+    bool ApplyMagBoneOverride();
+    std::atomic<bool> m_reloadHighlightActive{false};
+    std::atomic<float> m_reloadHighlightX{0.0f};
+    std::atomic<float> m_reloadHighlightY{0.0f};
+    std::atomic<float> m_reloadHighlightZ{0.0f};
+    std::atomic<float> m_reloadHighlightRadius{0.0f};
     std::atomic<bool> m_berserkPunchMode{false};
     bool m_skillGripWasDown = false;
     uint64_t m_berserkActivationUntilMs = 0;

@@ -102,7 +102,11 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space,
         XR_FAILED(CreateAction(m_actionSet, &m_rightThumbstickClick, XR_ACTION_TYPE_BOOLEAN_INPUT,
             "right_stick_click", "Right Stick Click")) ||
         XR_FAILED(CreateAction(m_actionSet, &m_menuButton, XR_ACTION_TYPE_BOOLEAN_INPUT,
-            "menu", "Menu"))) return false;
+            "menu", "Menu")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_haptic[0], XR_ACTION_TYPE_VIBRATION_OUTPUT,
+            "left_haptic", "Left Haptic")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_haptic[1], XR_ACTION_TYPE_VIBRATION_OUTPUT,
+            "right_haptic", "Right Haptic"))) return false;
 
     auto path = [&](const char* value) {
         XrPath result = XR_NULL_PATH;
@@ -141,6 +145,8 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space,
         {m_leftThumbstickClick, path("/user/hand/left/input/thumbstick/click")},
         {m_rightThumbstickClick, path("/user/hand/right/input/thumbstick/click")},
         {m_menuButton, path("/user/hand/left/input/menu/click")},
+        {m_haptic[0], path("/user/hand/left/output/haptic")},
+        {m_haptic[1], path("/user/hand/right/output/haptic")},
     };
     if (!suggest("/interaction_profiles/oculus/touch_controller", touch, _countof(touch)))
         return false;
@@ -167,6 +173,8 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space,
         {m_leftThumbstickClick, path("/user/hand/left/input/thumbstick/click")},
         {m_rightThumbstickClick, path("/user/hand/right/input/thumbstick/click")},
         {m_menuButton, path("/user/hand/left/input/system/click")},
+        {m_haptic[0], path("/user/hand/left/output/haptic")},
+        {m_haptic[1], path("/user/hand/right/output/haptic")},
     };
     suggest("/interaction_profiles/valve/index_controller", index, _countof(index));
 
@@ -183,6 +191,8 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space,
         {m_leftTrigger, path("/user/hand/left/input/trigger/value")},
         {m_rightTrigger, path("/user/hand/right/input/trigger/value")},
         {m_menuButton, path("/user/hand/left/input/menu/click")},
+        {m_haptic[0], path("/user/hand/left/output/haptic")},
+        {m_haptic[1], path("/user/hand/right/output/haptic")},
     };
     suggest("/interaction_profiles/htc/vive_controller", vive, _countof(vive));
 
@@ -396,6 +406,24 @@ void XRInput::UpdateControllerStateUnlocked(int hand, XrTime displayTime) {
             ctrl.thumbstickClick, ctrl.menuButton,
             ctrl.thumbstickX, ctrl.thumbstickY, ctrl.trigger, ctrl.grip);
     }
+}
+
+void XRInput::SendHaptic(int hand, float amplitude, float durationMs,
+                         float frequencyHz) {
+    if (hand < 0 || hand > 1 || m_haptic[hand] == XR_NULL_HANDLE ||
+        m_session == XR_NULL_HANDLE)
+        return;
+    XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
+    vibration.amplitude = amplitude < 0.0f ? 0.0f :
+        (amplitude > 1.0f ? 1.0f : amplitude);
+    vibration.duration = static_cast<XrDuration>(
+        static_cast<int64_t>(durationMs * 1000000.0));
+    vibration.frequency = frequencyHz;
+    XrHapticActionInfo actionInfo{XR_TYPE_HAPTIC_ACTION_INFO};
+    actionInfo.action = m_haptic[hand];
+    actionInfo.subactionPath = XR_NULL_PATH;
+    xrApplyHapticFeedback(m_session, &actionInfo,
+        reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
 }
 
 void XRInput::LogCurrentInteractionProfiles() const {

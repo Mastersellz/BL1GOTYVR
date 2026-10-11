@@ -55,6 +55,61 @@ static bool s_aimFunctionCacheValid = false;
 static SRWLOCK s_aimFunctionCacheLock = SRWLOCK_INIT;
 thread_local unsigned s_meleeAttackDepth = 0;
 
+struct WeaponPropWatchEntry {
+    int32_t offset = -1;
+    int32_t size = 0;
+    char name[64] = {};
+    int64_t lastValue = 0;
+    bool lastValid = false;
+};
+static WeaponPropWatchEntry s_weaponPropWatches[48] = {};
+static std::atomic<uint32_t> s_weaponPropWatchCount{0};
+static std::atomic<bool> s_weaponPropsDumped{false};
+static std::atomic<bool> s_weaponBonesDumped{false};
+static std::atomic<bool> s_handsBonesDumped{false};
+
+using ReloadRequestFn = void(__fastcall*)(void*, void*, void*);
+static ReloadRequestFn s_originalReloadRequest = nullptr;
+
+static void __fastcall HookedReloadRequest(void* object, void* frame, void* result) {
+    // Manual shotgun reload: auto-reload while firing is denied; the physical
+    // sequence owns the reload and refills the clip directly.
+    if (config::Get().manual_reload_shotgun &&
+        WeaponAimSystem::Instance().IsEquippedWeaponShotgun()) {
+        if (result) *reinterpret_cast<uint8_t*>(result) = 0;
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            Log("[ReloadHook] ShouldAutoReloadWhileFiring blocked (manual reload)");
+        return;
+    }
+    if (s_originalReloadRequest)
+        s_originalReloadRequest(object, frame, result);
+}
+
+bool WeaponNameContainsNoCase(const char* text, const char* lowerNeedle) {
+    if (!text || !lowerNeedle || !*lowerNeedle) return false;
+    for (const char* p = text; *p; ++p) {
+        const char* a = p;
+        const char* b = lowerNeedle;
+        while (*a && *b) {
+            char ca = *a;
+            if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
+            if (ca != *b) break;
+            ++a;
+            ++b;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
+
+bool IsManualReloadShotgunName(const char* weaponName, const char* weaponClassName) {
+    return WeaponNameContainsNoCase(weaponName, "shotgun") ||
+        WeaponNameContainsNoCase(weaponClassName, "shotgun") ||
+        WeaponNameContainsNoCase(weaponName, "riot") ||
+        WeaponNameContainsNoCase(weaponClassName, "riot");
+}
+
 enum class InteractionCallSource : uint32_t {
     ProcessEvent = 1,
     CallFunction = 2,
@@ -3314,6 +3369,14 @@ PlayerIdentitySnapshot WeaponAimSystem::GetPlayerIdentity() {
             ValidateRuntimeObject(globals, names, currentWeapon, "Weapon", weaponClass,
                 weaponName, sizeof(weaponName), weaponClassName, sizeof(weaponClassName));
         if (weaponRelationshipValid) {
+            if (IsManualReloadShotgunName(weaponName, weaponClassName)) {
+                const uintptr_t previousEvidence = m_shotgunEvidenceWeapon.exchange(
+                    currentWeapon, std::memory_order_acq_rel);
+                if (previousEvidence != currentWeapon) {
+                    Log("[WeaponAim] Manual reload family: shotgun=1 via weapon name "
+                        "(%s/%s)", weaponName, weaponClassName);
+                }
+            }
             bool changed = false;
             bool aimInvalidated = false;
             const uintptr_t selectedAimFunction =
@@ -3490,6 +3553,14 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
     m_localWeapon.store(weapon, std::memory_order_release);
     m_pawnIdentityValid.store(true, std::memory_order_release);
     m_weaponIdentityValid.store(weaponValid, std::memory_order_release);
+    if (weaponValid && IsManualReloadShotgunName(weaponName, weaponClassName)) {
+        const uintptr_t previousEvidence = m_shotgunEvidenceWeapon.exchange(
+            weapon, std::memory_order_acq_rel);
+        if (previousEvidence != weapon) {
+            Log("[WeaponAim] Manual reload family: shotgun=1 via weapon name "
+                "(%s/%s) [fast]", weaponName, weaponClassName);
+        }
+    }
     m_pawnPropertyOffset = pawnOffset;
     m_controllerPropertyOffset = controllerOffset;
     m_weaponPropertyOffset = weaponOffset;
@@ -3513,6 +3584,339 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
             selectedAimCompatible, selectedAimOwnerDistance);
     }
     return weaponValid;
+}
+
+void WeaponAimSystem::NoteEquippedWeaponMesh(uintptr_t weapon, uintptr_t skeletalMesh,
+                                             const char* meshName) {
+    if (weapon < 0x10000 || !meshName || !*meshName) return;
+    if (skeletalMesh >= 0x10000)
+        m_lastWeaponMesh.store(skeletalMesh, std::memory_order_release);
+    if (!WeaponNameContainsNoCase(meshName, "shotgun") &&
+        !WeaponNameContainsNoCase(meshName, "riot"))
+        return;
+    const uintptr_t previous =
+        m_shotgunEvidenceWeapon.exchange(weapon, std::memory_order_acq_rel);
+    if (previous != weapon) {
+        Log("[WeaponAim] Manual reload family: shotgun=1 via weapon mesh (%s)",
+            meshName);
+    }
+}
+
+static bool DumpMeshBoneNames(uintptr_t mesh, const char* tag) {
+    const auto globals = camera::GetUE3GlobalsSnapshot();
+    if (!globals.gNamesValid || !globals.gObjectsValid) return false;
+    TArray64 names = {};
+    if (!ReadMem(globals.gNamesAddress, &names, sizeof(names))) return false;
+    // The mesh asset holds a bone array; validate candidates by resolving the
+    // first FName of each element through GNames (printable ASCII required).
+    for (int arrayOffset = 0x40; arrayOffset <= 0x800; arrayOffset += 4) {
+        TArray64 candidate = {};
+        if (!ReadMem(mesh + static_cast<uintptr_t>(arrayOffset), &candidate,
+                     sizeof(candidate)) ||
+            !candidate.data || candidate.count < 1 || candidate.count > 256 ||
+            candidate.capacity < candidate.count || candidate.capacity > 512)
+            continue;
+        for (int stride : {0x40, 0x50, 0x58, 0x30, 0x28, 0x60}) {
+            const int checked = (std::min)(candidate.count, 32);
+            int printable = 0;
+            for (int index = 0; index < checked; ++index) {
+                int32_t nameIndex = -1;
+                if (!ReadMem(candidate.data +
+                             static_cast<uint64_t>(index) * stride,
+                             &nameIndex, sizeof(nameIndex))) break;
+                char boneName[128] = {};
+                if (ReadName(globals, names, nameIndex, boneName,
+                             sizeof(boneName)) && boneName[0]) ++printable;
+            }
+            if (printable > 0 && printable >= checked * 3 / 4) {
+                Log("[%s] mesh=%p array=+0x%X count=%d stride=0x%X "
+                    "printable=%d/%d", tag, reinterpret_cast<void*>(mesh),
+                    arrayOffset, candidate.count, stride, printable, checked);
+                const int logCount = (std::min)(candidate.count, 128);
+                for (int index = 0; index < logCount; ++index) {
+                    int32_t nameIndex = -1;
+                    int32_t nameNumber = 0;
+                    ReadMem(candidate.data + static_cast<uint64_t>(index) * stride,
+                            &nameIndex, sizeof(nameIndex));
+                    ReadMem(candidate.data + static_cast<uint64_t>(index) * stride + 4,
+                            &nameNumber, sizeof(nameNumber));
+                    char boneName[128] = {};
+                    ReadName(globals, names, nameIndex, boneName, sizeof(boneName));
+                    Log("[%s] [%d] '%s' (#%d)", tag, index, boneName,
+                        nameNumber);
+                }
+                return true;
+            }
+        }
+    }
+    Log("[%s] no name-validated bone array found on mesh=%p", tag,
+        reinterpret_cast<void*>(mesh));
+    return true;
+}
+
+void WeaponAimSystem::DumpWeaponBonesOnce() {
+    if (s_weaponBonesDumped.load(std::memory_order_acquire)) return;
+    const uintptr_t mesh = m_lastWeaponMesh.load(std::memory_order_acquire);
+    if (mesh < 0x10000) return;
+    if (!DumpMeshBoneNames(mesh, "WeaponBones")) return;
+    s_weaponBonesDumped.store(true, std::memory_order_release);
+}
+
+void WeaponAimSystem::DumpHandsBonesOnce(uintptr_t mesh) {
+    if (s_handsBonesDumped.load(std::memory_order_acquire)) return;
+    if (mesh < 0x10000) return;
+    if (!DumpMeshBoneNames(mesh, "HandsBones")) return;
+    s_handsBonesDumped.store(true, std::memory_order_release);
+}
+
+void WeaponAimSystem::InstallReloadBlocker() {
+    if (m_reloadBlockerAttempted.load(std::memory_order_acquire)) return;
+    const auto globals = camera::GetUE3GlobalsSnapshot();
+    if (!globals.gNamesValid || !globals.gObjectsValid) return;
+    TArray64 names = {};
+    TArray64 objects = {};
+    if (!ReadMem(globals.gNamesAddress, &names, sizeof(names)) ||
+        !ReadMem(globals.gObjectsAddress, &objects, sizeof(objects))) return;
+    static const char* candidates[] = {
+        "ShouldAutoReloadWhileFiring", "StartReload", "Reload", "BeginReload",
+        "AttemptReload", "WeaponReload"
+    };
+    uintptr_t functionObject = 0;
+    char functionName[128] = {};
+    for (int32_t index = 0; index < objects.count && !functionObject; ++index) {
+        uintptr_t object = 0;
+        char className[128] = {};
+        char objectName[128] = {};
+        if (!ReadMem(objects.data + static_cast<uint64_t>(index) * sizeof(uintptr_t),
+                     &object, sizeof(object)) || !object ||
+            !ReadClassName(globals, names, object, className, sizeof(className)) ||
+            strcmp(className, "Function") != 0 ||
+            !ReadObjectName(globals, names, object, objectName,
+                            sizeof(objectName)))
+            continue;
+        char lower[128] = {};
+        size_t length = strlen(objectName);
+        if (length >= sizeof(lower)) length = sizeof(lower) - 1;
+        for (size_t i = 0; i < length; ++i) {
+            char ch = objectName[i];
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+            lower[i] = ch;
+        }
+        if (!strstr(lower, "reload")) continue;
+        uintptr_t outer = 0;
+        char outerName[128] = {};
+        if (!ReadMem(object + globals.gObjectNameOffset - 8, &outer,
+                     sizeof(outer)) || !outer)
+            continue;
+        ReadObjectName(globals, names, outer, outerName, sizeof(outerName));
+        bool exactCandidate = false;
+        for (const char* candidate : candidates)
+            if (strcmp(objectName, candidate) == 0) exactCandidate = true;
+        Log("[ReloadHook] candidate fn=%s outer=%s exact=%d", objectName,
+            outerName, exactCandidate);
+        if (exactCandidate && strcmp(outerName, "WillowWeapon") == 0) {
+            functionObject = object;
+            strcpy_s(functionName, objectName);
+        }
+    }
+    if (functionObject < 0x10000) {
+        Log("[ReloadHook] WillowWeapon reload function not found");
+        return;
+    }
+    uintptr_t target = 0;
+    if (!ReadMem(functionObject + 0xF0, &target, sizeof(target)) ||
+        target < 0x10000) {
+        Log("[ReloadHook] reload function target unreadable");
+        return;
+    }
+    void* original = nullptr;
+    const MH_STATUS status = MH_CreateHook(reinterpret_cast<void*>(target),
+        reinterpret_cast<void*>(&HookedReloadRequest), &original);
+    if (status == MH_OK) {
+        s_originalReloadRequest = reinterpret_cast<ReloadRequestFn>(original);
+        MH_EnableHook(reinterpret_cast<void*>(target));
+        m_reloadBlockerTarget = target;
+        Log("[ReloadHook] blocking vanilla reload: %s target=%p",
+            functionName, reinterpret_cast<void*>(target));
+    } else {
+        Log("[ReloadHook] MH_CreateHook failed: %d", static_cast<int>(status));
+    }
+    m_reloadBlockerAttempted.store(true, std::memory_order_release);
+}
+
+// WillowWeapon class layout (from the [WeaponProps] dump):
+// ClipSize @ +0x4C4, ReloadCnt (current clip) @ +0x4E4.
+bool WeaponAimSystem::RefillEquippedWeaponClip() {
+    const uintptr_t weapon = m_localWeapon.load(std::memory_order_acquire);
+    if (weapon < 0x10000) return false;
+    constexpr int32_t kClipSizeOffset = 0x4C4;
+    constexpr int32_t kReloadCntOffset = 0x4E4;
+    int32_t clipSize = 0;
+    int32_t reloadCnt = 0;
+    if (!ReadMem(weapon + static_cast<uintptr_t>(kClipSizeOffset), &clipSize,
+                 sizeof(clipSize)) ||
+        !ReadMem(weapon + static_cast<uintptr_t>(kReloadCntOffset), &reloadCnt,
+                 sizeof(reloadCnt)))
+        return false;
+    if (clipSize <= 0 || clipSize > 256 || reloadCnt < 0 || reloadCnt > 256)
+        return false;
+    if (reloadCnt == clipSize) {
+        Log("[ManualReload] Clip already full (%d/%d); no write", reloadCnt, clipSize);
+        return true;
+    }
+    if (!WriteMem(weapon + static_cast<uintptr_t>(kReloadCntOffset), &clipSize,
+                  sizeof(clipSize)))
+        return false;
+    Log("[ManualReload] Clip refilled directly: %d -> %d (no animation)",
+        reloadCnt, clipSize);
+    return true;
+}
+
+void WeaponAimSystem::DumpWeaponPropertiesOnce() {
+    if (s_weaponPropsDumped.load(std::memory_order_acquire)) return;
+    if (m_localWeapon.load(std::memory_order_acquire) < 0x10000) return;
+    // BL1E reflection layout from bl-sdk/unrealsdk:
+    // UStruct::SuperField=0x78, PropertyLink=0xB0;
+    // ZProperty::Offset_Internal=0x8C, PropertyLinkNext=0x90.
+    const auto globals = camera::GetUE3GlobalsSnapshot();
+    if (!globals.gNamesValid || !globals.gObjectsValid) return;
+    TArray64 names = {};
+    TArray64 objects = {};
+    if (!ReadMem(globals.gNamesAddress, &names, sizeof(names)) ||
+        !ReadMem(globals.gObjectsAddress, &objects, sizeof(objects))) return;
+    uintptr_t weaponClass = 0;
+    for (int32_t index = 0; index < objects.count; ++index) {
+        uintptr_t object = 0;
+        char objectName[128] = {};
+        char className[128] = {};
+        if (!ReadMem(objects.data + static_cast<uint64_t>(index) * sizeof(uintptr_t),
+                     &object, sizeof(object)) || !object ||
+            !ReadObjectName(globals, names, object, objectName, sizeof(objectName)) ||
+            !ReadClassName(globals, names, object, className, sizeof(className)))
+            continue;
+        if (strcmp(className, "Class") == 0 && strcmp(objectName, "WillowWeapon") == 0) {
+            weaponClass = object;
+            break;
+        }
+    }
+    if (weaponClass < 0x10000) return;
+    s_weaponPropsDumped.store(true, std::memory_order_release);
+    Log("[WeaponProps] WillowWeapon class=%p", reinterpret_cast<void*>(weaponClass));
+    static const char* keywords[] = {
+        "ammo", "clip", "reload", "mag", "chamber", "shell", "round", "bullet"
+    };
+    uint32_t watchCount = 0;
+    for (int depth = 0; depth < 16 && weaponClass >= 0x10000; ++depth) {
+        char ownerName[128] = {};
+        ReadObjectName(globals, names, weaponClass, ownerName, sizeof(ownerName));
+        uintptr_t property = 0;
+        ReadMem(weaponClass + 0xB0, &property, sizeof(property));
+        size_t visited = 0;
+        while (property >= 0x10000 && visited++ < 2048) {
+            char propertyName[128] = {};
+            char propertyClass[128] = {};
+            int32_t offset = -1;
+            int32_t arrayDim = 0;
+            int32_t elementSize = 0;
+            uintptr_t next = 0;
+            const bool valid =
+                ReadObjectName(globals, names, property, propertyName,
+                               sizeof(propertyName)) &&
+                ReadClassName(globals, names, property, propertyClass,
+                              sizeof(propertyClass)) &&
+                ReadMem(property + 0x8C, &offset, sizeof(offset)) &&
+                ReadMem(property + 0x68, &arrayDim, sizeof(arrayDim)) &&
+                ReadMem(property + 0x6C, &elementSize, sizeof(elementSize)) &&
+                ReadMem(property + 0x90, &next, sizeof(next));
+            if (!valid) break;
+            if (offset >= 0 && elementSize > 0) {
+                Log("[WeaponProps] %s.%s type=%s offset=+0x%X size=%d depth=%d",
+                    ownerName, propertyName, propertyClass, offset, elementSize, depth);
+                char lower[128] = {};
+                size_t length = strlen(propertyName);
+                if (length >= sizeof(lower)) length = sizeof(lower) - 1;
+                for (size_t i = 0; i < length; ++i) {
+                    char ch = propertyName[i];
+                    if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+                    lower[i] = ch;
+                }
+                const bool interesting =
+                    (elementSize == 1 || elementSize == 2 || elementSize == 4 ||
+                     elementSize == 8) &&
+                    elementSize <= 8;
+                bool keywordMatch = false;
+                for (const char* keyword : keywords)
+                    if (interesting && strstr(lower, keyword)) keywordMatch = true;
+                if (keywordMatch && watchCount < _countof(s_weaponPropWatches)) {
+                    WeaponPropWatchEntry& entry = s_weaponPropWatches[watchCount];
+                    entry.offset = offset;
+                    entry.size = elementSize;
+                    strcpy_s(entry.name, propertyName);
+                    entry.lastValid = false;
+                    ++watchCount;
+                }
+            }
+            if (next == property) break;
+            property = next;
+        }
+        uintptr_t superField = 0;
+        if (!ReadMem(weaponClass + 0x78, &superField, sizeof(superField))) break;
+        weaponClass = superField;
+    }
+    s_weaponPropWatchCount.store(watchCount, std::memory_order_release);
+    Log("[WeaponProps] watch count=%u", watchCount);
+}
+
+void WeaponAimSystem::TickWeaponPropertyWatch() {
+    const uint32_t watchCount = s_weaponPropWatchCount.load(std::memory_order_acquire);
+    if (watchCount == 0) return;
+    const uintptr_t weapon = m_localWeapon.load(std::memory_order_acquire);
+    if (weapon < 0x10000) return;
+    static uint64_t s_lastTickMs = 0;
+    const uint64_t now = GetTickCount64();
+    if (now - s_lastTickMs < 250) return;
+    s_lastTickMs = now;
+    for (uint32_t index = 0; index < watchCount; ++index) {
+        WeaponPropWatchEntry& entry = s_weaponPropWatches[index];
+        int64_t value = 0;
+        if (!ReadMem(weapon + static_cast<uintptr_t>(entry.offset), &value,
+                     static_cast<size_t>(entry.size)))
+            continue;
+        const int64_t mask = entry.size == 8 ? -1LL :
+            ((1LL << (entry.size * 8)) - 1LL);
+        value &= mask;
+        if (!entry.lastValid) {
+            entry.lastValid = true;
+            entry.lastValue = value;
+            if (entry.size == 4) {
+                float asFloat = 0.0f;
+                const int32_t asInt32 = static_cast<int32_t>(value);
+                memcpy(&asFloat, &asInt32, sizeof(asFloat));
+                Log("[WeaponProps] watch init %s +0x%X = %d (f=%.3f)", entry.name,
+                    entry.offset, asInt32, asFloat);
+            } else {
+                Log("[WeaponProps] watch init %s +0x%X = %lld", entry.name,
+                    entry.offset, static_cast<long long>(value));
+            }
+            continue;
+        }
+        if (value == entry.lastValue) continue;
+        if (entry.size == 4) {
+            float floatOld = 0.0f;
+            float floatNew = 0.0f;
+            const int32_t oldInt = static_cast<int32_t>(entry.lastValue);
+            const int32_t newInt = static_cast<int32_t>(value);
+            memcpy(&floatOld, &oldInt, sizeof(floatOld));
+            memcpy(&floatNew, &newInt, sizeof(floatNew));
+            Log("[WeaponProps] watch %s +0x%X: %d -> %d (f: %.3f -> %.3f)",
+                entry.name, entry.offset, oldInt, newInt, floatOld, floatNew);
+        } else {
+            Log("[WeaponProps] watch %s +0x%X: %lld -> %lld", entry.name,
+                entry.offset, static_cast<long long>(entry.lastValue),
+                static_cast<long long>(value));
+        }
+        entry.lastValue = value;
+    }
 }
 
 void WeaponAimSystem::DumpInteractionCandidates() {
@@ -4266,6 +4670,7 @@ void WeaponAimSystem::Shutdown() {
     m_localController.store(0, std::memory_order_release);
     m_localPawn.store(0, std::memory_order_release);
     m_localWeapon.store(0, std::memory_order_release);
+    m_shotgunEvidenceWeapon.store(0, std::memory_order_release);
     m_pawnIdentityValid.store(false, std::memory_order_release);
     m_weaponIdentityValid.store(false, std::memory_order_release);
     m_pawnPropertyOffset = -1;

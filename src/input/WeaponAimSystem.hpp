@@ -53,6 +53,24 @@ public:
     bool IsPlayerInjured() const {
         return m_playerInjured.load(std::memory_order_acquire);
     }
+    bool IsEquippedWeaponShotgun() const {
+        const uintptr_t evidence =
+            m_shotgunEvidenceWeapon.load(std::memory_order_acquire);
+        return evidence != 0 &&
+            m_weaponIdentityValid.load(std::memory_order_acquire) &&
+            evidence == m_localWeapon.load(std::memory_order_acquire);
+    }
+    void NoteEquippedWeaponMesh(uintptr_t weapon, uintptr_t skeletalMesh,
+                                const char* meshName);
+    bool HasUsableTarget() const {
+        return m_sampledUsableObject.load(std::memory_order_acquire) != 0;
+    }
+    void DumpWeaponPropertiesOnce();
+    void DumpWeaponBonesOnce();
+    void DumpHandsBonesOnce(uintptr_t mesh);
+    void InstallReloadBlocker();
+    void TickWeaponPropertyWatch();
+    bool RefillEquippedWeaponClip();
     bool IsPhaseWalkActive();
     bool RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_t pawn);
 
@@ -130,6 +148,10 @@ private:
     std::atomic<uintptr_t> m_localController{0};
     std::atomic<uintptr_t> m_localPawn{0};
     std::atomic<uintptr_t> m_localWeapon{0};
+    std::atomic<uintptr_t> m_shotgunEvidenceWeapon{0};
+    std::atomic<uintptr_t> m_lastWeaponMesh{0};
+    std::atomic<bool> m_reloadBlockerAttempted{false};
+    uintptr_t m_reloadBlockerTarget = 0;
     std::atomic<uint64_t> m_identityGeneration{0};
     std::atomic<bool> m_pawnIdentityValid{false};
     std::atomic<bool> m_weaponIdentityValid{false};

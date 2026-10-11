@@ -108,6 +108,9 @@ float hud_horizontal_offset = 0.0f;
     bool vanilla_hands_filter = true;
     float vanilla_hands_cut_threshold = 70.0f;
 
+    /* Manual reload (VR pump gestures); shotgun first */
+    bool manual_reload_shotgun = true;
+
     /* Debug */
     bool debug_force_no_hud_layer = false;  /* Skip HUD layer submission for VDXR testing */
 };

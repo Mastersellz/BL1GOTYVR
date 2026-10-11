@@ -35,6 +35,8 @@ public:
     bool SyncActions();
     void UpdateControllerStates(XrTime displayTime);
     bool GetControllerSnapshot(ControllerState controllers[2], uint64_t* generation = nullptr) const;
+    void SendHaptic(int hand, float amplitude, float durationMs,
+                    float frequencyHz = 150.0f);
     void LogCurrentInteractionProfiles() const;
 
 private:
@@ -79,6 +81,9 @@ private:
     XrAction m_leftThumbstickClick = XR_NULL_HANDLE;
     XrAction m_rightThumbstickClick = XR_NULL_HANDLE;
     XrAction m_menuButton = XR_NULL_HANDLE;
+
+    // Haptic output
+    XrAction m_haptic[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
 
     ControllerState m_controllers[2] = {};
     uint64_t m_generation = 0;

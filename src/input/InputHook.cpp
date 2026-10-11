@@ -47,6 +47,99 @@ static void RotateMeleeVector(const float quaternion[4], const float vector[3],
         (quaternion[0] * ty - quaternion[1] * tx);
 }
 
+static void XrVectorToUe(const float xr[3], float ue[3]) {
+    ue[0] = -xr[2];
+    ue[1] = xr[0];
+    ue[2] = xr[1];
+}
+
+static void RotatePitchYawVec(const float vector[3], float pitch, float yaw,
+                              float output[3]) {
+    const float pitchSine = sinf(pitch);
+    const float pitchCosine = cosf(pitch);
+    const float pitchedX = pitchCosine * vector[0] - pitchSine * vector[2];
+    const float pitchedZ = pitchSine * vector[0] + pitchCosine * vector[2];
+    const float sine = sinf(yaw);
+    const float cosine = cosf(yaw);
+    output[0] = cosine * pitchedX - sine * vector[1];
+    output[1] = sine * pitchedX + cosine * vector[1];
+    output[2] = pitchedZ;
+}
+
+static void QuatMultiplyFast(const float a[4], const float b[4], float out[4]) {
+    out[0] = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+    out[1] = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+    out[2] = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+    out[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+}
+
+static void Multiply3x3(const float a[9], const float b[9], float out[9]) {
+    for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 3; ++column) {
+            float sum = 0.0f;
+            for (int index = 0; index < 3; ++index)
+                sum += a[row * 3 + index] * b[index * 3 + column];
+            out[row * 3 + column] = sum;
+        }
+    }
+}
+
+static void Transpose3x3(const float a[9], float out[9]) {
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column)
+            out[row * 3 + column] = a[column * 3 + row];
+}
+
+// Hand world rotation (UE3, row-vector 3x3) from the XR controller pose,
+// mirroring the ArmIK XrControllerToWorld conversion.
+static bool HandWorldRotationFromXr(const float controllerRotation[4],
+                                    const float referenceRotation[4],
+                                    float pitch, float yaw, float out[9]) {
+    const float inverseReference[4] = {
+        -referenceRotation[0], -referenceRotation[1],
+        -referenceRotation[2], referenceRotation[3]};
+    float relative[4] = {};
+    QuatMultiplyFast(inverseReference, controllerRotation, relative);
+    const float length = sqrtf(relative[0] * relative[0] +
+        relative[1] * relative[1] + relative[2] * relative[2] +
+        relative[3] * relative[3]);
+    if (!std::isfinite(length) || length < 1.0e-6f) return false;
+    for (float& value : relative) value /= length;
+    constexpr float kLocalForward[3] = {0.0f, 0.0f, -1.0f};
+    constexpr float kLocalUp[3] = {0.0f, 1.0f, 0.0f};
+    float xrForward[3] = {};
+    float xrUp[3] = {};
+    RotateMeleeVector(relative, kLocalForward, xrForward);
+    RotateMeleeVector(relative, kLocalUp, xrUp);
+    float mapped[3] = {};
+    float ueForward[3] = {};
+    float ueUp[3] = {};
+    XrVectorToUe(xrForward, mapped);
+    RotatePitchYawVec(mapped, pitch, yaw, ueForward);
+    XrVectorToUe(xrUp, mapped);
+    RotatePitchYawVec(mapped, pitch, yaw, ueUp);
+    const float forwardLength = sqrtf(ueForward[0] * ueForward[0] +
+        ueForward[1] * ueForward[1] + ueForward[2] * ueForward[2]);
+    if (!std::isfinite(forwardLength) || forwardLength < 1.0e-5f) return false;
+    for (float& value : ueForward) value /= forwardLength;
+    float right[3] = {
+        ueUp[1] * ueForward[2] - ueUp[2] * ueForward[1],
+        ueUp[2] * ueForward[0] - ueUp[0] * ueForward[2],
+        ueUp[0] * ueForward[1] - ueUp[1] * ueForward[0]};
+    const float rightLength = sqrtf(right[0] * right[0] + right[1] * right[1] +
+        right[2] * right[2]);
+    if (!std::isfinite(rightLength) || rightLength < 1.0e-5f) return false;
+    for (float& value : right) value /= rightLength;
+    const float up[3] = {
+        ueForward[1] * right[2] - ueForward[2] * right[1],
+        ueForward[2] * right[0] - ueForward[0] * right[2],
+        ueForward[0] * right[1] - ueForward[1] * right[0]};
+    out[0] = right[0]; out[1] = right[1]; out[2] = right[2];
+    out[3] = up[0]; out[4] = up[1]; out[5] = up[2];
+    out[6] = -ueForward[0]; out[7] = -ueForward[1]; out[8] = -ueForward[2];
+    return true;
+}
+
 void InputHook::Install() {
     if (m_installed) return;
     Log("[Input] Installing VR input system...");
@@ -104,7 +197,8 @@ void InputHook::Install() {
         config::Get().snap_turn_angle, config::Get().locomotion_deadzone,
         config::Get().weapon_position_scale);
     Log("[Input] Map: sticks analog, RT fire, LT ADS, A jump, B Esc/back, "
-        "X use/reload, Y cycle, LB skill, RB grenade, L3 sprint, R3 crouch");
+        "X use/reload (shotgun: LT grabs mag), Y cycle, LB skill, "
+        "RB grenade, L3 sprint, R3 crouch");
     Log("[Input] Y chord: tap=Y, hold 400ms=Back/ECHO, hold+left stick=D-pad");
     Log("[Input] UI navigation: left stick vertical=D-pad up/down; melee=physical VR swing");
     Log("[Input] Calibration: Ctrl+Numpad 1=global left hand, 3=active weapon, "
@@ -203,6 +297,7 @@ void InputHook::ReleaseAllInput() {
     m_weaponGrabLatched = false;
     m_snapTurnAccum = 0;
     ResetPhysicalMelee();
+    ResetManualReload();
     if (m_outputLive) {
         Log("[Input] Output neutralized (focus, tracking, or action sync unavailable)");
         m_outputLive = false;
@@ -347,6 +442,405 @@ bool InputHook::UpdatePhysicalMelee(const ControllerState& controller, int hand,
     return nowMs < tracker.pulseUntilMs;
 }
 
+void InputHook::ResetManualReload() {
+    m_shotgunReload = {};
+    PublishMagHold(0);
+}
+
+bool InputHook::UpdateShotgunReloadSequence(const ControllerState controllers[2],
+                                            bool xDown, bool usableTargeted,
+                                            bool actionDown, uint64_t nowMs) {
+    ShotgunReloadSequencer& seq = m_shotgunReload;
+    const bool pressed = xDown && !seq.xWasDown;
+    seq.xWasDown = xDown;
+    const bool actionWasDown = seq.gripWasDown;
+    const bool gripPressed = actionDown && !seq.gripWasDown;
+    const bool actionReleased = !actionDown && actionWasDown;
+    seq.gripWasDown = actionDown;
+    auto& xrInput = XRInput::Instance();
+    if (pressed) {
+        if (usableTargeted) {
+            // A usable is under the crosshair: let X do its contextual use.
+            seq.forwardCurrentPress = true;
+        } else if (seq.phase == ShotgunReloadSequencer::Phase::Idle &&
+                   nowMs >= seq.cooldownUntilMs) {
+            seq.phase = ShotgunReloadSequencer::Phase::MagReleased;
+            seq.enteredPhaseMs = nowMs;
+            seq.wellLatched = false;
+            seq.pouchLatched = false;
+            seq.forwardCurrentPress = false;
+            xrInput.SendHaptic(1, 0.6f, 70.0f);
+            Log("[ManualReload] Mag released — pull it out with the left hand "
+                "(press X again = instant reload)");
+        } else {
+            // Press during an active sequence: ignore. The vanilla reload is
+            // fully suppressed while the manual shotgun flow is in control.
+            seq.forwardCurrentPress = false;
+            xrInput.SendHaptic(0, 0.2f, 30.0f);
+            Log("[ManualReload] Reload key ignored during sequence");
+        }
+    }
+    const bool forward = xDown && (seq.forwardCurrentPress || usableTargeted);
+
+    if (seq.phase == ShotgunReloadSequencer::Phase::Idle) {
+        seq.gripCaptured = false;
+        m_reloadHighlightActive.store(false, std::memory_order_release);
+        return forward;
+    }
+
+    const ControllerState& offHand = controllers[0];
+    const ControllerState& weaponHand = controllers[1];
+    if (!offHand.aimValid || !weaponHand.aimValid ||
+        !m_motionControlsEnabled.load(std::memory_order_acquire)) {
+        seq.gripCaptured = false;
+        m_reloadHighlightActive.store(false, std::memory_order_release);
+        return forward;
+    }
+    constexpr float kLocalForward[3] = {0.0f, 0.0f, -1.0f};
+    constexpr float kLocalRight[3] = {1.0f, 0.0f, 0.0f};
+    float weaponForward[3] = {};
+    RotateMeleeVector(weaponHand.aimRotation, kLocalForward, weaponForward);
+    if (!std::isfinite(weaponForward[0]) || !std::isfinite(weaponForward[1]) ||
+        !std::isfinite(weaponForward[2]))
+        return forward;
+    constexpr float kLocalUp[3] = {0.0f, 1.0f, 0.0f};
+    float weaponUp[3] = {};
+    RotateMeleeVector(weaponHand.aimRotation, kLocalUp, weaponUp);
+    float weaponRight[3] = {
+        weaponForward[1] * weaponUp[2] - weaponForward[2] * weaponUp[1],
+        weaponForward[2] * weaponUp[0] - weaponForward[0] * weaponUp[2],
+        weaponForward[0] * weaponUp[1] - weaponForward[1] * weaponUp[0]};
+    // Mag well: primary source is the weapon mesh's b_clip bone (index 25),
+    // read in UE3 world space and mapped to XR with the same axis remap the
+    // aim code uses (ue -> xr: (y, z, -x), cm -> m). Falls back to the
+    // calibrated grip-space estimate when the bone read is unavailable.
+    constexpr float kWellForwardMeters = 0.15f;
+    constexpr float kWellUpMeters = -0.12f;
+    constexpr float kWellRightMeters = -0.10f;
+    float headPosition[3] = {};
+    float headRotation[4] = {};
+    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    if (!xr::OpenXRContext::Instance().GetPoseSnapshot(
+            headPosition, headRotation, views)) {
+        m_reloadHighlightActive.store(false, std::memory_order_release);
+        return forward;
+    }
+    float well[3] = {
+        weaponHand.position[0] + weaponForward[0] * kWellForwardMeters +
+            weaponUp[0] * kWellUpMeters + weaponRight[0] * kWellRightMeters,
+        weaponHand.position[1] + weaponForward[1] * kWellForwardMeters +
+            weaponUp[1] * kWellUpMeters + weaponRight[1] * kWellRightMeters,
+        weaponHand.position[2] + weaponForward[2] * kWellForwardMeters +
+            weaponUp[2] * kWellUpMeters + weaponRight[2] * kWellRightMeters};
+    bool wellFromBone = false;
+    {
+        float clipWorld[3] = {};
+        const float* cameraLocation = camera::GetCameraLocation();
+        const int32_t* cameraRotation = camera::GetCameraRotation();
+        float referencePosition[3] = {};
+        float referenceRotation[4] = {};
+        if (cameraLocation && cameraRotation &&
+            camera::GetPoseReference(referencePosition, referenceRotation) &&
+            GetWeaponClipWorldPosition(clipWorld)) {
+            const float scale = 100.0f * config::Get().positional_scale;
+            const float yaw = static_cast<float>(cameraRotation[1]) *
+                6.2831853071795864769f / 65536.0f;
+            const float relative[3] = {
+                (clipWorld[0] - cameraLocation[0]) / scale,
+                (clipWorld[1] - cameraLocation[1]) / scale,
+                (clipWorld[2] - cameraLocation[2]) / scale};
+            if (scale > 1.0f && std::isfinite(relative[0]) &&
+                std::isfinite(relative[1]) && std::isfinite(relative[2]) &&
+                fabsf(relative[0]) < 10.0f && fabsf(relative[1]) < 10.0f &&
+                fabsf(relative[2]) < 10.0f) {
+                // Exact inverse of the ArmIK world mapping: undo yaw, apply
+                // UeToXr, then the pose reference orientation/position.
+                const float sine = sinf(-yaw);
+                const float cosine = cosf(-yaw);
+                const float yawedX = cosine * relative[0] - sine * relative[1];
+                const float yawedY = sine * relative[0] + cosine * relative[1];
+                const float yawedZ = relative[2];
+                const float localXr[3] = {yawedY, yawedZ, -yawedX};
+                float stageOffset[3] = {};
+                RotateMeleeVector(referenceRotation, localXr, stageOffset);
+                well[0] = referencePosition[0] + stageOffset[0];
+                well[1] = referencePosition[1] + stageOffset[1];
+                well[2] = referencePosition[2] + stageOffset[2];
+                wellFromBone = true;
+            }
+        }
+    }
+    if (seq.phase == ShotgunReloadSequencer::Phase::Idle) seq.wellAnchorValid = false;
+    if (seq.wellAnchorValid) {
+        // While the mag is carried, keep the well at its seated position so
+        // insertion detection and the glow do not chase the left hand.
+        well[0] = seq.wellAnchor[0];
+        well[1] = seq.wellAnchor[1];
+        well[2] = seq.wellAnchor[2];
+    }
+    float headRight[3] = {};
+    RotateMeleeVector(headRotation, kLocalRight, headRight);
+    float headForwardVec[3] = {};
+    RotateMeleeVector(headRotation, kLocalForward, headForwardVec);
+    float headUpVec[3] = {};
+    RotateMeleeVector(headRotation, kLocalUp, headUpVec);
+    // Ammo pouch at the natural left hip, calibrated from the in-game Grip
+    // log: ~0.65m below the head, ~0.32m to the left, at the body plane.
+    float pouch[3] = {
+        headPosition[0] + headForwardVec[0] * 0.02f -
+            headUpVec[0] * 0.65f - headRight[0] * 0.32f,
+        headPosition[1] + headForwardVec[1] * 0.02f -
+            headUpVec[1] * 0.65f - headRight[1] * 0.32f,
+        headPosition[2] + headForwardVec[2] * 0.02f -
+            headUpVec[2] * 0.65f - headRight[2] * 0.32f};
+    auto distance3 = [](const float a[3], const float b[3]) {
+        const float dx = a[0] - b[0];
+        const float dy = a[1] - b[1];
+        const float dz = a[2] - b[2];
+        return sqrtf(dx * dx + dy * dy + dz * dz);
+    };
+    const float dWell = distance3(offHand.aimPosition, well);
+    const float dPouch = distance3(offHand.aimPosition, pouch);
+    if (!std::isfinite(dWell) || !std::isfinite(dPouch)) return forward;
+    constexpr float kWellGlow = 0.30f;
+    constexpr float kWellExtract = 0.26f;
+    constexpr float kPouchGlow = 0.30f;
+    constexpr float kPouchExtract = 0.28f;
+
+    bool highlight = false;
+    float highlightPos[3] = {};
+    float highlightRadius = 0.0f;
+    bool gripCaptured = false;
+    const ShotgunReloadSequencer::Phase phaseBefore = seq.phase;
+    if (gripPressed) {
+        const float toWell[3] = {
+            offHand.aimPosition[0] - well[0],
+            offHand.aimPosition[1] - well[1],
+            offHand.aimPosition[2] - well[2]};
+        const float corrFwd = toWell[0] * weaponForward[0] +
+            toWell[1] * weaponForward[1] + toWell[2] * weaponForward[2];
+        const float corrUp = toWell[0] * weaponUp[0] +
+            toWell[1] * weaponUp[1] + toWell[2] * weaponUp[2];
+        const float corrRight = toWell[0] * weaponRight[0] +
+            toWell[1] * weaponRight[1] + toWell[2] * weaponRight[2];
+        float headForward[3] = {};
+        float headUp[3] = {};
+        float headRight[3] = {};
+        RotateMeleeVector(headRotation, kLocalForward, headForward);
+        RotateMeleeVector(headRotation, kLocalUp, headUp);
+        RotateMeleeVector(headRotation, kLocalRight, headRight);
+        const float toPouch[3] = {
+            offHand.aimPosition[0] - pouch[0],
+            offHand.aimPosition[1] - pouch[1],
+            offHand.aimPosition[2] - pouch[2]};
+        const float pouchFwd = toPouch[0] * headForward[0] +
+            toPouch[1] * headForward[1] + toPouch[2] * headForward[2];
+        const float pouchUp = toPouch[0] * headUp[0] +
+            toPouch[1] * headUp[1] + toPouch[2] * headUp[2];
+        const float pouchRight = toPouch[0] * headRight[0] +
+            toPouch[1] * headRight[1] + toPouch[2] * headRight[2];
+        Log("[ManualReload] Grip: phase=%d dWell=%.2f dPouch=%.2f src=%s "
+            "mag(fwd=%.2f up=%.2f right=%.2f) pouch(fwd=%.2f up=%.2f right=%.2f)",
+            static_cast<int>(seq.phase), dWell, dPouch,
+            wellFromBone ? "bone" : "fallback",
+            corrFwd, corrUp, corrRight, pouchFwd, pouchUp, pouchRight);
+    }
+    auto publishThrowFromHand = [&](const float velocityXr[3]) {
+        float magWorld[3] = {};
+        if (!GetWeaponClipWorldPosition(magWorld)) {
+            PublishMagHold(0);
+            return;
+        }
+        const int32_t* cameraRotation = camera::GetCameraRotation();
+        const float yaw = cameraRotation
+            ? static_cast<float>(cameraRotation[1]) *
+                6.2831853071795864769f / 65536.0f
+            : 0.0f;
+        float velocityUe[3] = {};
+        XrVectorToUe(velocityXr, velocityUe);
+        const float sine = sinf(yaw);
+        const float cosine = cosf(yaw);
+        const float velocityX = cosine * velocityUe[0] - sine * velocityUe[1];
+        const float velocityY = sine * velocityUe[0] + cosine * velocityUe[1];
+        const float scale = 100.0f * config::Get().positional_scale;
+        const float velocityWorld[3] = {
+            velocityX * scale, velocityY * scale, velocityUe[2] * scale};
+        PublishMagThrow(magWorld, velocityWorld);
+    };
+    auto seatMag = [&]() {
+        seq.phase = ShotgunReloadSequencer::Phase::Idle;
+        seq.cooldownUntilMs = nowMs + 500;
+        seq.enteredPhaseMs = nowMs;
+        seq.wellAnchorValid = false;
+        PublishMagHold(0);
+        xrInput.SendHaptic(0, 1.0f, 100.0f);
+        xrInput.SendHaptic(1, 0.5f, 60.0f);
+        if (WeaponAimSystem::Instance().RefillEquippedWeaponClip()) {
+            Log("[ManualReload] Mag inserted -> clip refilled (no animation)");
+        } else {
+            seq.keyboardReloadPulseUntilMs = nowMs + 140;
+            Log("[ManualReload] Mag inserted -> direct refill failed, "
+                "classic reload pulse");
+        }
+    };
+    switch (seq.phase) {
+    case ShotgunReloadSequencer::Phase::MagReleased:
+        if (dWell <= kWellGlow) {
+            highlight = true;
+            highlightRadius = 0.11f;
+            memcpy(highlightPos, well, sizeof(highlightPos));
+            gripCaptured = true;
+            if (dWell <= kWellExtract && gripPressed) {
+                seq.phase = ShotgunReloadSequencer::Phase::MagOut;
+                seq.enteredPhaseMs = nowMs;
+                memcpy(seq.wellAnchor, well, sizeof(seq.wellAnchor));
+                seq.wellAnchorValid = true;
+                PublishMagHold(1);
+                xrInput.SendHaptic(0, 0.9f, 90.0f);
+                Log("[ManualReload] Mag grabbed — carry it (release at the "
+                    "weapon to insert, anywhere else to drop)");
+            }
+        }
+        break;
+    case ShotgunReloadSequencer::Phase::MagOut:
+        if (dPouch <= kPouchGlow) {
+            highlight = true;
+            highlightRadius = 0.15f;
+            memcpy(highlightPos, pouch, sizeof(highlightPos));
+            gripCaptured = true;
+        }
+        if (actionReleased) {
+            // The carried mag is the spent one: releasing never inserts it,
+            // it always gets dropped; the fresh mag comes from the pouch.
+            const float velocityXr[3] = {-0.4f, -1.3f, 0.5f};
+            publishThrowFromHand(velocityXr);
+            seq.phase = ShotgunReloadSequencer::Phase::NeedMag;
+            seq.enteredPhaseMs = nowMs;
+            xrInput.SendHaptic(0, 0.5f, 70.0f);
+            Log("[ManualReload] Mag dropped — grab a fresh one from the "
+                "left-hip pouch");
+        }
+        break;
+    case ShotgunReloadSequencer::Phase::NeedMag:
+        if (dPouch <= kPouchGlow) {
+            highlight = true;
+            highlightRadius = 0.15f;
+            memcpy(highlightPos, pouch, sizeof(highlightPos));
+            gripCaptured = true;
+            if (dPouch <= kPouchExtract && gripPressed) {
+                seq.phase = ShotgunReloadSequencer::Phase::NewMag;
+                seq.enteredPhaseMs = nowMs;
+                PublishMagHold(1);
+                xrInput.SendHaptic(0, 0.9f, 90.0f);
+                Log("[ManualReload] Fresh mag in hand — release at the weapon "
+                    "to insert");
+            }
+        }
+        break;
+    case ShotgunReloadSequencer::Phase::NewMag:
+        if (dWell <= kWellGlow) {
+            highlight = true;
+            highlightRadius = 0.11f;
+            memcpy(highlightPos, well, sizeof(highlightPos));
+        }
+        if (actionReleased) {
+            if (dWell <= 0.35f) {
+                seatMag();
+            } else {
+                const float velocityXr[3] = {-0.4f, -1.3f, 0.5f};
+                publishThrowFromHand(velocityXr);
+                seq.phase = ShotgunReloadSequencer::Phase::NeedMag;
+                seq.enteredPhaseMs = nowMs;
+                xrInput.SendHaptic(0, 0.5f, 70.0f);
+                Log("[ManualReload] Mag dropped — grab a fresh one from the "
+                    "left-hip pouch");
+            }
+        }
+        break;
+    default:
+        break;
+    }
+    if (gripPressed && phaseBefore != ShotgunReloadSequencer::Phase::Idle &&
+        seq.phase == phaseBefore) {
+        // Mis-press feedback: the squeeze registered but not near its target.
+        xrInput.SendHaptic(0, 0.25f, 40.0f);
+    }
+    seq.gripCaptured = gripCaptured;
+    m_reloadHighlightActive.store(highlight, std::memory_order_release);
+    if (highlight) {
+        m_reloadHighlightX.store(highlightPos[0], std::memory_order_relaxed);
+        m_reloadHighlightY.store(highlightPos[1], std::memory_order_relaxed);
+        m_reloadHighlightZ.store(highlightPos[2], std::memory_order_relaxed);
+        m_reloadHighlightRadius.store(highlightRadius, std::memory_order_relaxed);
+    }
+    return forward;
+}
+
+bool InputHook::IsMagCarried() const {
+    AcquireSRWLockShared(const_cast<SRWLOCK*>(&m_magHoldLock));
+    const int32_t mode = m_magHold.mode;
+    ReleaseSRWLockShared(const_cast<SRWLOCK*>(&m_magHoldLock));
+    return mode == 1;
+}
+
+bool InputHook::GetReloadHighlight(float worldOut[3], float* radiusMeters) const {
+    if (!m_reloadHighlightActive.load(std::memory_order_acquire)) return false;
+    worldOut[0] = m_reloadHighlightX.load(std::memory_order_relaxed);
+    worldOut[1] = m_reloadHighlightY.load(std::memory_order_relaxed);
+    worldOut[2] = m_reloadHighlightZ.load(std::memory_order_relaxed);
+    if (radiusMeters)
+        *radiusMeters = m_reloadHighlightRadius.load(std::memory_order_relaxed);
+    return true;
+}
+
+bool InputHook::GetWeaponClipWorldPosition(float out[3]) const {
+    // The weapon mesh's b_clip bone (index 25 of 27) in UE3 world space: read
+    // the live component matrix plus the component-space bone matrix array.
+    uintptr_t component = 0;
+    int32_t matrixOffset = 0;
+    uint64_t updatedMs = 0;
+    AcquireSRWLockShared(const_cast<SRWLOCK*>(&m_weaponPoseWriteLock));
+    component = m_renderWeaponComponent;
+    matrixOffset = m_renderWeaponMatrixOffset;
+    updatedMs = m_renderWeaponStampUpdatedMs;
+    ReleaseSRWLockShared(const_cast<SRWLOCK*>(&m_weaponPoseWriteLock));
+    if (component < 0x10000 || matrixOffset < 0) return false;
+    if (GetTickCount64() - updatedMs > 1000) return false;
+    struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
+    constexpr uintptr_t kSpaceBasesOffset = 0x330;
+    constexpr int kClipBoneIndex = 25;
+    constexpr uint64_t kBoneMatrixStride = 0x40;
+    float componentMatrix[16] = {};
+    TArrayPose poses = {};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(component +
+                static_cast<uintptr_t>(matrixOffset)),
+            componentMatrix, sizeof(componentMatrix), &read) ||
+        read != sizeof(componentMatrix) ||
+        !ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(component + kSpaceBasesOffset),
+            &poses, sizeof(poses), &read) || read != sizeof(poses) ||
+        !poses.data || poses.count <= kClipBoneIndex || poses.count > 256 ||
+        poses.capacity < poses.count)
+        return false;
+    float boneMatrix[16] = {};
+    if (!ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(poses.data +
+                static_cast<uint64_t>(kClipBoneIndex) * kBoneMatrixStride),
+            boneMatrix, sizeof(boneMatrix), &read) || read != sizeof(boneMatrix))
+        return false;
+    for (float value : boneMatrix)
+        if (!std::isfinite(value) || fabsf(value) > 10000000.0f) return false;
+    if (fabsf(boneMatrix[15] - 1.0f) > 0.05f) return false;
+    float world[16] = {};
+    MultiplyMatrix(boneMatrix, componentMatrix, world);
+    out[0] = world[12];
+    out[1] = world[13];
+    out[2] = world[14];
+    return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+}
+
 void InputHook::ProcessTurn() {
     const auto& xr = XRInput::Instance();
     ControllerState controllers[2] = {};
@@ -452,10 +946,11 @@ void InputHook::UpdateState(XrTime displayTime) {
     m_leftGripDown = ApplyHysteresis(left.grip, m_leftGripDown);
     m_rightGripDown = ApplyHysteresis(right.grip, m_rightGripDown);
     const bool vehicleMode = camera::IsVehicleCameraActive();
+    const bool magZoneCaptured = IsLeftGripCaptured();
     const bool leftTriggerPressed = m_leftTriggerDown && !m_leftTriggerWasDown;
     const bool weaponGrabCancelled = m_weaponGrabCancelRequested.exchange(
         false, std::memory_order_acq_rel);
-    if (!m_leftTriggerDown || weaponGrabCancelled || vehicleMode ||
+    if (!m_leftTriggerDown || magZoneCaptured || weaponGrabCancelled || vehicleMode ||
         !m_motionControlsEnabled.load(std::memory_order_acquire)) {
         m_weaponGrabLatched = false;
     } else if (leftTriggerPressed) {
@@ -463,7 +958,8 @@ void InputHook::UpdateState(XrTime displayTime) {
         if (m_weaponGrabLatched)
             Log("[Input] Left trigger latched on weapon contact");
     }
-    const bool weaponGrabHeld = m_leftTriggerDown && m_weaponGrabLatched;
+    const bool weaponGrabHeld = m_leftTriggerDown && m_weaponGrabLatched &&
+        !magZoneCaptured;
     m_weaponGrabHeld.store(weaponGrabHeld, std::memory_order_release);
     constexpr bool adsActive = false;
     const bool vehicleSecondaryFire = vehicleMode && m_rightGripDown;
@@ -511,7 +1007,8 @@ void InputHook::UpdateState(XrTime displayTime) {
             now + 700, std::memory_order_release);
     bool physicalMeleePulse = false;
     if (!berserkPunchMode) {
-        const bool leftArmed = m_leftTriggerDown && !weaponGrabHeld;
+        const bool leftArmed = m_leftTriggerDown && !weaponGrabHeld &&
+            !magZoneCaptured;
         const bool leftMeleePulse = leftArmed &&
             UpdatePhysicalMelee(left, 0, now, true);
         if (!leftArmed) ResetPhysicalMelee(0);
@@ -635,9 +1132,33 @@ void InputHook::UpdateState(XrTime displayTime) {
         else if (left.thumbstickY <= -0.55f) menuDirection = XINPUT_GAMEPAD_DPAD_DOWN;
     }
 
+    const bool manualShotgunReload = cfg.manual_reload_shotgun &&
+        WeaponAimSystem::Instance().IsEquippedWeaponShotgun();
+    bool forwardReloadX = left.buttonX;
+    if (manualShotgunReload) {
+        forwardReloadX = UpdateShotgunReloadSequence(controllers, left.buttonX,
+            WeaponAimSystem::Instance().HasUsableTarget(), m_leftTriggerDown, now);
+    } else {
+        ResetManualReload();
+    }
+    WeaponAimSystem::Instance().DumpWeaponPropertiesOnce();
+    WeaponAimSystem::Instance().DumpWeaponBonesOnce();
+    WeaponAimSystem::Instance().InstallReloadBlocker();
+    WeaponAimSystem::Instance().TickWeaponPropertyWatch();
+    // Reload key: the sequencer pulses R when the fresh mag is seated;
+    // otherwise the keyboard fallback maps X -> R as before.
+    const bool reloadKeyDown = manualShotgunReload
+        ? now < m_shotgunReload.keyboardReloadPulseUntilMs
+        : (!m_xinputActive && left.buttonX);
+    if (reloadKeyDown && !m_prevReload) PressKey('R');
+    else if (!reloadKeyDown && m_prevReload) ReleaseKey('R');
+    m_prevReload = reloadKeyDown ? 1 : 0;
+
     WORD buttons = chordDirection | menuDirection;
     if (right.buttonA) buttons |= XINPUT_GAMEPAD_A;
-    if (left.buttonX) buttons |= XINPUT_GAMEPAD_X;
+    // X stays usable for contextual use (loot pickups) at all times; the
+    // sequence only swallows presses that start/abort a manual reload.
+    if (forwardReloadX) buttons |= XINPUT_GAMEPAD_X;
     if (yTapPulse) buttons |= XINPUT_GAMEPAD_Y;
     if (m_leftGripDown) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
     if (m_rightGripDown && !vehicleMode) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
@@ -714,7 +1235,6 @@ void InputHook::UpdateState(XrTime displayTime) {
         setKey(VK_SPACE, right.buttonA, m_prevJump);
         setKey('C', crouchPulse, m_prevCrouch);
         setKey('E', left.buttonX, m_prevUse);
-        setKey('R', left.buttonX, m_prevReload);
         setKey('F', m_leftGripDown, m_prevGrip);
         setKey('G', m_rightGripDown && !vehicleMode, m_prevGrenade);
         setKey(VK_LSHIFT, left.thumbstickClick && !suppressStickClicks, m_prevSprint);
@@ -1911,7 +2431,234 @@ void InputHook::ApplyLeftHand(int eye) {
     (void)eye;
 }
 
+void InputHook::PublishMagHold(int32_t mode) {
+    AcquireSRWLockExclusive(&m_magHoldLock);
+    m_magHold.mode = mode;
+    if (mode != 2) m_magHold.throwStartMs = 0;
+    if (mode != 1) m_magHold.grabRotationValid = false;
+    if (mode == 1) {
+        // Cache the hand world rotation and the mag's world rotation at grab
+        // time, so the carried mag can rotate with the hand afterwards.
+        ControllerState controllers[2] = {};
+        const int32_t* cameraRotation = camera::GetCameraRotation();
+        float referencePosition[3] = {};
+        float referenceRotation[4] = {};
+        if (XRInput::Instance().GetControllerSnapshot(controllers) &&
+            controllers[0].valid && cameraRotation &&
+            camera::GetPoseReference(referencePosition, referenceRotation)) {
+            const float pitch = static_cast<float>(cameraRotation[0]) *
+                6.2831853071795864769f / 65536.0f;
+            const float yaw = static_cast<float>(cameraRotation[1]) *
+                6.2831853071795864769f / 65536.0f;
+            float handRotation[9] = {};
+            uintptr_t component = 0;
+            int32_t matrixOffset = 0;
+            AcquireSRWLockShared(&m_weaponPoseWriteLock);
+            component = m_renderWeaponComponent;
+            matrixOffset = m_renderWeaponMatrixOffset;
+            ReleaseSRWLockShared(&m_weaponPoseWriteLock);
+            struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
+            TArrayPose poses = {};
+            float componentMatrix[16] = {};
+            float boneMatrix[16] = {};
+            SIZE_T read = 0;
+            if (HandWorldRotationFromXr(controllers[0].rotation, referenceRotation,
+                                        pitch, yaw, handRotation) &&
+                component >= 0x10000 && matrixOffset > 0 &&
+                ReadProcessMemory(GetCurrentProcess(),
+                    reinterpret_cast<const void*>(component +
+                        static_cast<uintptr_t>(matrixOffset)),
+                    componentMatrix, sizeof(componentMatrix), &read) &&
+                read == sizeof(componentMatrix) &&
+                ReadProcessMemory(GetCurrentProcess(),
+                    reinterpret_cast<const void*>(component + 0x330),
+                    &poses, sizeof(poses), &read) && read == sizeof(poses) &&
+                poses.data && poses.count > 25 && poses.count <= 256 &&
+                ReadProcessMemory(GetCurrentProcess(),
+                    reinterpret_cast<const void*>(poses.data + 25ull * 0x40ull),
+                    boneMatrix, sizeof(boneMatrix), &read) &&
+                read == sizeof(boneMatrix)) {
+                float world[16] = {};
+                MultiplyMatrix(boneMatrix, componentMatrix, world);
+                for (int row = 0; row < 3; ++row)
+                    for (int column = 0; column < 3; ++column)
+                        m_magHold.grabMagRotation[row * 3 + column] =
+                            world[row * 4 + column];
+                memcpy(m_magHold.grabHandRotation, handRotation,
+                       sizeof(m_magHold.grabHandRotation));
+                m_magHold.grabRotationValid = true;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&m_magHoldLock);
+}
+
+void InputHook::PublishMagThrow(const float originWorld[3],
+                                const float velocityWorld[3]) {
+    AcquireSRWLockExclusive(&m_magHoldLock);
+    m_magHold.mode = 2;
+    m_magHold.throwStartMs = GetTickCount64();
+    memcpy(m_magHold.throwOrigin, originWorld, sizeof(m_magHold.throwOrigin));
+    memcpy(m_magHold.throwVelocity, velocityWorld, sizeof(m_magHold.throwVelocity));
+    ReleaseSRWLockExclusive(&m_magHoldLock);
+}
+
+bool InputHook::ApplyMagBoneOverride() {
+    // Move the weapon mesh's b_clip bone so the magazine is visible in the
+    // left hand, flies away when discarded, and rides back for insertion.
+    // Runs from the per-frame weapon stamp (render path, after animation).
+    MagHoldParams hold = {};
+    AcquireSRWLockShared(&m_magHoldLock);
+    hold = m_magHold;
+    ReleaseSRWLockShared(&m_magHoldLock);
+    if (hold.mode == 0) return false;
+    if (!m_motionControlsEnabled.load(std::memory_order_acquire)) return false;
+    uintptr_t component = 0;
+    int32_t matrixOffset = 0;
+    AcquireSRWLockShared(&m_weaponPoseWriteLock);
+    component = m_renderWeaponComponent;
+    matrixOffset = m_renderWeaponMatrixOffset;
+    ReleaseSRWLockShared(&m_weaponPoseWriteLock);
+    if (component < 0x10000 || matrixOffset <= 0) return false;
+    float componentMatrix[16] = {};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(component +
+                static_cast<uintptr_t>(matrixOffset)),
+            componentMatrix, sizeof(componentMatrix), &read) ||
+        read != sizeof(componentMatrix))
+        return false;
+    float desiredWorld[3] = {};
+    float handRotation[9] = {};
+    bool handRotationReady = false;
+    const uint64_t nowMs = GetTickCount64();
+    if (hold.mode == 2 && nowMs >= hold.throwStartMs) {
+        float t = static_cast<float>(nowMs - hold.throwStartMs) / 1000.0f;
+        if (t > 0.7f) t = 0.7f;   // parked at the end of the flight
+        desiredWorld[0] = hold.throwOrigin[0] + hold.throwVelocity[0] * t;
+        desiredWorld[1] = hold.throwOrigin[1] + hold.throwVelocity[1] * t;
+        desiredWorld[2] = hold.throwOrigin[2] + hold.throwVelocity[2] * t -
+            490.0f * t * t;
+    } else {
+        // In hand (mode 1), or the fresh mag riding the palm after the throw.
+        ControllerState controllers[2] = {};
+        if (!XRInput::Instance().GetControllerSnapshot(controllers) ||
+            !controllers[0].valid)
+            return false;
+        const float* cameraLocation = camera::GetCameraLocation();
+        const int32_t* cameraRotation = camera::GetCameraRotation();
+        float referencePosition[3] = {};
+        float referenceRotation[4] = {};
+        if (!cameraLocation || !cameraRotation ||
+            !camera::GetPoseReference(referencePosition, referenceRotation))
+            return false;
+        const float inverseReference[4] = {
+            -referenceRotation[0], -referenceRotation[1],
+            -referenceRotation[2], referenceRotation[3]};
+        const float trackingDelta[3] = {
+            controllers[0].position[0] - referencePosition[0],
+            controllers[0].position[1] - referencePosition[1],
+            controllers[0].position[2] - referencePosition[2]};
+        float localXr[3] = {};
+        RotateMeleeVector(inverseReference, trackingDelta, localXr);
+        const float yaw = static_cast<float>(cameraRotation[1]) *
+            6.2831853071795864769f / 65536.0f;
+        const float pitch = static_cast<float>(cameraRotation[0]) *
+            6.2831853071795864769f / 65536.0f;
+        float ue[3] = {};
+        XrVectorToUe(localXr, ue);
+        const float sine = sinf(yaw);
+        const float cosine = cosf(yaw);
+        const float yawedX = cosine * ue[0] - sine * ue[1];
+        const float yawedY = sine * ue[0] + cosine * ue[1];
+        const float scale = 100.0f * config::Get().positional_scale;
+        // Same left-hand visual offset the IK target applies, so the mag
+        // lands in the visible palm instead of the raw controller origin.
+        const auto& settings = config::Get();
+        const float offsetLocal[3] = {
+            settings.left_hand_offset_forward,
+            settings.left_hand_offset_right,
+            settings.left_hand_offset_up};
+        const float pitchSine = sinf(pitch);
+        const float pitchCosine = cosf(pitch);
+        const float pitchedX = pitchCosine * offsetLocal[0] -
+            pitchSine * offsetLocal[2];
+        const float pitchedZ = pitchSine * offsetLocal[0] +
+            pitchCosine * offsetLocal[2];
+        const float adjustmentX = cosine * pitchedX - sine * offsetLocal[1];
+        const float adjustmentY = sine * pitchedX + cosine * offsetLocal[1];
+        desiredWorld[0] = cameraLocation[0] + yawedX * scale + adjustmentX;
+        desiredWorld[1] = cameraLocation[1] + yawedY * scale + adjustmentY;
+        desiredWorld[2] = cameraLocation[2] + ue[2] * scale + pitchedZ;
+        handRotationReady = HandWorldRotationFromXr(controllers[0].rotation,
+            referenceRotation, pitch, yaw, handRotation);
+    }
+    if (!std::isfinite(desiredWorld[0]) || !std::isfinite(desiredWorld[1]) ||
+        !std::isfinite(desiredWorld[2]))
+        return false;
+    // Fine trim into the palm after the grip-pose mapping.
+    desiredWorld[2] += 3.0f;
+    struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
+    constexpr uintptr_t kSpaceBasesOffset = 0x330;
+    constexpr int kClipBoneIndex = 25;
+    constexpr uint64_t kBoneMatrixStride = 0x40;
+    TArrayPose poses = {};
+    if (!ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(component + kSpaceBasesOffset),
+            &poses, sizeof(poses), &read) || read != sizeof(poses) ||
+        !poses.data || poses.count <= kClipBoneIndex || poses.count > 256 ||
+        poses.capacity < poses.count)
+        return false;
+    const uintptr_t boneAddress = poses.data +
+        static_cast<uint64_t>(kClipBoneIndex) * kBoneMatrixStride;
+    if (handRotationReady && hold.grabRotationValid) {
+        // Also rotate the mag with the hand: it keeps the orientation it had
+        // at grab time, rotated by the hand's world delta since then.
+        float grabInverse[9] = {};
+        Transpose3x3(hold.grabHandRotation, grabInverse);
+        float deltaRotation[9] = {};
+        Multiply3x3(grabInverse, handRotation, deltaRotation);
+        float worldRotation[9] = {};
+        Multiply3x3(hold.grabMagRotation, deltaRotation, worldRotation);
+        float worldMatrix[16] = {};
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                worldMatrix[row * 4 + column] = worldRotation[row * 3 + column];
+        worldMatrix[12] = desiredWorld[0];
+        worldMatrix[13] = desiredWorld[1];
+        worldMatrix[14] = desiredWorld[2];
+        worldMatrix[15] = 1.0f;
+        float inverseComponent[16] = {};
+        InvertRigidFrame(componentMatrix, inverseComponent);
+        float boneResult[16] = {};
+        MultiplyMatrix(worldMatrix, inverseComponent, boneResult);
+        SIZE_T writtenRotation = 0;
+        return WriteProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<void*>(boneAddress), boneResult,
+            sizeof(boneResult), &writtenRotation) &&
+            writtenRotation == sizeof(boneResult);
+    }
+    float componentSpace[3] = {};
+    if (!InverseTransformPoint(componentMatrix, desiredWorld, componentSpace))
+        return false;
+    float boneMatrix[16] = {};
+    if (!ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(boneAddress), boneMatrix,
+            sizeof(boneMatrix), &read) || read != sizeof(boneMatrix))
+        return false;
+    for (float value : boneMatrix)
+        if (!std::isfinite(value)) return false;
+    boneMatrix[12] = componentSpace[0];
+    boneMatrix[13] = componentSpace[1];
+    boneMatrix[14] = componentSpace[2];
+    SIZE_T written = 0;
+    return WriteProcessMemory(GetCurrentProcess(),
+        reinterpret_cast<void*>(boneAddress), boneMatrix, sizeof(boneMatrix),
+        &written) && written == sizeof(boneMatrix);
+}
+
 bool InputHook::ReapplyWeaponPose(void* component) {
+    ApplyMagBoneOverride();
     if (!component || !m_motionControlsEnabled.load(std::memory_order_acquire))
         return false;
     bool written = false;
@@ -1940,6 +2687,7 @@ bool InputHook::ReapplyWeaponPose(void* component) {
 }
 
 bool InputHook::ReapplyWeaponPose() {
+    ApplyMagBoneOverride();
     if (!m_motionControlsEnabled.load(std::memory_order_acquire)) return false;
     bool written = false;
     AcquireSRWLockShared(&m_weaponPoseWriteLock);

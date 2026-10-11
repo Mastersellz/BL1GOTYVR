@@ -419,6 +419,7 @@ SamplerState sourceSampler : register(s0);
         uint4 easuCon1;
         uint4 easuCon2;
         uint4 easuCon3;
+        float4 reloadHint;   // xy=screen uv z=radius w=enabled (mag/pouch glow)
     };
     float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         float2 screenUv = uv;
@@ -461,6 +462,15 @@ SamplerState sourceSampler : register(s0);
             float3 mx = max(max(max(n, s), max(e, w)), color.rgb);
             color.rgb = clamp(color.rgb + (color.rgb - blur) * (postFx.x * 1.5), mn, mx);
         }
+    }
+    if (reloadHint.w > 0.5) {
+        float2 delta = screenUv - reloadHint.xy;
+        delta.x *= outputSettings.x;
+        float dist = length(delta);
+        float glow = saturate(1.0 - dist / max(reloadHint.z, 0.0001));
+        glow = glow * glow * 0.9;
+        if (glow > 0.001)
+            color.rgb = saturate(color.rgb + glow * float3(1.0, 0.7, 0.15));
     }
     if (dotSettings.w > 0.5) {
         float2 delta = screenUv - dotSettings.xy;
@@ -526,7 +536,7 @@ SamplerState sourceSampler : register(s0);
     if (FAILED(hr)) Log("[FrameLoop] CreateSamplerState failed: 0x%08X", hr);
     if (FAILED(hr)) return false;
     D3D11_BUFFER_DESC constantsDesc = {};
-    constantsDesc.ByteWidth = 176;
+    constantsDesc.ByteWidth = 192;
     constantsDesc.Usage = D3D11_USAGE_DEFAULT;
     constantsDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     hr = device->CreateBuffer(&constantsDesc, nullptr, &m_blitConstants);
@@ -899,6 +909,56 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
             uvOffsetY * static_cast<float>(sourceDesc.Height));
         fsrUpscale = true;
     }
+    float reloadU = 0.5f, reloadV = 0.5f, reloadRadius = 0.0f, reloadEnabled = 0.0f;
+    {
+        float reloadWorld[3] = {};
+        float reloadRadiusMeters = 0.0f;
+        if (!flatSource && m_submissionViewsValid && sampledEye >= 0 &&
+            sampledEye < 2 && input::InputHook::Instance().GetReloadHighlight(
+                reloadWorld, &reloadRadiusMeters)) {
+            auto rotateReload = [](const float quaternion[4], const float vector[3],
+                                   float output[3]) {
+                const float qx = quaternion[0], qy = quaternion[1];
+                const float qz = quaternion[2], qw = quaternion[3];
+                const float tx = 2.0f * (qy * vector[2] - qz * vector[1]);
+                const float ty = 2.0f * (qz * vector[0] - qx * vector[2]);
+                const float tz = 2.0f * (qx * vector[1] - qy * vector[0]);
+                output[0] = vector[0] + qw * tx + (qy * tz - qz * ty);
+                output[1] = vector[1] + qw * ty + (qz * tx - qx * tz);
+                output[2] = vector[2] + qw * tz + (qx * ty - qy * tx);
+            };
+            const XrView& eyeView = m_submissionViews[eye];
+            const float eyeDelta[3] = {
+                reloadWorld[0] - eyeView.pose.position.x,
+                reloadWorld[1] - eyeView.pose.position.y,
+                reloadWorld[2] - eyeView.pose.position.z};
+            const float inverseEye[4] = {
+                -eyeView.pose.orientation.x, -eyeView.pose.orientation.y,
+                -eyeView.pose.orientation.z, eyeView.pose.orientation.w};
+            float eyeLocal[3] = {};
+            rotateReload(inverseEye, eyeDelta, eyeLocal);
+            if (eyeLocal[2] < -0.001f) {
+                const float tangentX = eyeLocal[0] / -eyeLocal[2];
+                const float tangentY = eyeLocal[1] / -eyeLocal[2];
+                const float tanLeft = tanf(eyeView.fov.angleLeft);
+                const float tanRight = tanf(eyeView.fov.angleRight);
+                const float tanDown = tanf(eyeView.fov.angleDown);
+                const float tanUp = tanf(eyeView.fov.angleUp);
+                const float u = (tangentX - tanLeft) / (tanRight - tanLeft);
+                const float verticalHalfSpan = (tanUp - tanDown) * 0.5f;
+                const float v = (verticalHalfSpan - tangentY) /
+                    (verticalHalfSpan * 2.0f);
+                if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
+                    reloadU = u;
+                    reloadV = v;
+                    const float angleRadius = reloadRadiusMeters / -eyeLocal[2];
+                    reloadRadius = angleRadius / (tanUp - tanDown);
+                    reloadRadius = (std::max)(0.01f, (std::min)(0.5f, reloadRadius));
+                    reloadEnabled = 1.0f;
+                }
+            }
+        }
+    }
     const bool selectedSwapchainIsSrgb =
         selectedSwapchainFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
         selectedSwapchainFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
@@ -915,7 +975,7 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
         static_cast<float>((std::max)(1u, destinationDesc.Width));
     const float postFxTexelY = uvScaleY /
         static_cast<float>((std::max)(1u, destinationDesc.Height));
-    float settings[44] = {
+    float settings[48] = {
         sourceDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1.0f : 0.0f,
         convergenceShift, uvScaleX, uvScaleY, uvOffsetX, uvOffsetY, 0.0f, 0.0f,
         dotU, dotV, 0.006f, dotEnabled,
@@ -928,7 +988,8 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
         postFxTexelX, postFxTexelY,
         fsrUpscale ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        reloadU, reloadV, reloadRadius, reloadEnabled
     };
     memcpy(settings + 28, easuCon, sizeof(easuCon));
     if (sampledEye >= 0 && sampledEye < 2) {

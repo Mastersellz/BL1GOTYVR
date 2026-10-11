@@ -599,6 +599,12 @@ int32_t* GetCameraRotation() {
     const CameraInfo camera = GetCameraSnapshot();
     return camera.found ? reinterpret_cast<int32_t*>(camera.cameraCacheRotation) : s_rotation;
 }
+bool GetPoseReference(float position[3], float rotation[4]) {
+    if (!position || !rotation) return false;
+    memcpy(position, s_poseReferencePosition, sizeof(float) * 3);
+    memcpy(rotation, s_poseReferenceRotation, sizeof(float) * 4);
+    return true;
+}
 UE3Globals GetUE3GlobalsSnapshot() {
     UE3Globals globals = {};
     AcquireSRWLockShared(&s_globalsLock);
