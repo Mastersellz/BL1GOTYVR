@@ -247,8 +247,10 @@ static float s_poseReferencePosition[3] = {};
 static float s_poseReferenceRotation[4] = {};
 static std::atomic<float> s_relativeHeadYawRadians{0.0f};
 static std::atomic<bool> s_relativeHeadYawValid{false};
-static std::atomic<int32_t> s_physicalMeleeYawAnchor{0};
-static std::atomic<bool> s_physicalMeleeYawAnchorValid{false};
+    static std::atomic<int32_t> s_physicalMeleeYawAnchor{0};
+    static std::atomic<bool> s_physicalMeleeYawAnchorValid{false};
+    static int32_t s_recoilAnchorRotation[3] = {0, 0, 0};
+    static std::atomic<bool> s_recoilAnchorValid{false};
 static std::atomic<bool> s_recenterRequested{true};
 static std::atomic<bool> s_gamePitchReferenceValid{false};
 static std::atomic<int32_t> s_gamePitchReference{0};
@@ -605,6 +607,37 @@ bool GetPoseReference(float position[3], float rotation[4]) {
     memcpy(rotation, s_poseReferenceRotation, sizeof(float) * 4);
     return true;
 }
+void SuppressRecoilTick(bool firing) {
+    if (!config::Get().camera_recoil_disabled) {
+        s_recoilAnchorValid.store(false, std::memory_order_release);
+        return;
+    }
+    const CameraInfo camera = GetCameraSnapshot();
+    if (!camera.found || !camera.cameraCacheRotation) return;
+    auto* rotation = reinterpret_cast<int32_t*>(camera.cameraCacheRotation);
+    static uint64_t s_lastFireSeenMs = 0;
+    const uint64_t recoilNowMs = GetTickCount64();
+    if (firing) s_lastFireSeenMs = recoilNowMs;
+    if (firing || (recoilNowMs - s_lastFireSeenMs < 400 &&
+                   s_recoilAnchorValid.load(std::memory_order_acquire))) {
+        if (s_recoilAnchorValid.load(std::memory_order_acquire)) {
+            memcpy(rotation, s_recoilAnchorRotation,
+                   sizeof(s_recoilAnchorRotation));
+            static std::atomic<uint64_t> recoilLogs{0};
+            if (recoilLogs.fetch_add(1, std::memory_order_relaxed) < 3) {
+                Log("[Camera] Recoil suppression holding pawn rotation");
+            }
+        } else {
+            memcpy(s_recoilAnchorRotation, rotation,
+                   sizeof(s_recoilAnchorRotation));
+            s_recoilAnchorValid.store(true, std::memory_order_release);
+        }
+    } else {
+        memcpy(s_recoilAnchorRotation, rotation,
+               sizeof(s_recoilAnchorRotation));
+        s_recoilAnchorValid.store(true, std::memory_order_release);
+    }
+}
 UE3Globals GetUE3GlobalsSnapshot() {
     UE3Globals globals = {};
     AcquireSRWLockShared(&s_globalsLock);
@@ -858,6 +891,12 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
             memcpy(interactionRotation, originalRotation, sizeof(interactionRotation));
             originalFov = *fov;
             cameraStateSaved = true;
+
+            // Recoil suppression also runs from UpdateState (input thread) so
+            // the game tick sees clean values; this keeps the render path and
+            // the interaction rotation consistent with it.
+            SuppressRecoilTick(input::WeaponAimSystem::Instance().IsFireActive());
+            memcpy(interactionRotation, rotation, sizeof(interactionRotation));
 
             if (!s_gamePitchReferenceValid.load(std::memory_order_acquire)) {
                 s_gamePitchReference.store(originalRotation[0], std::memory_order_relaxed);

@@ -120,6 +120,7 @@ public:
                            uint64_t controllerGeneration);
     bool GetWorldHandTarget(uint64_t targetGeneration, int hand,
                             float position[3], float forward[3], float up[3]) const;
+    bool GetLeftGripCenterWorld(float out[3]) const;
     void SetRenderContext(uint64_t renderGeneration, uint64_t targetGeneration);
     bool ReapplyRenderPalette();
     bool ApplyPostAnimation(void* component);

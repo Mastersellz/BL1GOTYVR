@@ -120,7 +120,8 @@ private:
     void ResetPhysicalMelee(int hand = -1);
     bool UpdateShotgunReloadSequence(const ControllerState controllers[2],
                                      bool xDown, bool usableTargeted,
-                                     bool actionDown, uint64_t nowMs);
+                                     bool actionDown, bool squeezeDown,
+                                     uint64_t nowMs);
     void ResetManualReload();
     // True while the left hand is inside a mag-action zone (mag well or
     // pouch); the left trigger is captured for the grab during these phases.
@@ -199,6 +200,11 @@ private:
         bool forwardCurrentPress = true;
         bool wellAnchorValid = false;
         float wellAnchor[3] = {};
+        float lastLeftPos[3] = {};
+        uint64_t lastLeftPosMs = 0;
+        bool flickArmed = true;
+        bool spinWasActive = false;
+        uint64_t lastSpinHapticMs = 0;
         uint64_t enteredPhaseMs = 0;
         uint64_t cooldownUntilMs = 0;
         uint64_t keyboardReloadPulseUntilMs = 0;
@@ -216,6 +222,7 @@ private:
         float grabHandRotation[9] = {};  // hand world rotation at grab (row-vector)
         float grabMagRotation[9] = {};   // mag world rotation at grab (row-vector)
         float seatedMatrix[16] = {};     // pristine component-space bone matrix
+        float hammerCockedMatrix[16] = {};  // cached cocked hammer matrix
     };
     mutable SRWLOCK m_magHoldLock = SRWLOCK_INIT;
     MagHoldParams m_magHold = {};
@@ -223,11 +230,23 @@ private:
     void PublishMagThrow(const float originWorld[3], const float velocityWorld[3]);
     bool ApplyMagBoneOverride();
     void RestoreMagBoneSeated();
+    bool GetWeaponBoneWorld(int boneIndex, float out[3]) const;
+    void CockRevolverHammer();
+    bool ApplyRevolverIdleExtras();
+    void TickHammerStrikeSampler(bool fireOutput, uint64_t nowMs);
     std::atomic<bool> m_reloadHighlightActive{false};
     std::atomic<float> m_reloadHighlightX{0.0f};
     std::atomic<float> m_reloadHighlightY{0.0f};
     std::atomic<float> m_reloadHighlightZ{0.0f};
     std::atomic<float> m_reloadHighlightRadius{0.0f};
+    std::atomic<bool> m_cylinderSpinning{false};
+    std::atomic<bool> m_hammerCocked{false};
+    std::atomic<uint64_t> m_spinLastMs{0};
+    uint64_t m_fanFireUntilMs = 0;
+    bool m_strikePrevFire = false;
+    bool m_strikePending = false;
+    uint64_t m_strikeT0Ms = 0;
+    float m_strikePos0[3] = {};
     std::atomic<bool> m_berserkPunchMode{false};
     bool m_skillGripWasDown = false;
     uint64_t m_berserkActivationUntilMs = 0;

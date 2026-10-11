@@ -21,6 +21,12 @@ struct ControllerState {
     bool buttonY = false;
     bool thumbstickClick = false;
     bool menuButton = false;
+    // Capacitive touch sensors (Quest Touch): thumb on stick, index on
+    // trigger, thumb on face buttons; squeeze stays analog for the rest.
+    bool thumbstickTouch = false;
+    bool triggerTouch = false;
+    bool primaryTouch = false;
+    bool secondaryTouch = false;
     bool valid = false;
     bool aimValid = false;
 };
@@ -81,6 +87,16 @@ private:
     XrAction m_leftThumbstickClick = XR_NULL_HANDLE;
     XrAction m_rightThumbstickClick = XR_NULL_HANDLE;
     XrAction m_menuButton = XR_NULL_HANDLE;
+
+    // Capacitive touch
+    XrAction m_leftThumbstickTouch = XR_NULL_HANDLE;
+    XrAction m_rightThumbstickTouch = XR_NULL_HANDLE;
+    XrAction m_leftTriggerTouch = XR_NULL_HANDLE;
+    XrAction m_rightTriggerTouch = XR_NULL_HANDLE;
+    XrAction m_buttonATouch = XR_NULL_HANDLE;
+    XrAction m_buttonBTouch = XR_NULL_HANDLE;
+    XrAction m_buttonXTouch = XR_NULL_HANDLE;
+    XrAction m_buttonYTouch = XR_NULL_HANDLE;
 
     // Haptic output
     XrAction m_haptic[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};

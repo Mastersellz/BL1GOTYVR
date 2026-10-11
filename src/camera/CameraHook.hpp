@@ -28,6 +28,7 @@ void DiscardCompletedNativeMultiviewFrame();
 void SuspendNativeMultiview();
 float* GetCameraLocation();   // float[3]
 bool GetPoseReference(float position[3], float rotation[4]);
+void SuppressRecoilTick(bool firing);
 int32_t* GetCameraRotation(); // int[3] in Unis
 UE3Globals GetUE3GlobalsSnapshot();
 void RequestRecenter();  // Request camera recenter (integer yaw system)

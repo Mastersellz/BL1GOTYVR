@@ -140,6 +140,38 @@ static bool HandWorldRotationFromXr(const float controllerRotation[4],
     return true;
 }
 
+// XR stage position (meters) -> UE3 world (unit-meters*scale), mirroring the
+// ArmIK world mapping.
+static bool StagePositionToUeWorld(const float xr[3], float out[3]) {
+    const float* cameraLocation = camera::GetCameraLocation();
+    const int32_t* cameraRotation = camera::GetCameraRotation();
+    float referencePosition[3] = {};
+    float referenceRotation[4] = {};
+    if (!cameraLocation || !cameraRotation ||
+        !camera::GetPoseReference(referencePosition, referenceRotation))
+        return false;
+    const float inverseReference[4] = {
+        -referenceRotation[0], -referenceRotation[1],
+        -referenceRotation[2], referenceRotation[3]};
+    const float delta[3] = {
+        xr[0] - referencePosition[0],
+        xr[1] - referencePosition[1],
+        xr[2] - referencePosition[2]};
+    float localXr[3] = {};
+    RotateMeleeVector(inverseReference, delta, localXr);
+    float ue[3] = {};
+    XrVectorToUe(localXr, ue);
+    const float yaw = static_cast<float>(cameraRotation[1]) *
+        6.2831853071795864769f / 65536.0f;
+    const float sine = sinf(yaw);
+    const float cosine = cosf(yaw);
+    const float scale = 100.0f * config::Get().positional_scale;
+    out[0] = cameraLocation[0] + (cosine * ue[0] - sine * ue[1]) * scale;
+    out[1] = cameraLocation[1] + (sine * ue[0] + cosine * ue[1]) * scale;
+    out[2] = cameraLocation[2] + ue[2] * scale;
+    return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+}
+
 void InputHook::Install() {
     if (m_installed) return;
     Log("[Input] Installing VR input system...");
@@ -449,7 +481,8 @@ void InputHook::ResetManualReload() {
 
 bool InputHook::UpdateShotgunReloadSequence(const ControllerState controllers[2],
                                             bool xDown, bool usableTargeted,
-                                            bool actionDown, uint64_t nowMs) {
+                                            bool actionDown, bool squeezeDown,
+                                            uint64_t nowMs) {
     ShotgunReloadSequencer& seq = m_shotgunReload;
     const bool pressed = xDown && !seq.xWasDown;
     seq.xWasDown = xDown;
@@ -470,17 +503,92 @@ bool InputHook::UpdateShotgunReloadSequence(const ControllerState controllers[2]
             seq.pouchLatched = false;
             seq.forwardCurrentPress = false;
             xrInput.SendHaptic(1, 0.6f, 70.0f);
-            Log("[ManualReload] Mag released — pull it out with the left hand "
-                "(press X again = instant reload)");
+            if (WeaponAimSystem::Instance().IsEquippedWeaponRevolver()) {
+                PublishMagHold(3);
+                Log("[ManualReload] Cylinder released to the side — grab it "
+                    "with the left hand");
+            } else {
+                Log("[ManualReload] Mag released — pull it out with the left hand");
+            }
         } else {
-            // Press during an active sequence: ignore. The vanilla reload is
-            // fully suppressed while the manual shotgun flow is in control.
+            // Second press during an active sequence: cancel back to Idle.
+            // The vanilla reload stays fully suppressed.
+            seq.phase = ShotgunReloadSequencer::Phase::Idle;
+            seq.cooldownUntilMs = nowMs + 300;
+            seq.wellLatched = false;
+            seq.pouchLatched = false;
+            seq.wellAnchorValid = false;
             seq.forwardCurrentPress = false;
-            xrInput.SendHaptic(0, 0.2f, 30.0f);
-            Log("[ManualReload] Reload key ignored during sequence");
+            PublishMagHold(0);
+            xrInput.SendHaptic(0, 0.3f, 40.0f);
+            Log("[ManualReload] Sequence cancelled");
         }
     }
     const bool forward = xDown && (seq.forwardCurrentPress || usableTargeted);
+
+    // Left-hand vertical speed for the hammer flick gesture.
+    float speedUp = 0.0f;
+    if (controllers[0].valid && seq.lastLeftPosMs != 0 &&
+        nowMs > seq.lastLeftPosMs && nowMs - seq.lastLeftPosMs < 250) {
+        const float dtMs = static_cast<float>(nowMs - seq.lastLeftPosMs);
+        if (dtMs > 1.0f)
+            speedUp = (controllers[0].position[1] - seq.lastLeftPos[1]) /
+                (dtMs / 1000.0f);
+    }
+    memcpy(seq.lastLeftPos, controllers[0].position, sizeof(seq.lastLeftPos));
+    seq.lastLeftPosMs = nowMs;
+    if (speedUp < 0.3f) seq.flickArmed = true;
+
+    // Revolver extras while idle: spin the cylinder with the squeeze held
+    // near it, or cock the hammer with an upward flick near it.
+    const bool revolverTricks = config::Get().manual_reload_shotgun &&
+        WeaponAimSystem::Instance().IsEquippedWeaponRevolver();
+    bool spinningThisFrame = false;
+    if (revolverTricks && seq.phase == ShotgunReloadSequencer::Phase::Idle &&
+        controllers[0].valid) {
+        float handUe[3] = {};
+        if (StagePositionToUeWorld(controllers[0].position, handUe)) {
+            float cylWorld[3] = {};
+            const int32_t magIndex =
+                WeaponAimSystem::Instance().GetClipBoneIndex();
+            if (magIndex >= 0 && GetWeaponBoneWorld(magIndex, cylWorld)) {
+                const float dx = handUe[0] - cylWorld[0];
+                const float dy = handUe[1] - cylWorld[1];
+                const float dz = handUe[2] - cylWorld[2];
+                const float distance = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (squeezeDown && distance <= 22.0f) {
+                    spinningThisFrame = true;
+                    if (!seq.spinWasActive)
+                        Log("[ManualReload] Cylinder spin start d=%.2f", distance);
+                    if (nowMs - seq.lastSpinHapticMs >= 150) {
+                        xrInput.SendHaptic(0, 0.35f, 50.0f);
+                        seq.lastSpinHapticMs = nowMs;
+                    }
+                }
+            }
+            const int32_t hammerIndex =
+                WeaponAimSystem::Instance().GetHammerBoneIndex();
+            if (hammerIndex >= 0 && seq.flickArmed && speedUp > 0.9f) {
+                float hammerWorld[3] = {};
+                if (GetWeaponBoneWorld(hammerIndex, hammerWorld)) {
+                    const float hx = handUe[0] - hammerWorld[0];
+                    const float hy = handUe[1] - hammerWorld[1];
+                    const float hz = handUe[2] - hammerWorld[2];
+                    if (sqrtf(hx * hx + hy * hy + hz * hz) <= 22.0f) {
+                        // Fan: fire a shot; the vanilla shoot animation drives
+                        // the hammer naturally (no manual cock override).
+                        XRInput::Instance().SendHaptic(0, 1.0f, 80.0f);
+                        m_fanFireUntilMs = nowMs + 130;
+                        seq.flickArmed = false;
+                        Log("[ManualReload] Fan fire");
+                    }
+                }
+            }
+        }
+    }
+    m_cylinderSpinning.store(spinningThisFrame, std::memory_order_release);
+    if (!spinningThisFrame && seq.spinWasActive) RestoreMagBoneSeated();
+    seq.spinWasActive = spinningThisFrame;
 
     if (seq.phase == ShotgunReloadSequencer::Phase::Idle) {
         seq.gripCaptured = false;
@@ -787,6 +895,52 @@ bool InputHook::IsMagCarried() const {
     return mode == 1;
 }
 
+bool InputHook::GetWeaponBoneWorld(int boneIndex, float out[3]) const {
+    if (boneIndex < 0) return false;
+    uintptr_t component = 0;
+    int32_t matrixOffset = 0;
+    uint64_t updatedMs = 0;
+    AcquireSRWLockShared(const_cast<SRWLOCK*>(&m_weaponPoseWriteLock));
+    component = m_renderWeaponComponent;
+    matrixOffset = m_renderWeaponMatrixOffset;
+    updatedMs = m_renderWeaponStampUpdatedMs;
+    ReleaseSRWLockShared(const_cast<SRWLOCK*>(&m_weaponPoseWriteLock));
+    if (component < 0x10000 || matrixOffset < 0) return false;
+    if (GetTickCount64() - updatedMs > 1000) return false;
+    struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
+    constexpr uintptr_t kSpaceBasesOffset = 0x330;
+    constexpr uint64_t kBoneMatrixStride = 0x40;
+    float componentMatrix[16] = {};
+    TArrayPose poses = {};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(component +
+                static_cast<uintptr_t>(matrixOffset)),
+            componentMatrix, sizeof(componentMatrix), &read) ||
+        read != sizeof(componentMatrix) ||
+        !ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(component + kSpaceBasesOffset),
+            &poses, sizeof(poses), &read) || read != sizeof(poses) ||
+        !poses.data || poses.count <= boneIndex || poses.count > 256 ||
+        poses.capacity < poses.count)
+        return false;
+    float boneMatrix[16] = {};
+    if (!ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(poses.data +
+                static_cast<uint64_t>(boneIndex) * kBoneMatrixStride),
+            boneMatrix, sizeof(boneMatrix), &read) || read != sizeof(boneMatrix))
+        return false;
+    for (float value : boneMatrix)
+        if (!std::isfinite(value) || fabsf(value) > 10000000.0f) return false;
+    if (fabsf(boneMatrix[15] - 1.0f) > 0.05f) return false;
+    float world[16] = {};
+    MultiplyMatrix(boneMatrix, componentMatrix, world);
+    out[0] = world[12];
+    out[1] = world[13];
+    out[2] = world[14];
+    return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+}
+
 bool InputHook::GetReloadHighlight(float worldOut[3], float* radiusMeters) const {
     if (!m_reloadHighlightActive.load(std::memory_order_acquire)) return false;
     worldOut[0] = m_reloadHighlightX.load(std::memory_order_relaxed);
@@ -968,14 +1122,40 @@ void InputHook::UpdateState(XrTime displayTime) {
     m_weaponGrabHeld.store(weaponGrabHeld, std::memory_order_release);
     constexpr bool adsActive = false;
     const bool vehicleSecondaryFire = vehicleMode && m_rightGripDown;
-    const bool fireOutput = m_rightTriggerDown || vehicleSecondaryFire;
+    // The weapon cannot fire while its magazine is physically removed.
+    const bool magOutBlocksFire = cfg.manual_reload_shotgun &&
+        WeaponAimSystem::Instance().IsManualReloadWeapon() &&
+        m_shotgunReload.phase != ShotgunReloadSequencer::Phase::Idle;
+    const bool fireOutput = (m_rightTriggerDown || vehicleSecondaryFire ||
+        GetTickCount64() < m_fanFireUntilMs) && !magOutBlocksFire;
     WeaponAimSystem::Instance().SetVehicleSecondaryFireActive(vehicleSecondaryFire);
     WeaponAimSystem::Instance().SetFireActive(fireOutput);
+    camera::SuppressRecoilTick(fireOutput);
     static bool lastFireOutput = false;
     if (fireOutput != lastFireOutput) {
         lastFireOutput = fireOutput;
-        Log("[Input] Fire trigger %s (RT=%.2f vehicle=%d)",
-            fireOutput ? "pressed" : "released", right.trigger,
+        const bool fanShot = !m_rightTriggerDown && !vehicleSecondaryFire;
+        float aimDirection[3] = {0.0f, 0.0f, -1.0f};
+        if (right.aimValid) {
+            constexpr float kLocalForward[3] = {0.0f, 0.0f, -1.0f};
+            RotateMeleeVector(right.aimRotation, kLocalForward, aimDirection);
+        }
+        const float aimPitchDeg = atan2f(aimDirection[1], -aimDirection[2]) *
+            57.29578f;
+        const float aimYawDeg = atan2f(aimDirection[0], -aimDirection[2]) *
+            57.29578f;
+        const float stampPitchDeg = static_cast<float>(
+            WeaponAimSystem::Instance().GetAimPitchUnis()) * 360.0f / 65536.0f;
+        const float stampYawDeg = static_cast<float>(
+            WeaponAimSystem::Instance().GetAimYawUnis()) * 360.0f / 65536.0f;
+        const int32_t* liveCamRot = camera::GetCameraRotation();
+        const int32_t liveCamP = liveCamRot ? liveCamRot[0] : 0;
+        const int32_t liveCamY = liveCamRot ? liveCamRot[1] : 0;
+        Log("[Input] Fire %s src=%s aimValid=%d dir=(%.2f,%.2f,%.2f) pitch=%.1f yaw=%.1f stamp=(%.1f,%.1f) cam=(%d,%d) (RT=%.2f vehicle=%d)",
+            fireOutput ? "pressed" : "released", fanShot ? "fan" : "trigger",
+            right.aimValid ? 1 : 0, aimDirection[0], aimDirection[1],
+            aimDirection[2], aimPitchDeg, aimYawDeg, stampPitchDeg, stampYawDeg,
+            liveCamP, liveCamY, right.trigger,
             vehicleSecondaryFire ? 1 : 0);
     }
 
@@ -1142,7 +1322,7 @@ void InputHook::UpdateState(XrTime displayTime) {
     bool forwardReloadX = left.buttonX;
     if (manualShotgunReload) {
         forwardReloadX = UpdateShotgunReloadSequence(controllers, left.buttonX,
-            WeaponAimSystem::Instance().HasUsableTarget(), m_leftTriggerDown, now);
+            WeaponAimSystem::Instance().HasUsableTarget(), m_leftTriggerDown, m_leftGripDown, now);
         // Route the pickup/use forward as the keyboard USE key: the gamepad X
         // bit is contextual (use OR reload) and leaks vanilla reloads.
         if (forwardReloadX && !m_prevUse) PressKey('E');
@@ -1171,7 +1351,7 @@ void InputHook::UpdateState(XrTime displayTime) {
     // sequence only swallows presses that start/abort a manual reload.
     if (forwardReloadX) buttons |= XINPUT_GAMEPAD_X;
     if (yTapPulse) buttons |= XINPUT_GAMEPAD_Y;
-    if (m_leftGripDown) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+    if (m_leftGripDown && !m_cylinderSpinning.load(std::memory_order_acquire)) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
     if (m_rightGripDown && !vehicleMode) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
     if (left.thumbstickClick && !suppressStickClicks) buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
     if (echoHeld) buttons |= XINPUT_GAMEPAD_BACK;
@@ -1198,7 +1378,7 @@ void InputHook::UpdateState(XrTime displayTime) {
         state.turnY = 0.0f;
         state.leftTrigger = 0.0f;
         state.rightTrigger = berserkPunchMode ? 0.0f :
-            (m_rightTriggerDown ? (std::max)(right.trigger, 0.55f) : 0.0f);
+            (((m_rightTriggerDown || GetTickCount64() < m_fanFireUntilMs) && !magOutBlocksFire) ? (std::max)(right.trigger, 0.55f) : 0.0f);
         state.buttons = buttons;
         state.active = true;
         XInputBridge::Instance().Publish(state);
@@ -1239,14 +1419,14 @@ void InputHook::UpdateState(XrTime displayTime) {
         };
 
         setMouse(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-            berserkPunchMode ? rightPunchPulse : m_rightTriggerDown, m_prevTrigger);
+            berserkPunchMode ? rightPunchPulse : ((m_rightTriggerDown || GetTickCount64() < m_fanFireUntilMs) && !magOutBlocksFire), m_prevTrigger);
         setMouse(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
             berserkPunchMode ? leftPunchPulse : (adsActive || vehicleSecondaryFire),
             m_prevButtonA);
         setKey(VK_SPACE, right.buttonA, m_prevJump);
         setKey('C', crouchPulse, m_prevCrouch);
         setKey('E', left.buttonX, m_prevUse);
-        setKey('F', m_leftGripDown, m_prevGrip);
+        setKey('F', m_leftGripDown && !m_cylinderSpinning.load(std::memory_order_acquire), m_prevGrip);
         setKey('G', m_rightGripDown && !vehicleMode, m_prevGrenade);
         setKey(VK_LSHIFT, left.thumbstickClick && !suppressStickClicks, m_prevSprint);
         setKey('V', physicalMeleePulse, m_prevMelee);
@@ -2453,9 +2633,11 @@ void InputHook::PublishMagHold(int32_t mode) {
         m_magHold.grabRotationValid = false;
         if (mode == 0) RestoreMagBoneSeated();
     }
-    if (mode == 1 && !m_magHold.grabRotationValid) {
+    if ((mode == 1 && !m_magHold.grabRotationValid) || mode == 3) {
         // Cache the hand world rotation and the mag's world rotation at grab
         // time, so the carried mag can rotate with the hand afterwards.
+        // Mode 3 (revolver swing-out) also seeds the seated matrix so the
+        // swing works on the very first reload with a weapon.
         ControllerState controllers[2] = {};
         const int32_t* cameraRotation = camera::GetCameraRotation();
         float referencePosition[3] = {};
@@ -2511,15 +2693,17 @@ void InputHook::PublishMagHold(int32_t mode) {
                     m_magHold.seatedWeapon = weaponPtr;
                     m_magHold.seatedValid = true;
                 }
-                float world[16] = {};
-                MultiplyMatrix(m_magHold.seatedMatrix, componentMatrix, world);
-                for (int row = 0; row < 3; ++row)
-                    for (int column = 0; column < 3; ++column)
-                        m_magHold.grabMagRotation[row * 3 + column] =
-                            world[row * 4 + column];
-                memcpy(m_magHold.grabHandRotation, handRotation,
-                       sizeof(m_magHold.grabHandRotation));
-                m_magHold.grabRotationValid = true;
+                if (mode == 1) {
+                    float world[16] = {};
+                    MultiplyMatrix(m_magHold.seatedMatrix, componentMatrix, world);
+                    for (int row = 0; row < 3; ++row)
+                        for (int column = 0; column < 3; ++column)
+                            m_magHold.grabMagRotation[row * 3 + column] =
+                                world[row * 4 + column];
+                    memcpy(m_magHold.grabHandRotation, handRotation,
+                           sizeof(m_magHold.grabHandRotation));
+                    m_magHold.grabRotationValid = true;
+                }
             }
         }
     }
@@ -2562,6 +2746,289 @@ void InputHook::RestoreMagBoneSeated() {
         m_magHold.seatedMatrix, sizeof(m_magHold.seatedMatrix), nullptr);
 }
 
+void InputHook::CockRevolverHammer() {
+    const int32_t hammerIndex = WeaponAimSystem::Instance().GetHammerBoneIndex();
+    if (hammerIndex < 0) return;
+    uintptr_t component = 0;
+    int32_t matrixOffset = 0;
+    AcquireSRWLockShared(&m_weaponPoseWriteLock);
+    component = m_renderWeaponComponent;
+    matrixOffset = m_renderWeaponMatrixOffset;
+    ReleaseSRWLockShared(&m_weaponPoseWriteLock);
+    if (component < 0x10000 || matrixOffset <= 0) return;
+    struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
+    constexpr uintptr_t kSpaceBasesOffset = 0x330;
+    constexpr uint64_t kBoneMatrixStride = 0x40;
+    auto readMatrix = [&](int bone, float out[16]) {
+        TArrayPose poses = {};
+        SIZE_T read = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(),
+                reinterpret_cast<const void*>(component + kSpaceBasesOffset),
+                &poses, sizeof(poses), &read) || read != sizeof(poses) ||
+            !poses.data || poses.count <= bone || poses.count > 256)
+            return false;
+        return ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(poses.data +
+                static_cast<uint64_t>(bone) * kBoneMatrixStride),
+            out, sizeof(float) * 16, &read) && read == sizeof(float) * 16;
+    };
+    float hammer[16] = {}, muzzle[16] = {}, trigger[16] = {};
+    float componentMatrix[16] = {};
+    SIZE_T read = 0;
+    if (!readMatrix(hammerIndex, hammer) || !readMatrix(1, muzzle) ||
+        !readMatrix(3, trigger) ||
+        !ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(component +
+                static_cast<uintptr_t>(matrixOffset)),
+            componentMatrix, sizeof(componentMatrix), &read) ||
+        read != sizeof(componentMatrix))
+        return;
+    // Hammer world pose + barrel direction, all from live data. The cock
+    // rotates about the world lateral axis through the hammer pivot.
+    float hammerWorld[16] = {};
+    MultiplyMatrix(hammer, componentMatrix, hammerWorld);
+    const float pivot[3] = {hammerWorld[12], hammerWorld[13], hammerWorld[14]};
+    float muzzleWorld[16] = {};
+    MultiplyMatrix(muzzle, componentMatrix, muzzleWorld);
+    float barrel[3] = {muzzleWorld[12] - pivot[0], muzzleWorld[13] - pivot[1],
+                       muzzleWorld[14] - pivot[2]};
+    const float barrelLength = sqrtf(barrel[0] * barrel[0] + barrel[1] * barrel[1] +
+        barrel[2] * barrel[2]);
+    if (!std::isfinite(barrelLength) || barrelLength < 1.0e-3f) return;
+    for (float& value : barrel) value /= barrelLength;
+    float hinge[3] = {-barrel[1], barrel[0], 0.0f};
+    const float hingeLength = sqrtf(hinge[0] * hinge[0] + hinge[1] * hinge[1]);
+    if (!std::isfinite(hingeLength) || hingeLength < 1.0e-5f) return;
+    for (float& value : hinge) value /= hingeLength;
+    // Try both swing directions; keep the one whose nose rises highest.
+    float bestMatrix[16] = {};
+    float bestScore = -1.0e30f;
+    for (int direction = 0; direction < 2; ++direction) {
+        const float angle = (direction == 0 ? 40.0f : -40.0f) *
+            0.01745329251994329577f;
+        const float c = cosf(angle);
+        const float s = sinf(angle);
+        const float t = 1.0f - c;
+        const float x = hinge[0];
+        const float y = hinge[1];
+        const float z = hinge[2];
+        const float columnRotation[3][3] = {
+            {t * x * x + c, t * x * y - s * z, t * x * z + s * y},
+            {t * x * y + s * z, t * y * y + c, t * y * z - s * x},
+            {t * x * z - s * y, t * y * z + s * x, t * z * z + c}};
+        float rotation[3][3] = {};
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                rotation[row][column] = columnRotation[column][row];
+        float pivotRotated[3] = {};
+        for (int column = 0; column < 3; ++column)
+            for (int row = 0; row < 3; ++row)
+                pivotRotated[column] += pivot[row] * rotation[row][column];
+    float pivotMatrix[16] = {};
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                pivotMatrix[row * 4 + column] = rotation[row][column];
+        pivotMatrix[12] = pivot[0] - pivotRotated[0];
+        pivotMatrix[13] = pivot[1] - pivotRotated[1];
+        pivotMatrix[14] = pivot[2] - pivotRotated[2];
+        pivotMatrix[15] = 1.0f;
+        float candidate[16] = {};
+        for (int row = 0; row < 4; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                float sum = 0.0f;
+                for (int index = 0; index < 4; ++index)
+                    sum += hammerWorld[row * 4 + index] *
+                        pivotMatrix[index * 4 + column];
+                candidate[row * 4 + column] = sum;
+            }
+        }
+        // Score: the barrel-direction nose height after the swing.
+        float rotatedNose[3] = {};
+        for (int column = 0; column < 3; ++column)
+            for (int row = 0; row < 3; ++row)
+                rotatedNose[column] += barrel[row] * rotation[row][column];
+        const float score = pivot[2] + rotatedNose[2];
+        if (score > bestScore) {
+            bestScore = score;
+            memcpy(bestMatrix, candidate, sizeof(bestMatrix));
+        }
+    }
+    static std::atomic<bool> hammerCalibrated{false};
+    if (!hammerCalibrated.exchange(true, std::memory_order_relaxed))
+        Log("[ManualReload] Hammer cock v2: hinge=(%.2f,%.2f,%.2f) score=%.2f",
+            hinge[0], hinge[1], hinge[2], bestScore);
+    float inverseComponent[16] = {};
+    InvertRigidFrame(componentMatrix, inverseComponent);
+    float boneResult[16] = {};
+    MultiplyMatrix(bestMatrix, inverseComponent, boneResult);
+    AcquireSRWLockExclusive(&m_magHoldLock);
+    memcpy(m_magHold.hammerCockedMatrix, boneResult,
+           sizeof(m_magHold.hammerCockedMatrix));
+    ReleaseSRWLockExclusive(&m_magHoldLock);
+    m_hammerCocked.store(true, std::memory_order_release);
+    XRInput::Instance().SendHaptic(0, 1.0f, 120.0f);
+    Log("[ManualReload] Hammer cocked");
+}
+
+void InputHook::TickHammerStrikeSampler(bool fireOutput, uint64_t nowMs) {
+    const bool fireEdge = fireOutput && !m_strikePrevFire;
+    m_strikePrevFire = fireOutput;
+    if (!WeaponAimSystem::Instance().IsEquippedWeaponRevolver() ||
+        !config::Get().manual_reload_shotgun) {
+        m_strikePending = false;
+        return;
+    }
+    const int32_t hammerIndex = WeaponAimSystem::Instance().GetHammerBoneIndex();
+    if (hammerIndex < 0) return;
+    if (fireEdge && !m_hammerCocked.load(std::memory_order_acquire)) {
+        float world[3] = {};
+        if (GetWeaponBoneWorld(hammerIndex, world)) {
+            memcpy(m_strikePos0, world, sizeof(m_strikePos0));
+            m_strikeT0Ms = nowMs;
+            m_strikePending = true;
+        }
+    }
+    if (m_strikePending && nowMs >= m_strikeT0Ms + 120) {
+        m_strikePending = false;
+        if (nowMs - m_strikeT0Ms < 1000) {
+            float world[3] = {};
+            if (GetWeaponBoneWorld(hammerIndex, world)) {
+                const float dx = world[0] - m_strikePos0[0];
+                const float dy = world[1] - m_strikePos0[1];
+                const float dz = world[2] - m_strikePos0[2];
+                const float distance = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (std::isfinite(distance) && distance > 0.05f) {
+                    Log("[ManualReload] Strike sample: hammer moved %.2fcm dir=(%.2f,%.2f,%.2f)",
+                        distance, dx / distance, dy / distance, dz / distance);
+                } else {
+                    Log("[ManualReload] Strike sample: hammer static (%.2fcm)",
+                        distance);
+                }
+            }
+        }
+    }
+}
+
+bool InputHook::ApplyRevolverIdleExtras() {
+    if (!WeaponAimSystem::Instance().IsEquippedWeaponRevolver() ||
+        !config::Get().manual_reload_shotgun) return false;
+    uintptr_t component = 0;
+    int32_t matrixOffset = 0;
+    AcquireSRWLockShared(&m_weaponPoseWriteLock);
+    component = m_renderWeaponComponent;
+    matrixOffset = m_renderWeaponMatrixOffset;
+    ReleaseSRWLockShared(&m_weaponPoseWriteLock);
+    if (component < 0x10000 || matrixOffset <= 0) return false;
+    struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
+    constexpr uintptr_t kSpaceBasesOffset = 0x330;
+    constexpr uint64_t kBoneMatrixStride = 0x40;
+    TArrayPose poses = {};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(component + kSpaceBasesOffset),
+            &poses, sizeof(poses), &read) || read != sizeof(poses) ||
+        !poses.data || poses.count < 4 || poses.count > 256 ||
+        poses.capacity < poses.count)
+        return false;
+    bool did = false;
+    const int32_t magIndex = WeaponAimSystem::Instance().GetClipBoneIndex();
+    if (magIndex >= 0 && poses.count > magIndex &&
+        m_cylinderSpinning.load(std::memory_order_acquire)) {
+        float cylinder[16] = {};
+        float muzzle[16] = {};
+        auto readBone = [&](int bone, float out[16]) {
+            SIZE_T bytesRead = 0;
+            return ReadProcessMemory(GetCurrentProcess(),
+                reinterpret_cast<const void*>(poses.data +
+                    static_cast<uint64_t>(bone) * kBoneMatrixStride),
+                out, sizeof(float) * 16, &bytesRead) &&
+                bytesRead == sizeof(float) * 16;
+        };
+        if (readBone(magIndex, cylinder) && poses.count > 1 &&
+            readBone(1, muzzle)) {
+            float axis[3] = {muzzle[12] - cylinder[12], muzzle[13] - cylinder[13],
+                             muzzle[14] - cylinder[14]};
+            const float axisLength = sqrtf(axis[0] * axis[0] + axis[1] * axis[1] +
+                axis[2] * axis[2]);
+            if (std::isfinite(axisLength) && axisLength > 1.0e-5f) {
+                const uint64_t nowMs = GetTickCount64();
+                const uint64_t prevMs = m_spinLastMs.exchange(
+                    nowMs, std::memory_order_acq_rel);
+                if (prevMs != 0 && nowMs >= prevMs) {
+                    float dt = static_cast<float>(nowMs - prevMs) / 1000.0f;
+                    if (dt > 0.1f) dt = 0.1f;
+                    const float angle = dt * 8.37758040957278173812f;
+                    const float c = cosf(angle);
+                    const float s = sinf(angle);
+                    const float t = 1.0f - c;
+                    const float x = axis[0] / axisLength;
+                    const float y = axis[1] / axisLength;
+                    const float z = axis[2] / axisLength;
+                    const float columnRotation[3][3] = {
+                        {t * x * x + c, t * x * y - s * z, t * x * z + s * y},
+                        {t * x * y + s * z, t * y * y + c, t * y * z - s * x},
+                        {t * x * z - s * y, t * y * z + s * x, t * z * z + c}};
+                    float rotation[3][3] = {};
+                    for (int row = 0; row < 3; ++row)
+                        for (int column = 0; column < 3; ++column)
+                            rotation[row][column] = columnRotation[column][row];
+                    const float pivot[3] = {cylinder[12], cylinder[13],
+                                            cylinder[14]};
+                    float pivotRotated[3] = {};
+                    for (int column = 0; column < 3; ++column)
+                        for (int row = 0; row < 3; ++row)
+                            pivotRotated[column] +=
+                                pivot[row] * rotation[row][column];
+                    float pivotMatrix[16] = {};
+                    for (int row = 0; row < 3; ++row)
+                        for (int column = 0; column < 3; ++column)
+                            pivotMatrix[row * 4 + column] = rotation[row][column];
+                    pivotMatrix[12] = pivot[0] - pivotRotated[0];
+                    pivotMatrix[13] = pivot[1] - pivotRotated[1];
+                    pivotMatrix[14] = pivot[2] - pivotRotated[2];
+                    pivotMatrix[15] = 1.0f;
+                    float result[16] = {};
+                    for (int row = 0; row < 4; ++row) {
+                        for (int column = 0; column < 4; ++column) {
+                            float sum = 0.0f;
+                            for (int index = 0; index < 4; ++index)
+                                sum += cylinder[row * 4 + index] *
+                                    pivotMatrix[index * 4 + column];
+                            result[row * 4 + column] = sum;
+                        }
+                    }
+                    SIZE_T bytesWritten = 0;
+                    if (WriteProcessMemory(GetCurrentProcess(),
+                            reinterpret_cast<void*>(poses.data +
+                                static_cast<uint64_t>(magIndex) *
+                                    kBoneMatrixStride),
+                            result, sizeof(result), &bytesWritten) &&
+                        bytesWritten == sizeof(result))
+                        did = true;
+                }
+            }
+        }
+    }
+    if (m_hammerCocked.load(std::memory_order_acquire)) {
+        const int32_t hammerIndex = WeaponAimSystem::Instance().GetHammerBoneIndex();
+        if (hammerIndex >= 0 && poses.count > hammerIndex) {
+            MagHoldParams holdCopy = {};
+            AcquireSRWLockShared(&m_magHoldLock);
+            holdCopy = m_magHold;
+            ReleaseSRWLockShared(&m_magHoldLock);
+            SIZE_T bytesWritten = 0;
+            if (WriteProcessMemory(GetCurrentProcess(),
+                    reinterpret_cast<void*>(poses.data +
+                        static_cast<uint64_t>(hammerIndex) * kBoneMatrixStride),
+                    holdCopy.hammerCockedMatrix,
+                    sizeof(holdCopy.hammerCockedMatrix), &bytesWritten) &&
+                bytesWritten == sizeof(holdCopy.hammerCockedMatrix))
+                did = true;
+        }
+    }
+    return did;
+}
+
 bool InputHook::ApplyMagBoneOverride() {
     // Move the weapon mesh's b_clip bone so the magazine is visible in the
     // left hand, flies away when discarded, and rides back for insertion.
@@ -2570,7 +3037,10 @@ bool InputHook::ApplyMagBoneOverride() {
     AcquireSRWLockShared(&m_magHoldLock);
     hold = m_magHold;
     ReleaseSRWLockShared(&m_magHoldLock);
-    if (hold.mode == 0) return false;
+    if (hold.mode == 0) {
+        if (!m_motionControlsEnabled.load(std::memory_order_acquire)) return false;
+        return ApplyRevolverIdleExtras();
+    }
     if (!m_motionControlsEnabled.load(std::memory_order_acquire)) return false;
     uintptr_t component = 0;
     int32_t matrixOffset = 0;
@@ -2591,7 +3061,34 @@ bool InputHook::ApplyMagBoneOverride() {
     float handRotation[9] = {};
     bool handRotationReady = false;
     const uint64_t nowMs = GetTickCount64();
-    if (hold.mode == 2 && nowMs >= hold.throwStartMs) {
+    if (hold.mode == 3) {
+        // Revolver: keep the cylinder swung out to the weapon's left side,
+        // derived from the pristine seated pose so it tracks the weapon.
+        if (!hold.seatedValid) return false;
+        float seatedWorldMatrix[16] = {};
+        MultiplyMatrix(hold.seatedMatrix, componentMatrix, seatedWorldMatrix);
+        const int32_t* cameraRotation = camera::GetCameraRotation();
+        if (!cameraRotation) return false;
+        const float yaw = static_cast<float>(cameraRotation[1]) *
+            6.2831853071795864769f / 65536.0f;
+        const float xrRight[3] = {1.0f, 0.0f, 0.0f};
+        float rightUe[3] = {};
+        XrVectorToUe(xrRight, rightUe);
+        const float sine = sinf(yaw);
+        const float cosine = cosf(yaw);
+        const float yawedX = cosine * rightUe[0] - sine * rightUe[1];
+        const float yawedY = sine * rightUe[0] + cosine * rightUe[1];
+        desiredWorld[0] = seatedWorldMatrix[12] - yawedX * 4.0f;
+        desiredWorld[1] = seatedWorldMatrix[13] - yawedY * 4.0f;
+        desiredWorld[2] = seatedWorldMatrix[14] - rightUe[2] * 4.0f;
+        static std::atomic<bool> swingLogged{false};
+        if (!swingLogged.exchange(true, std::memory_order_relaxed)) {
+            Log("[ManualReload] Swing map: seated=(%.1f,%.1f,%.1f) desired=(%.1f,%.1f,%.1f) compT=(%.1f,%.1f,%.1f)",
+                seatedWorldMatrix[12], seatedWorldMatrix[13], seatedWorldMatrix[14],
+                desiredWorld[0], desiredWorld[1], desiredWorld[2],
+                componentMatrix[12], componentMatrix[13], componentMatrix[14]);
+        }
+    } else if (hold.mode == 2 && nowMs >= hold.throwStartMs) {
         float t = static_cast<float>(nowMs - hold.throwStartMs) / 1000.0f;
         if (t > 0.7f) t = 0.7f;   // parked at the end of the flight
         desiredWorld[0] = hold.throwOrigin[0] + hold.throwVelocity[0] * t;
@@ -2651,6 +3148,14 @@ bool InputHook::ApplyMagBoneOverride() {
         desiredWorld[2] = cameraLocation[2] + ue[2] * scale + pitchedZ;
         handRotationReady = HandWorldRotationFromXr(controllers[0].rotation,
             referenceRotation, pitch, yaw, handRotation);
+        // Prefer the real grip point (fingertip centroid pulled toward the
+        // wrist) so the mag sits inside the closing fist, not beside it.
+        float gripWorld[3] = {};
+        if (player::ArmIKSystem::Instance().GetLeftGripCenterWorld(gripWorld)) {
+            desiredWorld[0] = gripWorld[0];
+            desiredWorld[1] = gripWorld[1];
+            desiredWorld[2] = gripWorld[2];
+        }
     }
     if (!std::isfinite(desiredWorld[0]) || !std::isfinite(desiredWorld[1]) ||
         !std::isfinite(desiredWorld[2]))
@@ -2669,6 +3174,21 @@ bool InputHook::ApplyMagBoneOverride() {
         !poses.data || poses.count <= clipBoneIndex || poses.count > 256 ||
         poses.capacity < poses.count)
         return false;
+    const int32_t expectedBones =
+        WeaponAimSystem::Instance().GetWeaponBoneCount();
+    static std::atomic<uintptr_t> loggedPoseComponent{0};
+    static std::atomic<int32_t> loggedPoseBone{-1};
+    if (loggedPoseComponent.load(std::memory_order_acquire) != component ||
+        loggedPoseBone.load(std::memory_order_acquire) != clipBoneIndex) {
+        loggedPoseComponent.store(component, std::memory_order_release);
+        loggedPoseBone.store(clipBoneIndex, std::memory_order_release);
+        Log("[ManualReload] Pose check: component=%p bone=%d poses=%d expected=%d "
+            "compT=(%.1f,%.1f,%.1f)",
+            reinterpret_cast<void*>(component), clipBoneIndex, poses.count,
+            expectedBones, componentMatrix[12], componentMatrix[13],
+            componentMatrix[14]);
+    }
+    if (expectedBones > 0 && poses.count != expectedBones) return false;
     const uintptr_t boneAddress = poses.data +
         static_cast<uint64_t>(clipBoneIndex) * kBoneMatrixStride;
     if (handRotationReady && hold.grabRotationValid) {

@@ -3586,7 +3586,10 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
     return weaponValid;
 }
 
-static int FindMagBoneIndex(uintptr_t mesh, char* foundName, size_t foundNameSize);
+static int FindMagBoneIndex(uintptr_t mesh, char* foundName, size_t foundNameSize,
+                            int* outCount);
+static int FindBoneWithKeyword(uintptr_t mesh, const char* keyword, char* foundName,
+                               size_t foundNameSize);
 
 void WeaponAimSystem::NoteEquippedWeaponMesh(uintptr_t weapon, uintptr_t skeletalMesh,
                                              const char* meshName) {
@@ -3599,8 +3602,18 @@ void WeaponAimSystem::NoteEquippedWeaponMesh(uintptr_t weapon, uintptr_t skeleta
         if (lastMesh != skeletalMesh || currentIndex == -1) {
             const bool vanillaOnly =
                 WeaponNameContainsNoCase(meshName, "launcher") ||
-                WeaponNameContainsNoCase(meshName, "rocket") ||
-                WeaponNameContainsNoCase(meshName, "revolver");
+                WeaponNameContainsNoCase(meshName, "rocket");
+            m_equippedWeaponRevolver.store(
+                WeaponNameContainsNoCase(meshName, "revolver"),
+                std::memory_order_release);
+            char hammerName[128] = {};
+            const int hammerIndex = FindBoneWithKeyword(skeletalMesh, "hammer",
+                                                        hammerName,
+                                                        sizeof(hammerName));
+            m_hammerBoneIndex.store(hammerIndex, std::memory_order_release);
+            if (hammerIndex >= 0)
+                Log("[WeaponAim] Manual reload hammer: mesh=%s bone=%s index=%d",
+                    meshName, hammerName, hammerIndex);
             if (vanillaOnly) {
                 m_lastWeaponMesh.store(skeletalMesh, std::memory_order_release);
                 m_clipBoneIndex.store(-2, std::memory_order_release);
@@ -3608,8 +3621,13 @@ void WeaponAimSystem::NoteEquippedWeaponMesh(uintptr_t weapon, uintptr_t skeleta
                     meshName);
             } else {
                 char magBone[128] = {};
+                int validatedCount = -1;
                 const int magIndex = FindMagBoneIndex(skeletalMesh, magBone,
-                                                      sizeof(magBone));
+                                                      sizeof(magBone),
+                                                      &validatedCount);
+                if (validatedCount > 0)
+                    m_weaponBoneCount.store(validatedCount,
+                                            std::memory_order_release);
                 if (magIndex >= 0) {
                     m_lastWeaponMesh.store(skeletalMesh, std::memory_order_release);
                     m_clipBoneIndex.store(magIndex, std::memory_order_release);
@@ -3695,12 +3713,22 @@ void WeaponAimSystem::DumpWeaponBonesOnce() {
 
 // Locate the magazine bone of a weapon mesh by name so every weapon family
 // gets the physical reload: first bone containing "clip", "mag" or "loader".
-static int FindMagBoneIndex(uintptr_t mesh, char* foundName, size_t foundNameSize) {
+static int FindBoneWithKeyword(uintptr_t mesh, const char* keyword, char* foundName,
+                               size_t foundNameSize) {
     if (foundName && foundNameSize) foundName[0] = '\0';
+    if (!keyword || !*keyword) return -1;
     const auto globals = camera::GetUE3GlobalsSnapshot();
     if (!globals.gNamesValid || !globals.gObjectsValid) return -1;
     TArray64 names = {};
     if (!ReadMem(globals.gNamesAddress, &names, sizeof(names))) return -1;
+    char lowerKeyword[64] = {};
+    size_t keywordLength = strlen(keyword);
+    if (keywordLength >= sizeof(lowerKeyword)) keywordLength = sizeof(lowerKeyword) - 1;
+    for (size_t i = 0; i < keywordLength; ++i) {
+        char ch = keyword[i];
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        lowerKeyword[i] = ch;
+    }
     for (int arrayOffset = 0x40; arrayOffset <= 0x800; arrayOffset += 4) {
         TArray64 candidate = {};
         if (!ReadMem(mesh + static_cast<uintptr_t>(arrayOffset), &candidate,
@@ -3738,12 +3766,76 @@ static int FindMagBoneIndex(uintptr_t mesh, char* foundName, size_t foundNameSiz
                         ch = static_cast<char>(ch - 'A' + 'a');
                     lower[i] = ch;
                 }
-                if (strstr(lower, "clip") || strstr(lower, "mag") ||
-                    strstr(lower, "loader")) {
-                    if (foundName && foundNameSize) {
+                if (strstr(lower, lowerKeyword)) {
+                    if (foundName && foundNameSize)
                         strncpy_s(foundName, foundNameSize, boneName, _TRUNCATE);
-                    }
                     return index;
+                }
+            }
+            // The first validated array is the real skeleton.
+            return -1;
+        }
+    }
+    return -1;
+}
+
+static int FindMagBoneIndex(uintptr_t mesh, char* foundName, size_t foundNameSize,
+                            int* outCount) {
+    if (foundName && foundNameSize) foundName[0] = '\0';
+    if (outCount) *outCount = -1;
+    const auto globals = camera::GetUE3GlobalsSnapshot();
+    if (!globals.gNamesValid || !globals.gObjectsValid) return -1;
+    TArray64 names = {};
+    if (!ReadMem(globals.gNamesAddress, &names, sizeof(names))) return -1;
+    for (int arrayOffset = 0x40; arrayOffset <= 0x800; arrayOffset += 4) {
+        TArray64 candidate = {};
+        if (!ReadMem(mesh + static_cast<uintptr_t>(arrayOffset), &candidate,
+                     sizeof(candidate)) ||
+            !candidate.data || candidate.count < 4 || candidate.count > 256 ||
+            candidate.capacity < candidate.count || candidate.capacity > 512)
+            continue;
+        for (int stride : {0x40, 0x50, 0x58, 0x30, 0x28, 0x60}) {
+            const int checked = (std::min)(candidate.count, 32);
+            int printable = 0;
+            for (int index = 0; index < checked; ++index) {
+                int32_t nameIndex = -1;
+                if (!ReadMem(candidate.data +
+                             static_cast<uint64_t>(index) * stride,
+                             &nameIndex, sizeof(nameIndex))) break;
+                char boneName[128] = {};
+                if (ReadName(globals, names, nameIndex, boneName,
+                             sizeof(boneName)) && boneName[0]) ++printable;
+            }
+            if (printable < checked) continue;
+            if (outCount) *outCount = candidate.count;
+            for (int pass = 0; pass < 2; ++pass) {
+                const bool cylinders = pass == 1;
+                for (int index = 0; index < candidate.count; ++index) {
+                    int32_t nameIndex = -1;
+                    if (!ReadMem(candidate.data + static_cast<uint64_t>(index) * stride,
+                                 &nameIndex, sizeof(nameIndex))) break;
+                    char boneName[128] = {};
+                    if (!ReadName(globals, names, nameIndex, boneName,
+                                  sizeof(boneName)) || !boneName[0])
+                        continue;
+                    char lower[128] = {};
+                    size_t length = strlen(boneName);
+                    if (length >= sizeof(lower)) length = sizeof(lower) - 1;
+                    for (size_t i = 0; i < length; ++i) {
+                        char ch = boneName[i];
+                        if (ch >= 'A' && ch <= 'Z')
+                            ch = static_cast<char>(ch - 'A' + 'a');
+                        lower[i] = ch;
+                    }
+                    bool match = strstr(lower, "clip") || strstr(lower, "mag") ||
+                        strstr(lower, "loader");
+                    if (!match && cylinders) match = strstr(lower, "cyl");
+                    if (match) {
+                        if (foundName && foundNameSize) {
+                            strncpy_s(foundName, foundNameSize, boneName, _TRUNCATE);
+                        }
+                        return index;
+                    }
                 }
             }
             // The first validated array is the real skeleton: if it has no mag

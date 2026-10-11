@@ -2551,7 +2551,81 @@ bool ArmIKSystem::ReapplyRenderPalette() {
 
 // Curl the LEFT hand fingers around the carried magazine. Runs after the IK
 // palette write so the closure survives the arm solve.
-static void ApplyMagCarryFingerCurl(uintptr_t component);
+static void ApplySensorFingerPose(uintptr_t component);
+
+bool ArmIKSystem::GetLeftGripCenterWorld(float out[3]) const {
+    // Grip point the magazine should sit in: fingertip centroid of the left
+    // hand pulled toward the wrist, in UE3 world space. Uses the same live
+    // reads as the finger drive (component matrix + SpaceBases array).
+    if (!out) return false;
+    uintptr_t component = 0;
+    int matrixOffset = 0;
+    {
+        AcquireSRWLockShared(&m_rigLock);
+        if (m_rig && m_rig->valid) {
+            component = m_rig->component;
+            matrixOffset = m_rig->matrixOffset;
+        }
+        ReleaseSRWLockShared(&m_rigLock);
+    }
+    if (component < 0x10000 || matrixOffset <= 0) return false;
+    constexpr uintptr_t kSpaceBasesOffset = 0x330;
+    constexpr uint64_t kBoneMatrixStride = 0x40;
+    struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
+    TArrayPose poses = {};
+    if (!ReadMemory(component + kSpaceBasesOffset, &poses, sizeof(poses)) ||
+        !poses.data || poses.count < 40 || poses.count > 256 ||
+        poses.capacity < poses.count)
+        return false;
+    float componentMatrix[16] = {};
+    if (!ReadMemory(component + static_cast<uintptr_t>(matrixOffset),
+                    &componentMatrix, sizeof(componentMatrix)))
+        return false;
+    for (float value : componentMatrix)
+        if (!std::isfinite(value)) return false;
+    if (fabsf(componentMatrix[15] - 1.0f) > 0.05f) return false;
+    auto readTranslation = [&](int bone, float translation[3]) {
+        float matrix[16] = {};
+        SIZE_T bytesRead = 0;
+        if (!ReadMemory(poses.data + static_cast<uint64_t>(bone) * kBoneMatrixStride,
+                        &matrix, sizeof(matrix)))
+            return false;
+        for (float value : matrix)
+            if (!std::isfinite(value)) return false;
+        if (fabsf(matrix[15] - 1.0f) > 0.05f) return false;
+        translation[0] = matrix[12];
+        translation[1] = matrix[13];
+        translation[2] = matrix[14];
+        return true;
+    };
+    static const int kTips[4] = {26, 30, 34, 38};
+    float centroid[3] = {};
+    for (int i = 0; i < 4; ++i) {
+        float tip[3] = {};
+        if (!readTranslation(kTips[i], tip)) return false;
+        centroid[0] += tip[0];
+        centroid[1] += tip[1];
+        centroid[2] += tip[2];
+    }
+    for (float& value : centroid) value *= 0.25f;
+    float wrist[3] = {};
+    if (!readTranslation(19, wrist)) return false;
+    const float gripLocal[3] = {
+        centroid[0] * 0.7f + wrist[0] * 0.3f,
+        centroid[1] * 0.7f + wrist[1] * 0.3f,
+        centroid[2] * 0.7f + wrist[2] * 0.3f};
+    out[0] = gripLocal[0] * componentMatrix[0] +
+        gripLocal[1] * componentMatrix[4] +
+        gripLocal[2] * componentMatrix[8] + componentMatrix[12];
+    out[1] = gripLocal[0] * componentMatrix[1] +
+        gripLocal[1] * componentMatrix[5] +
+        gripLocal[2] * componentMatrix[9] + componentMatrix[13];
+    out[2] = gripLocal[0] * componentMatrix[2] +
+        gripLocal[1] * componentMatrix[6] +
+        gripLocal[2] * componentMatrix[10] + componentMatrix[14];
+    return std::isfinite(out[0]) && std::isfinite(out[1]) &&
+        std::isfinite(out[2]);
+}
 
 bool ArmIKSystem::ApplyPostAnimation(void* component) {
     if (!component || !m_poseHookInstalled.load(std::memory_order_acquire)) return false;
@@ -2564,21 +2638,23 @@ bool ArmIKSystem::ApplyPostAnimation(void* component) {
     const uint64_t targetGeneration = m_renderTargetGeneration.load(std::memory_order_acquire);
     const bool applied = renderGeneration != 0 && targetGeneration != 0 &&
         Apply(renderGeneration, targetGeneration, false);
-    static constexpr bool kMagFingerCurlEnabled = false;
-    if (kMagFingerCurlEnabled && applied &&
-        input::InputHook::Instance().IsMagCarried())
-        ApplyMagCarryFingerCurl(targetComponent);
+    if (applied)
+        ApplySensorFingerPose(targetComponent);
     return applied;
 }
 
-static void ApplyMagCarryFingerCurl(uintptr_t component) {
+static void ApplySensorFingerPose(uintptr_t component) {
+    // Drive both hands' fingers from the controllers' capacitive sensors:
+    // index follows trigger touch/value, middle/ring/pinky follow the analog
+    // squeeze, thumb follows stick/button touch. At rest (sensors off) the
+    // game pose is left untouched.
     if (component < 0x10000) return;
     constexpr uintptr_t kSpaceBasesOffset = 0x330;
     constexpr uint64_t kBoneMatrixStride = 0x40;
     struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
     TArrayPose poses = {};
     if (!ReadMemory(component + kSpaceBasesOffset, &poses, sizeof(poses)) ||
-        !poses.data || poses.count < 41 || poses.count > 256 ||
+        !poses.data || poses.count < 67 || poses.count > 256 ||
         poses.capacity < poses.count)
         return;
     auto readMatrix = [&](int bone, float out[16]) {
@@ -2586,35 +2662,63 @@ static void ApplyMagCarryFingerCurl(uintptr_t component) {
                               static_cast<uint64_t>(bone) * kBoneMatrixStride,
                           out, sizeof(float) * 16);
     };
-    float wrist[16] = {};
-    if (!readMatrix(19, wrist)) return;
-    const float wristPosition[3] = {wrist[12], wrist[13], wrist[14]};
-    // Knuckle line (index proximal to pinky proximal) is the shared bend axis
-    // for the four fingers; per-chain cross products are noise on straight
-    // fingers and mangle the hand.
-    float indexProximal[16] = {};
-    float pinkyProximal[16] = {};
-    if (!readMatrix(24, indexProximal) || !readMatrix(36, pinkyProximal)) return;
-    float knuckleAxis[3] = {
-        indexProximal[12] - pinkyProximal[12],
-        indexProximal[13] - pinkyProximal[13],
-        indexProximal[14] - pinkyProximal[14]};
-    const float knuckleLength = sqrtf(knuckleAxis[0] * knuckleAxis[0] +
-        knuckleAxis[1] * knuckleAxis[1] + knuckleAxis[2] * knuckleAxis[2]);
-    if (!std::isfinite(knuckleLength) || knuckleLength < 1.0e-5f) return;
-    knuckleAxis[0] /= knuckleLength;
-    knuckleAxis[1] /= knuckleLength;
-    knuckleAxis[2] /= knuckleLength;
-    struct Finger { int bones[4]; float cumulativeDegrees[4]; };
-    static const Finger fingers[5] = {
-        {{20, 21, 22, 23}, {0.0f, 0.0f, 0.0f, 0.0f}},
-        {{24, 25, 26, 27}, {15.0f, 30.0f, 45.0f, 45.0f}},
-        {{28, 29, 30, 31}, {15.0f, 30.0f, 45.0f, 45.0f}},
-        {{32, 33, 34, 35}, {15.0f, 30.0f, 45.0f, 45.0f}},
-        {{36, 37, 38, 39}, {15.0f, 30.0f, 45.0f, 45.0f}}
-    };
+    input::ControllerState controllers[2] = {};
+    if (!input::XRInput::Instance().GetControllerSnapshot(controllers)) return;
     constexpr float kDegreesToRadians = 0.01745329251994329577f;
-    for (const Finger& finger : fingers) {
+    constexpr float kJointFractions[4] = {0.35f, 0.75f, 1.0f, 1.0f};
+    for (int hand = 0; hand < 2; ++hand) {
+        const input::ControllerState& ctrl = controllers[hand];
+        if (!ctrl.valid) continue;
+        const int wristBone = hand == 0 ? 19 : 44;
+        const int indexBase = hand == 0 ? 24 : 49;
+        const int pinkyBase = hand == 0 ? 36 : 61;
+        const int thumbBase = hand == 0 ? 20 : 45;
+        const int middleBase = hand == 0 ? 28 : 53;
+        const int ringBase = hand == 0 ? 32 : 57;
+        float indexAmount = ctrl.triggerTouch ? (0.2f + 0.8f * ctrl.trigger) : 0.0f;
+        if (indexAmount > 1.0f) indexAmount = 1.0f;
+        float gripAmount = ctrl.grip;
+        if (gripAmount < 0.0f) gripAmount = 0.0f;
+        if (gripAmount > 1.0f) gripAmount = 1.0f;
+        float thumbAmount = ctrl.thumbstickTouch ? 0.35f : 0.0f;
+        if (ctrl.primaryTouch || ctrl.secondaryTouch) thumbAmount = 0.55f;
+        const float squeezeThumb = gripAmount * 0.6f;
+        if (squeezeThumb > thumbAmount) thumbAmount = squeezeThumb;
+        float wrist[16] = {};
+        if (!readMatrix(wristBone, wrist)) continue;
+        const float wristPosition[3] = {wrist[12], wrist[13], wrist[14]};
+        // Knuckle line (index proximal to pinky proximal) is the shared bend
+        // axis for the four fingers; per-chain cross products are noise on
+        // straight fingers and mangle the hand.
+        float indexProximal[16] = {};
+        float pinkyProximal[16] = {};
+        if (!readMatrix(indexBase, indexProximal) ||
+            !readMatrix(pinkyBase, pinkyProximal)) continue;
+        float knuckleAxis[3] = {
+            indexProximal[12] - pinkyProximal[12],
+            indexProximal[13] - pinkyProximal[13],
+            indexProximal[14] - pinkyProximal[14]};
+        const float knuckleLength = sqrtf(knuckleAxis[0] * knuckleAxis[0] +
+            knuckleAxis[1] * knuckleAxis[1] + knuckleAxis[2] * knuckleAxis[2]);
+        if (!std::isfinite(knuckleLength) || knuckleLength < 1.0e-5f) continue;
+        knuckleAxis[0] /= knuckleLength;
+        knuckleAxis[1] /= knuckleLength;
+        knuckleAxis[2] /= knuckleLength;
+        struct Finger { int bones[4]; float amount; float maxDegrees; };
+        const Finger fingers[5] = {
+            {{thumbBase, thumbBase + 1, thumbBase + 2, thumbBase + 3},
+             0.0f, 0.0f},
+            {{indexBase, indexBase + 1, indexBase + 2, indexBase + 3},
+             indexAmount, 55.0f},
+            {{middleBase, middleBase + 1, middleBase + 2, middleBase + 3},
+             gripAmount, 40.0f},
+            {{ringBase, ringBase + 1, ringBase + 2, ringBase + 3},
+             gripAmount, 40.0f},
+            {{pinkyBase, pinkyBase + 1, pinkyBase + 2, pinkyBase + 3},
+             gripAmount, 40.0f}
+        };
+        for (const Finger& finger : fingers) {
+            if (finger.maxDegrees <= 0.0f) continue;
         float matrices[4][16] = {};
         if (!readMatrix(finger.bones[0], matrices[0]) ||
             !readMatrix(finger.bones[1], matrices[1]) ||
@@ -2648,9 +2752,27 @@ static void ApplyMagCarryFingerCurl(uintptr_t component) {
             axis[1] = -axis[1];
             axis[2] = -axis[2];
         }
-        for (int joint = 0; joint < 4; ++joint) {
-            const float angle = finger.cumulativeDegrees[joint] *
-                kDegreesToRadians;
+        // Hierarchical FK: each segment inherits its parent's motion, so the
+        // joints stay connected (no tearing/sinking). Angles are relative
+        // per joint; the dummy tip rides rigidly with the distal segment.
+        static const float kRelativeFractions[3] = {0.3f, 0.35f, 0.3f};
+        float parent[16] = {1.0f, 0.0f, 0.0f, 0.0f,
+                            0.0f, 1.0f, 0.0f, 0.0f,
+                            0.0f, 0.0f, 1.0f, 0.0f,
+                            0.0f, 0.0f, 0.0f, 1.0f};
+        for (int joint = 0; joint < 3; ++joint) {
+            const float* originalHead = positions[joint];
+            float pivot[3] = {
+                originalHead[0] * parent[0] + originalHead[1] * parent[4] +
+                    originalHead[2] * parent[8] + parent[12],
+                originalHead[0] * parent[1] + originalHead[1] * parent[5] +
+                    originalHead[2] * parent[9] + parent[13],
+                originalHead[0] * parent[2] + originalHead[1] * parent[6] +
+                    originalHead[2] * parent[10] + parent[14]};
+            static const float kOpenDegrees = 15.0f;
+            const float angle = kRelativeFractions[joint] *
+                (finger.amount * (finger.maxDegrees + kOpenDegrees) -
+                 kOpenDegrees) * kDegreesToRadians;
             const float c = cosf(angle);
             const float s = sinf(angle);
             const float t = 1.0f - c;
@@ -2665,10 +2787,6 @@ static void ApplyMagCarryFingerCurl(uintptr_t component) {
             for (int row = 0; row < 3; ++row)
                 for (int column = 0; column < 3; ++column)
                     rotation[row][column] = columnRotation[column][row];
-            // Proper FK: the whole chain rotates about the finger's base
-            // knuckle with cumulative angles, so the bases fold instead of
-            // only the tips spinning in place.
-            const float* pivot = positions[0];
             float pivotRotated[3] = {};
             for (int column = 0; column < 3; ++column)
                 for (int row = 0; row < 3; ++row)
@@ -2681,25 +2799,49 @@ static void ApplyMagCarryFingerCurl(uintptr_t component) {
             pivotMatrix[13] = pivot[1] - pivotRotated[1];
             pivotMatrix[14] = pivot[2] - pivotRotated[2];
             pivotMatrix[15] = 1.0f;
+            float composed[16] = {};
+            for (int row = 0; row < 4; ++row) {
+                for (int column = 0; column < 4; ++column) {
+                    float sum = 0.0f;
+                    for (int index = 0; index < 4; ++index)
+                        sum += parent[row * 4 + index] *
+                            pivotMatrix[index * 4 + column];
+                    composed[row * 4 + column] = sum;
+                }
+            }
             float result[16] = {};
             for (int row = 0; row < 4; ++row) {
                 for (int column = 0; column < 4; ++column) {
                     float sum = 0.0f;
                     for (int index = 0; index < 4; ++index)
                         sum += matrices[joint][row * 4 + index] *
-                            pivotMatrix[index * 4 + column];
+                            composed[index * 4 + column];
                     result[row * 4 + column] = sum;
                 }
             }
-            result[12] = pivot[0];
-            result[13] = pivot[1];
-            result[14] = pivot[2];
             WriteProcessMemory(GetCurrentProcess(),
                 reinterpret_cast<void*>(poses.data +
                     static_cast<uint64_t>(finger.bones[joint]) *
                         kBoneMatrixStride),
                 result, sizeof(result), nullptr);
+            memcpy(parent, composed, sizeof(parent));
         }
+        float dummyResult[16] = {};
+        for (int row = 0; row < 4; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                float sum = 0.0f;
+                for (int index = 0; index < 4; ++index)
+                    sum += matrices[3][row * 4 + index] *
+                        parent[index * 4 + column];
+                dummyResult[row * 4 + column] = sum;
+            }
+        }
+        WriteProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<void*>(poses.data +
+                static_cast<uint64_t>(finger.bones[3]) *
+                    kBoneMatrixStride),
+            dummyResult, sizeof(dummyResult), nullptr);
+    }
     }
 }
 

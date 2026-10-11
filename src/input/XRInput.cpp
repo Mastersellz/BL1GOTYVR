@@ -106,7 +106,23 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space,
         XR_FAILED(CreateAction(m_actionSet, &m_haptic[0], XR_ACTION_TYPE_VIBRATION_OUTPUT,
             "left_haptic", "Left Haptic")) ||
         XR_FAILED(CreateAction(m_actionSet, &m_haptic[1], XR_ACTION_TYPE_VIBRATION_OUTPUT,
-            "right_haptic", "Right Haptic"))) return false;
+            "right_haptic", "Right Haptic")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_leftThumbstickTouch, XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "left_thumbstick_touch", "Left Thumbstick Touch")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_rightThumbstickTouch, XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "right_thumbstick_touch", "Right Thumbstick Touch")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_leftTriggerTouch, XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "left_trigger_touch", "Left Trigger Touch")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_rightTriggerTouch, XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "right_trigger_touch", "Right Trigger Touch")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_buttonATouch, XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "button_a_touch", "Button A Touch")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_buttonBTouch, XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "button_b_touch", "Button B Touch")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_buttonXTouch, XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "button_x_touch", "Button X Touch")) ||
+        XR_FAILED(CreateAction(m_actionSet, &m_buttonYTouch, XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "button_y_touch", "Button Y Touch"))) return false;
 
     auto path = [&](const char* value) {
         XrPath result = XR_NULL_PATH;
@@ -147,6 +163,14 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space,
         {m_menuButton, path("/user/hand/left/input/menu/click")},
         {m_haptic[0], path("/user/hand/left/output/haptic")},
         {m_haptic[1], path("/user/hand/right/output/haptic")},
+        {m_leftThumbstickTouch, path("/user/hand/left/input/thumbstick/touch")},
+        {m_rightThumbstickTouch, path("/user/hand/right/input/thumbstick/touch")},
+        {m_leftTriggerTouch, path("/user/hand/left/input/trigger/touch")},
+        {m_rightTriggerTouch, path("/user/hand/right/input/trigger/touch")},
+        {m_buttonXTouch, path("/user/hand/left/input/x/touch")},
+        {m_buttonYTouch, path("/user/hand/left/input/y/touch")},
+        {m_buttonATouch, path("/user/hand/right/input/a/touch")},
+        {m_buttonBTouch, path("/user/hand/right/input/b/touch")},
     };
     if (!suggest("/interaction_profiles/oculus/touch_controller", touch, _countof(touch)))
         return false;
@@ -175,6 +199,12 @@ bool XRInput::Initialize(XrInstance instance, XrSession session, XrSpace space,
         {m_menuButton, path("/user/hand/left/input/system/click")},
         {m_haptic[0], path("/user/hand/left/output/haptic")},
         {m_haptic[1], path("/user/hand/right/output/haptic")},
+        {m_leftThumbstickTouch, path("/user/hand/left/input/thumbstick/touch")},
+        {m_rightThumbstickTouch, path("/user/hand/right/input/thumbstick/touch")},
+        {m_leftTriggerTouch, path("/user/hand/left/input/trigger/touch")},
+        {m_rightTriggerTouch, path("/user/hand/right/input/trigger/touch")},
+        {m_buttonATouch, path("/user/hand/right/input/a/touch")},
+        {m_buttonBTouch, path("/user/hand/right/input/b/touch")},
     };
     suggest("/interaction_profiles/valve/index_controller", index, _countof(index));
 
@@ -391,19 +421,27 @@ void XRInput::UpdateControllerStateUnlocked(int hand, XrTime displayTime) {
     ctrl.buttonX = hand == 0 && getButton(m_buttonX);
     ctrl.buttonY = hand == 0 && getButton(m_buttonY);
     ctrl.menuButton = hand == 0 && getButton(m_menuButton);
+    ctrl.thumbstickTouch =
+        getButton(hand == 0 ? m_leftThumbstickTouch : m_rightThumbstickTouch);
+    ctrl.triggerTouch =
+        getButton(hand == 0 ? m_leftTriggerTouch : m_rightTriggerTouch);
+    ctrl.primaryTouch = getButton(hand == 0 ? m_buttonXTouch : m_buttonATouch);
+    ctrl.secondaryTouch = getButton(hand == 0 ? m_buttonYTouch : m_buttonBTouch);
 
     static uint64_t updateCounts[2] = {};
     const uint64_t updateCount = ++updateCounts[hand];
     if (updateCount == 1 || updateCount % 300 == 0) {
         Log("[XRInput] hand=%s poseResult=%d active=%d locateResult=%d flags=0x%llX "
             "valid=%d stickActive=%d scalarActive=%d/%d triggerActive=%d gripActive=%d "
-            "buttons=%d%d%d%d%d%d values=(%.2f,%.2f %.2f %.2f)",
+            "buttons=%d%d%d%d%d%d touch=%d%d%d%d values=(%.2f,%.2f %.2f %.2f)",
             hand == 0 ? "left" : "right", (int)poseResult, poseState.isActive,
             (int)locationResult, static_cast<unsigned long long>(location.locationFlags),
             ctrl.valid, thumbState.isActive, thumbXState.isActive, thumbYState.isActive,
             triggerState.isActive, gripState.isActive,
             ctrl.buttonA, ctrl.buttonB, ctrl.buttonX, ctrl.buttonY,
             ctrl.thumbstickClick, ctrl.menuButton,
+            ctrl.thumbstickTouch, ctrl.triggerTouch,
+            ctrl.primaryTouch, ctrl.secondaryTouch,
             ctrl.thumbstickX, ctrl.thumbstickY, ctrl.trigger, ctrl.grip);
     }
 }

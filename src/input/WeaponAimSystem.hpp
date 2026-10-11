@@ -29,6 +29,8 @@ public:
         m_vehicleSecondaryFireActive.store(active, std::memory_order_release);
     }
     bool IsFireActive() const { return m_fireActive.load(std::memory_order_acquire); }
+    int32_t GetAimPitchUnis() const { return m_aimPitch.load(std::memory_order_acquire); }
+    int32_t GetAimYawUnis() const { return m_aimYaw.load(std::memory_order_acquire); }
     void SetBallisticOverrideEnabled(bool enabled);
     bool IsBallisticOverrideEnabled() const {
         return m_ballisticOverrideEnabled.load(std::memory_order_acquire);
@@ -69,6 +71,15 @@ public:
     }
     int32_t GetClipBoneIndex() const {
         return m_clipBoneIndex.load(std::memory_order_acquire);
+    }
+    int32_t GetHammerBoneIndex() const {
+        return m_hammerBoneIndex.load(std::memory_order_acquire);
+    }
+    int32_t GetWeaponBoneCount() const {
+        return m_weaponBoneCount.load(std::memory_order_acquire);
+    }
+    bool IsEquippedWeaponRevolver() const {
+        return m_equippedWeaponRevolver.load(std::memory_order_acquire);
     }
     void NoteEquippedWeaponMesh(uintptr_t weapon, uintptr_t skeletalMesh,
                                 const char* meshName);
@@ -161,6 +172,9 @@ private:
     std::atomic<uintptr_t> m_shotgunEvidenceWeapon{0};
     std::atomic<uintptr_t> m_lastWeaponMesh{0};
     std::atomic<int32_t> m_clipBoneIndex{-1};
+    std::atomic<int32_t> m_hammerBoneIndex{-1};
+    std::atomic<int32_t> m_weaponBoneCount{-1};
+    std::atomic<bool> m_equippedWeaponRevolver{false};
     std::atomic<bool> m_reloadBlockerAttempted{false};
     uintptr_t m_reloadBlockerTarget = 0;
     std::atomic<uint64_t> m_identityGeneration{0};
