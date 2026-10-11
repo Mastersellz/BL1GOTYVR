@@ -716,8 +716,8 @@ bool InputHook::UpdateShotgunReloadSequence(const ControllerState controllers[2]
     if (!std::isfinite(dWell) || !std::isfinite(dPouch)) return forward;
     constexpr float kWellGlow = 0.30f;
     constexpr float kWellExtract = 0.26f;
-    constexpr float kPouchGlow = 0.30f;
-    constexpr float kPouchExtract = 0.28f;
+    constexpr float kPouchGlow = 0.45f;
+    constexpr float kPouchExtract = 0.42f;
 
     bool highlight = false;
     float highlightPos[3] = {};
@@ -1160,6 +1160,24 @@ void InputHook::UpdateState(XrTime displayTime) {
     }
 
     const auto playerIdentity = WeaponAimSystem::Instance().GetPlayerIdentity();
+    // Auto-recenter 3s after entering gameplay (pawn+weapon live), so the
+    // player starts aligned without touching the recenter button.
+    {
+        static bool autoRecenterArmed = false;
+        static bool wasInGame = false;
+        static uint64_t autoRecenterAtMs = 0;
+        const bool inGame = playerIdentity.pawnValid && playerIdentity.weaponValid;
+        if (inGame && !wasInGame) {
+            autoRecenterArmed = true;
+            autoRecenterAtMs = now + 3000;
+        }
+        wasInGame = inGame;
+        if (autoRecenterArmed && now >= autoRecenterAtMs) {
+            autoRecenterArmed = false;
+            camera::RequestRecenter();
+            Log("[Input] Auto-recenter after gameplay entry");
+        }
+    }
     const bool brickRigActive =
         player::ArmIKSystem::Instance().IsBrickRigActive();
     if (brickRigActive && playerIdentity.weaponValid && m_leftGripDown &&
