@@ -577,6 +577,10 @@ bool InputHook::UpdateShotgunReloadSequence(const ControllerState controllers[2]
         well[0] = seq.wellAnchor[0];
         well[1] = seq.wellAnchor[1];
         well[2] = seq.wellAnchor[2];
+    } else if (wellFromBone) {
+        // The bone origin sits at the mag's insertion point (top); drop the
+        // well onto the visible magazine body below it.
+        well[1] -= 0.08f;
     }
     float headRight[3] = {};
     RotateMeleeVector(headRotation, kLocalRight, headRight);
@@ -808,8 +812,9 @@ bool InputHook::GetWeaponClipWorldPosition(float out[3]) const {
     if (GetTickCount64() - updatedMs > 1000) return false;
     struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
     constexpr uintptr_t kSpaceBasesOffset = 0x330;
-    constexpr int kClipBoneIndex = 25;
-    constexpr uint64_t kBoneMatrixStride = 0x40;
+    const uint64_t kBoneMatrixStride = 0x40;
+    const int32_t clipBoneIndex = WeaponAimSystem::Instance().GetClipBoneIndex();
+    if (clipBoneIndex < 0) return false;
     float componentMatrix[16] = {};
     TArrayPose poses = {};
     SIZE_T read = 0;
@@ -821,13 +826,13 @@ bool InputHook::GetWeaponClipWorldPosition(float out[3]) const {
         !ReadProcessMemory(GetCurrentProcess(),
             reinterpret_cast<const void*>(component + kSpaceBasesOffset),
             &poses, sizeof(poses), &read) || read != sizeof(poses) ||
-        !poses.data || poses.count <= kClipBoneIndex || poses.count > 256 ||
+        !poses.data || poses.count <= clipBoneIndex || poses.count > 256 ||
         poses.capacity < poses.count)
         return false;
     float boneMatrix[16] = {};
     if (!ReadProcessMemory(GetCurrentProcess(),
             reinterpret_cast<const void*>(poses.data +
-                static_cast<uint64_t>(kClipBoneIndex) * kBoneMatrixStride),
+                static_cast<uint64_t>(clipBoneIndex) * kBoneMatrixStride),
             boneMatrix, sizeof(boneMatrix), &read) || read != sizeof(boneMatrix))
         return false;
     for (float value : boneMatrix)
@@ -1133,11 +1138,17 @@ void InputHook::UpdateState(XrTime displayTime) {
     }
 
     const bool manualShotgunReload = cfg.manual_reload_shotgun &&
-        WeaponAimSystem::Instance().IsEquippedWeaponShotgun();
+        WeaponAimSystem::Instance().IsManualReloadWeapon();
     bool forwardReloadX = left.buttonX;
     if (manualShotgunReload) {
         forwardReloadX = UpdateShotgunReloadSequence(controllers, left.buttonX,
             WeaponAimSystem::Instance().HasUsableTarget(), m_leftTriggerDown, now);
+        // Route the pickup/use forward as the keyboard USE key: the gamepad X
+        // bit is contextual (use OR reload) and leaks vanilla reloads.
+        if (forwardReloadX && !m_prevUse) PressKey('E');
+        else if (!forwardReloadX && m_prevUse) ReleaseKey('E');
+        m_prevUse = forwardReloadX ? 1 : 0;
+        forwardReloadX = false;
     } else {
         ResetManualReload();
     }
@@ -2435,8 +2446,14 @@ void InputHook::PublishMagHold(int32_t mode) {
     AcquireSRWLockExclusive(&m_magHoldLock);
     m_magHold.mode = mode;
     if (mode != 2) m_magHold.throwStartMs = 0;
-    if (mode != 1) m_magHold.grabRotationValid = false;
-    if (mode == 1) {
+    // The rotation cache survives the whole sequence (grab -> drop -> pouch):
+    // the first grab's seated orientation is reused for the fresh mag, so it
+    // always looks upright in the hand.
+    if (mode != 1 && mode != 2) {
+        m_magHold.grabRotationValid = false;
+        if (mode == 0) RestoreMagBoneSeated();
+    }
+    if (mode == 1 && !m_magHold.grabRotationValid) {
         // Cache the hand world rotation and the mag's world rotation at grab
         // time, so the carried mag can rotate with the hand afterwards.
         ControllerState controllers[2] = {};
@@ -2462,7 +2479,10 @@ void InputHook::PublishMagHold(int32_t mode) {
             float componentMatrix[16] = {};
             float boneMatrix[16] = {};
             SIZE_T read = 0;
-            if (HandWorldRotationFromXr(controllers[0].rotation, referenceRotation,
+            const int32_t clipBoneIndex =
+                WeaponAimSystem::Instance().GetClipBoneIndex();
+            if (clipBoneIndex >= 0 &&
+                HandWorldRotationFromXr(controllers[0].rotation, referenceRotation,
                                         pitch, yaw, handRotation) &&
                 component >= 0x10000 && matrixOffset > 0 &&
                 ReadProcessMemory(GetCurrentProcess(),
@@ -2473,13 +2493,26 @@ void InputHook::PublishMagHold(int32_t mode) {
                 ReadProcessMemory(GetCurrentProcess(),
                     reinterpret_cast<const void*>(component + 0x330),
                     &poses, sizeof(poses), &read) && read == sizeof(poses) &&
-                poses.data && poses.count > 25 && poses.count <= 256 &&
+                poses.data && poses.count > clipBoneIndex &&
+                poses.count <= 256 &&
                 ReadProcessMemory(GetCurrentProcess(),
-                    reinterpret_cast<const void*>(poses.data + 25ull * 0x40ull),
+                    reinterpret_cast<const void*>(poses.data +
+                        static_cast<uint64_t>(clipBoneIndex) * 0x40ull),
                     boneMatrix, sizeof(boneMatrix), &read) &&
                 read == sizeof(boneMatrix)) {
+                // Keep the pristine seated pose: the game does not re-animate
+                // the clip bone between sequences, so our previous override
+                // would otherwise poison the reference orientation.
+                const uintptr_t weaponPtr =
+                    WeaponAimSystem::Instance().GetPlayerIdentity().weapon;
+                if (!m_magHold.seatedValid || m_magHold.seatedWeapon != weaponPtr) {
+                    memcpy(m_magHold.seatedMatrix, boneMatrix,
+                           sizeof(m_magHold.seatedMatrix));
+                    m_magHold.seatedWeapon = weaponPtr;
+                    m_magHold.seatedValid = true;
+                }
                 float world[16] = {};
-                MultiplyMatrix(boneMatrix, componentMatrix, world);
+                MultiplyMatrix(m_magHold.seatedMatrix, componentMatrix, world);
                 for (int row = 0; row < 3; ++row)
                     for (int column = 0; column < 3; ++column)
                         m_magHold.grabMagRotation[row * 3 + column] =
@@ -2501,6 +2534,32 @@ void InputHook::PublishMagThrow(const float originWorld[3],
     memcpy(m_magHold.throwOrigin, originWorld, sizeof(m_magHold.throwOrigin));
     memcpy(m_magHold.throwVelocity, velocityWorld, sizeof(m_magHold.throwVelocity));
     ReleaseSRWLockExclusive(&m_magHoldLock);
+}
+
+void InputHook::RestoreMagBoneSeated() {
+    // Caller must hold m_magHoldLock exclusively.
+    if (!m_magHold.seatedValid) return;
+    uintptr_t component = 0;
+    int32_t matrixOffset = 0;
+    AcquireSRWLockShared(&m_weaponPoseWriteLock);
+    component = m_renderWeaponComponent;
+    matrixOffset = m_renderWeaponMatrixOffset;
+    ReleaseSRWLockShared(&m_weaponPoseWriteLock);
+    if (component < 0x10000 || matrixOffset <= 0) return;
+    const int32_t clipBoneIndex = WeaponAimSystem::Instance().GetClipBoneIndex();
+    if (clipBoneIndex < 0) return;
+    struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
+    TArrayPose poses = {};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<const void*>(component + 0x330),
+            &poses, sizeof(poses), &read) || read != sizeof(poses) ||
+        !poses.data || poses.count <= clipBoneIndex || poses.count > 256)
+        return;
+    WriteProcessMemory(GetCurrentProcess(),
+        reinterpret_cast<void*>(poses.data +
+            static_cast<uint64_t>(clipBoneIndex) * 0x40ull),
+        m_magHold.seatedMatrix, sizeof(m_magHold.seatedMatrix), nullptr);
 }
 
 bool InputHook::ApplyMagBoneOverride() {
@@ -2600,17 +2659,18 @@ bool InputHook::ApplyMagBoneOverride() {
     desiredWorld[2] += 3.0f;
     struct TArrayPose { uint64_t data; int32_t count; int32_t capacity; };
     constexpr uintptr_t kSpaceBasesOffset = 0x330;
-    constexpr int kClipBoneIndex = 25;
-    constexpr uint64_t kBoneMatrixStride = 0x40;
+    const uint64_t kBoneMatrixStride = 0x40;
+    const int32_t clipBoneIndex = WeaponAimSystem::Instance().GetClipBoneIndex();
+    if (clipBoneIndex < 0) return false;
     TArrayPose poses = {};
     if (!ReadProcessMemory(GetCurrentProcess(),
             reinterpret_cast<const void*>(component + kSpaceBasesOffset),
             &poses, sizeof(poses), &read) || read != sizeof(poses) ||
-        !poses.data || poses.count <= kClipBoneIndex || poses.count > 256 ||
+        !poses.data || poses.count <= clipBoneIndex || poses.count > 256 ||
         poses.capacity < poses.count)
         return false;
     const uintptr_t boneAddress = poses.data +
-        static_cast<uint64_t>(kClipBoneIndex) * kBoneMatrixStride;
+        static_cast<uint64_t>(clipBoneIndex) * kBoneMatrixStride;
     if (handRotationReady && hold.grabRotationValid) {
         // Also rotate the mag with the hand: it keeps the orientation it had
         // at grab time, rotated by the hand's world delta since then.

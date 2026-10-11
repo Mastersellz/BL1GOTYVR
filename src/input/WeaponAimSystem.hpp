@@ -60,6 +60,16 @@ public:
             m_weaponIdentityValid.load(std::memory_order_acquire) &&
             evidence == m_localWeapon.load(std::memory_order_acquire);
     }
+    // Any weapon whose mesh exposes an identifiable magazine/clip bone gets the
+    // physical reload sequence.
+    bool IsManualReloadWeapon() const {
+        return m_clipBoneIndex.load(std::memory_order_acquire) >= 0 &&
+            m_weaponIdentityValid.load(std::memory_order_acquire) &&
+            m_localWeapon.load(std::memory_order_acquire) >= 0x10000;
+    }
+    int32_t GetClipBoneIndex() const {
+        return m_clipBoneIndex.load(std::memory_order_acquire);
+    }
     void NoteEquippedWeaponMesh(uintptr_t weapon, uintptr_t skeletalMesh,
                                 const char* meshName);
     bool HasUsableTarget() const {
@@ -150,6 +160,7 @@ private:
     std::atomic<uintptr_t> m_localWeapon{0};
     std::atomic<uintptr_t> m_shotgunEvidenceWeapon{0};
     std::atomic<uintptr_t> m_lastWeaponMesh{0};
+    std::atomic<int32_t> m_clipBoneIndex{-1};
     std::atomic<bool> m_reloadBlockerAttempted{false};
     uintptr_t m_reloadBlockerTarget = 0;
     std::atomic<uint64_t> m_identityGeneration{0};

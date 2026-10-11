@@ -208,17 +208,21 @@ private:
     struct MagHoldParams {
         int32_t mode = 0;   // 0=game control, 1=in left hand, 2=thrown
         bool grabRotationValid = false;
+        bool seatedValid = false;
+        uintptr_t seatedWeapon = 0;
         uint64_t throwStartMs = 0;
         float throwOrigin[3] = {};
         float throwVelocity[3] = {};
         float grabHandRotation[9] = {};  // hand world rotation at grab (row-vector)
         float grabMagRotation[9] = {};   // mag world rotation at grab (row-vector)
+        float seatedMatrix[16] = {};     // pristine component-space bone matrix
     };
     mutable SRWLOCK m_magHoldLock = SRWLOCK_INIT;
     MagHoldParams m_magHold = {};
     void PublishMagHold(int32_t mode);
     void PublishMagThrow(const float originWorld[3], const float velocityWorld[3]);
     bool ApplyMagBoneOverride();
+    void RestoreMagBoneSeated();
     std::atomic<bool> m_reloadHighlightActive{false};
     std::atomic<float> m_reloadHighlightX{0.0f};
     std::atomic<float> m_reloadHighlightY{0.0f};
