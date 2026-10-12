@@ -195,6 +195,8 @@ private:
         bool wellLatched = false;
         bool pouchLatched = false;
         bool xWasDown = false;
+        bool magReleaseArmed = false;
+        uint64_t xHoldSinceMs = 0;
         bool gripWasDown = false;
         bool gripCaptured = false;
         bool forwardCurrentPress = true;
