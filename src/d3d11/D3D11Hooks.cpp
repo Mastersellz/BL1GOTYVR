@@ -989,10 +989,12 @@ static ID3D11Buffer* CreateHandOnlyIndexBuffer(
 
     const size_t vertexCount = vertexBytes.size() / kHandsVertexStride;
     const size_t indexCount = indexBytes.size() / sizeof(uint16_t);
-    if (vertexCount == 0 || indexCount == 0 || indexCount % 3 != 0)
+    if (vertexCount == 0 || indexCount == 0 || indexCount % 3 != 0 ||
+        indexBytes.size() % sizeof(uint16_t) != 0)
         return nullptr;
     std::vector<uint16_t> filtered(indexCount);
-    memcpy(filtered.data(), indexBytes.data(), indexBytes.size());
+    memcpy(filtered.data(), indexBytes.data(),
+           filtered.size() * sizeof(uint16_t));
     const size_t triangleCount = indexCount / 3;
     std::vector<uint8_t> keepTriangle(triangleCount, 0);
     struct RemovedTriangle {

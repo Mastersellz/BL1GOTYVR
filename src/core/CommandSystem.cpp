@@ -117,15 +117,4 @@ void CommandSystem::ListCommands() const {
     }
 }
 
-std::string CommandSystem::GetDescription(const std::string& name) const {
-    std::string lowerName = name;
-    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
-
-    auto it = m_commands.find(lowerName);
-    if (it != m_commands.end()) {
-        return it->second.description;
-    }
-    return "";
-}
-
 } // namespace bl1gotyvr

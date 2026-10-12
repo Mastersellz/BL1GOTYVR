@@ -2664,6 +2664,20 @@ static void ApplySensorFingerPose(uintptr_t component) {
     };
     input::ControllerState controllers[2] = {};
     if (!input::XRInput::Instance().GetControllerSnapshot(controllers)) return;
+    // Skip the whole per-bone work when no sensor is asking for a finger pose:
+    // at rest the game pose is untouched, so this saves all reads/writes.
+    bool anySensorActive = false;
+    for (int hand = 0; hand < 2; ++hand) {
+        const input::ControllerState& sensor = controllers[hand];
+        if (!sensor.valid) continue;
+        if (sensor.triggerTouch || sensor.trigger > 0.02f ||
+            sensor.grip > 0.02f || sensor.thumbstickTouch ||
+            sensor.primaryTouch || sensor.secondaryTouch) {
+            anySensorActive = true;
+            break;
+        }
+    }
+    if (!anySensorActive) return;
     constexpr float kDegreesToRadians = 0.01745329251994329577f;
     constexpr float kJointFractions[4] = {0.35f, 0.75f, 1.0f, 1.0f};
     for (int hand = 0; hand < 2; ++hand) {
@@ -2932,13 +2946,36 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
     std::array<BoneTransform, 256> solved = {};
     std::array<BoneMatrix, 256> originalMatrices = {};
     std::array<int32_t, 256> parents = {};
+    // Batch the contiguous pose array (and the strided parent indices) into one
+    // read each instead of two ReadProcessMemory calls per bone.
+    const size_t boneCount = static_cast<size_t>(rig.boneCount);
+    const bool posesBatched =
+        boneCount > 0 && boneCount <= 256 &&
+        rig.componentPoseStride == static_cast<int>(sizeof(BoneMatrix)) &&
+        ReadMemory(rig.componentPose, originalMatrices.data(),
+                   sizeof(BoneMatrix) * boneCount);
+    uint8_t refBatch[8192] = {};
+    const bool parentsBatched =
+        boneCount > 0 && boneCount <= 256 && rig.refStride > 0 &&
+        rig.parentOffset >= 0 &&
+        boneCount * static_cast<size_t>(rig.refStride) <= sizeof(refBatch) &&
+        ReadMemory(rig.refSkeleton + static_cast<uintptr_t>(rig.parentOffset),
+                   refBatch, boneCount * static_cast<size_t>(rig.refStride));
     for (int bone = 0; bone < rig.boneCount; ++bone) {
-        if (!ReadMemory(rig.componentPose + static_cast<uintptr_t>(bone) *
+        if (!posesBatched &&
+            !ReadMemory(rig.componentPose + static_cast<uintptr_t>(bone) *
                             rig.componentPoseStride,
-                        &originalMatrices[bone], sizeof(BoneMatrix)) ||
-            !ValidateMatrix(originalMatrices[bone].values) ||
-            !ReadMemory(rig.refSkeleton + static_cast<uintptr_t>(bone) * rig.refStride +
-                rig.parentOffset, &parents[bone], sizeof(parents[bone]))) return false;
+                        &originalMatrices[bone], sizeof(BoneMatrix))) return false;
+        if (!ValidateMatrix(originalMatrices[bone].values)) return false;
+        if (parentsBatched) {
+            memcpy(&parents[bone],
+                   refBatch + static_cast<size_t>(bone) *
+                       static_cast<size_t>(rig.refStride),
+                   sizeof(parents[bone]));
+        } else if (!ReadMemory(rig.refSkeleton +
+                                   static_cast<uintptr_t>(bone) * rig.refStride +
+                                   rig.parentOffset,
+                               &parents[bone], sizeof(parents[bone]))) return false;
         original[bone].rotation = MatrixRotation(originalMatrices[bone].values);
         original[bone].position = {originalMatrices[bone].values[12],
             originalMatrices[bone].values[13], originalMatrices[bone].values[14]};

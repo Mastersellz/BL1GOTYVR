@@ -122,37 +122,6 @@ static int CameraClassDistance(uintptr_t derivedClass, uintptr_t targetClass) {
     return -1;
 }
 
-static bool FindCameraPropertyOffset(const UE3Globals& globals, uintptr_t objectClass,
-                                     const char* propertyName, int32_t& output) {
-    CameraTArray64 objects = {};
-    if (!propertyName || objectClass < 0x10000 ||
-        !CameraRead(globals.gObjectsAddress, &objects, sizeof(objects)) ||
-        !objects.data || objects.count <= 0 || objects.count > objects.capacity) return false;
-    int bestDistance = 65;
-    int32_t bestOffset = -1;
-    for (int32_t index = 0; index < objects.count; ++index) {
-        uintptr_t object = 0;
-        char name[128] = {};
-        if (!CameraRead(objects.data + static_cast<uintptr_t>(index) * sizeof(uintptr_t),
-                        &object, sizeof(object)) || object < 0x10000 ||
-            !CameraReadObjectName(globals, object, name, sizeof(name)) ||
-            strcmp(name, propertyName) != 0) continue;
-        uintptr_t ownerClass = 0;
-        if (globals.gObjectNameOffset < 8 ||
-            !CameraRead(object + globals.gObjectNameOffset - 8, &ownerClass,
-                        sizeof(ownerClass))) continue;
-        const int distance = CameraClassDistance(objectClass, ownerClass);
-        int32_t propertyOffset = -1;
-        if (distance < 0 || distance >= bestDistance ||
-            !CameraRead(object + 0x84, &propertyOffset, sizeof(propertyOffset)) ||
-            propertyOffset <= 0 || propertyOffset > 0x10000) continue;
-        bestDistance = distance;
-        bestOffset = propertyOffset;
-    }
-    output = bestOffset;
-    return bestOffset > 0;
-}
-
 static std::atomic<uintptr_t> s_vehiclePawn{0};
 static std::atomic<uintptr_t> s_vehicleComponent{0};
 static std::atomic<int> s_vehicleSeatBone{-1};
@@ -457,62 +426,6 @@ static void BuildViewRotation(const int32_t rotation[3], float matrix[16]) {
     matrix[15] = 1.0f;
 }
 
-static void BuildHeadRotation(const float orientation[4], float matrix[16]) {
-    const float length = sqrtf(orientation[0] * orientation[0] +
-        orientation[1] * orientation[1] + orientation[2] * orientation[2] +
-        orientation[3] * orientation[3]);
-    memset(matrix, 0, sizeof(float) * 16);
-    matrix[15] = 1.0f;
-    if (length <= 1.0e-6f) {
-        matrix[0] = matrix[5] = matrix[10] = 1.0f;
-        return;
-    }
-    const float qx = orientation[0] / length;
-    const float qy = orientation[1] / length;
-    const float qz = orientation[2] / length;
-    const float qw = orientation[3] / length;
-    const float xrRotation[3][3] = {
-        {1.0f - 2.0f * (qy * qy + qz * qz), 2.0f * (qx * qy - qz * qw),
-         2.0f * (qx * qz + qy * qw)},
-        {2.0f * (qx * qy + qz * qw), 1.0f - 2.0f * (qx * qx + qz * qz),
-         2.0f * (qy * qz - qx * qw)},
-        {2.0f * (qx * qz - qy * qw), 2.0f * (qy * qz + qx * qw),
-         1.0f - 2.0f * (qx * qx + qy * qy)}
-    };
-    constexpr float basis[3] = {1.0f, 1.0f, -1.0f};
-    for (int row = 0; row < 3; ++row)
-        for (int column = 0; column < 3; ++column)
-            matrix[row * 4 + column] =
-                basis[row] * xrRotation[row][column] * basis[column];
-}
-
-static void ViewRotationToRotator(const float matrix[16], int32_t rotation[3]) {
-    constexpr float kRadiansToUnis = 65536.0f / 6.2831853071795864769f;
-    const float forward[3] = {matrix[2], matrix[6], matrix[10]};
-    const float pitch = asinf(std::clamp(forward[2], -1.0f, 1.0f));
-    const float yaw = atan2f(forward[1], forward[0]);
-    const float cp = cosf(pitch), sp = sinf(pitch);
-    const float cy = cosf(yaw), sy = sinf(yaw);
-    const float unrolledRight[3] = {-sy, cy, 0.0f};
-    const float unrolledUp[3] = {-sp * cy, -sp * sy, cp};
-    const float actualRight[3] = {matrix[0], matrix[4], matrix[8]};
-    const float sinRoll = actualRight[0] * unrolledUp[0] +
-        actualRight[1] * unrolledUp[1] + actualRight[2] * unrolledUp[2];
-    const float cosRoll = actualRight[0] * unrolledRight[0] +
-        actualRight[1] * unrolledRight[1] + actualRight[2] * unrolledRight[2];
-    rotation[0] = static_cast<int32_t>(lroundf(pitch * kRadiansToUnis));
-    rotation[1] = static_cast<int32_t>(lroundf(yaw * kRadiansToUnis));
-    rotation[2] = static_cast<int32_t>(lroundf(atan2f(sinRoll, cosRoll) * kRadiansToUnis));
-}
-
-static void RotateByYaw(float yaw, const float local[3], float world[3]) {
-    const float sine = sinf(yaw);
-    const float cosine = cosf(yaw);
-    world[0] = cosine * local[0] - sine * local[1];
-    world[1] = sine * local[0] + cosine * local[1];
-    world[2] = local[2];
-}
-
 static void RelativeQuaternion(const float reference[4], const float current[4], float result[4]) {
     const float ax = -reference[0], ay = -reference[1], az = -reference[2], aw = reference[3];
     const float bx = current[0], by = current[1], bz = current[2], bw = current[3];
@@ -529,15 +442,6 @@ static void quat_rotate(float qx, float qy, float qz, float qw, const float v[3]
     out[0] = v[0] + qw * t[0] + (qy * t[2] - qz * t[1]);
     out[1] = v[1] + qw * t[1] + (qz * t[0] - qx * t[2]);
     out[2] = v[2] + qw * t[2] + (qx * t[1] - qy * t[0]);
-}
-
-// XR to UE coordinate conversion (from BioShockVR2 ue_math.h)
-// XR LOCAL: right +X, up +Y, forward -Z
-// UE: forward +X, right +Y, up +Z
-static void xr_to_ue(const float v[3], float out[3]) {
-    out[0] = -v[2]; // XR -Z (forward) -> UE +X
-    out[1] = v[0];  // XR +X (right)   -> UE +Y
-    out[2] = v[1];  // XR +Y (up)      -> UE +Z
 }
 
 bool IsCameraFound() { return s_cameraFound && s_viewportDrawTarget != 0; }
@@ -618,14 +522,21 @@ void SuppressRecoilTick(bool firing) {
     static uint64_t s_lastFireSeenMs = 0;
     const uint64_t recoilNowMs = GetTickCount64();
     if (firing) s_lastFireSeenMs = recoilNowMs;
-    if (firing || (recoilNowMs - s_lastFireSeenMs < 400 &&
-                   s_recoilAnchorValid.load(std::memory_order_acquire))) {
-        if (s_recoilAnchorValid.load(std::memory_order_acquire)) {
-            memcpy(rotation, s_recoilAnchorRotation,
-                   sizeof(s_recoilAnchorRotation));
-            static std::atomic<uint64_t> recoilLogs{0};
-            if (recoilLogs.fetch_add(1, std::memory_order_relaxed) < 3) {
-                Log("[Camera] Recoil suppression holding pawn rotation");
+    const bool holdPitch = firing ||
+        (recoilNowMs - s_lastFireSeenMs < 400 &&
+         s_recoilAnchorValid.load(std::memory_order_acquire));
+    if (s_recoilAnchorValid.load(std::memory_order_acquire)) {
+        if (holdPitch) {
+            // Only the pitch axis (FRotator index 0) is pinned. Pinning the
+            // whole rotation also froze yaw, and UE3 derives movement direction
+            // from the pawn rotation: holding the trigger broke strafing and
+            // turning with the right stick.
+            if (rotation[0] != s_recoilAnchorRotation[0]) {
+                rotation[0] = s_recoilAnchorRotation[0];
+                static std::atomic<uint64_t> recoilLogs{0};
+                if (recoilLogs.fetch_add(1, std::memory_order_relaxed) < 3) {
+                    Log("[Camera] Recoil suppression holding pawn pitch");
+                }
             }
         } else {
             memcpy(s_recoilAnchorRotation, rotation,
@@ -2494,10 +2405,24 @@ static void UpdateVehicleLifecycleFast(const CameraInfo& camera) {
         return;
     }
     const UE3Globals globals = GetUE3GlobalsSnapshot();
-    char pawnClass[128] = {};
-    if (!CameraReadClassName(globals, livePawn, pawnClass, sizeof(pawnClass))) return;
+    // Cache the class string per pawn: the byte-by-byte name read is expensive
+    // and the class never changes for a live pawn.
+    static uintptr_t s_cachedPawnForClass = 0;
+    static bool s_cachedPawnIsPlayer = false;
+    static char s_cachedPawnClass[128] = {};
+    if (livePawn != s_cachedPawnForClass) {
+        s_cachedPawnClass[0] = '\0';
+        if (!CameraReadClassName(globals, livePawn, s_cachedPawnClass,
+                                 sizeof(s_cachedPawnClass)))
+            return;
+        s_cachedPawnIsPlayer =
+            strstr(s_cachedPawnClass, "WillowPlayerPawn") != nullptr;
+        s_cachedPawnForClass = livePawn;
+    }
+    const char* pawnClass = s_cachedPawnClass;
+    const bool isPlayerPawn = s_cachedPawnIsPlayer;
 
-    if (strstr(pawnClass, "WillowPlayerPawn") != nullptr) {
+    if (isPlayerPawn) {
         if (!activeVehicle) {
             const input::PlayerIdentitySnapshot before =
                 input::WeaponAimSystem::Instance().GetPlayerIdentity();

@@ -26,9 +26,6 @@ public:
     // List all registered commands
     void ListCommands() const;
 
-    // Get command description
-    ::std::string GetDescription(const ::std::string& name) const;
-
 private:
     CommandSystem() = default;
 
@@ -39,7 +36,6 @@ private:
 
     ::std::unordered_map<::std::string, CommandEntry> m_commands;
     ::std::string m_commandFilePath;
-    double m_lastPollTime = 0.0;
 };
 
 } // namespace bl1gotyvr

@@ -109,7 +109,8 @@ static float ReadFloat(const char* section, const char* key, float fallback, con
 
 void Load(const char* path) {
     if (!path || !*path) return;
-    if (path != s_configPath) strcpy_s(s_configPath, path);
+    if (strcmp(path, s_configPath) != 0 && strlen(path) < MAX_PATH)
+        strcpy_s(s_configPath, path);
     const int requestedWidth = static_cast<int>(GetPrivateProfileIntA(
         "Display", "Width", s_settings.render_width, path));
     const int requestedHeight = static_cast<int>(GetPrivateProfileIntA(
@@ -148,8 +149,6 @@ void Load(const char* path) {
         ReadFloat("Tracking", "HeadYawScale", s_settings.head_yaw_scale, path), 0.0f, 1.0f);
     s_settings.head_pitch_scale = std::clamp(
         ReadFloat("Tracking", "HeadPitchScale", s_settings.head_pitch_scale, path), 0.0f, 1.0f);
-    s_settings.roll_enabled = GetPrivateProfileIntA(
-        "Tracking", "RollEnabled", s_settings.roll_enabled, path) != 0;
     s_settings.same_frame_stereo_requested = GetPrivateProfileIntA(
         "Stereo", "SameFrameStereo", s_settings.same_frame_stereo_requested, path) != 0;
     // Runtime enables this only after both the viewport boundary and camera
@@ -159,8 +158,6 @@ void Load(const char* path) {
         "Stereo", "ReverseEyes", s_settings.reverse_eyes, path) != 0;
     s_settings.debug_logging = GetPrivateProfileIntA(
         "Debug", "Logging", s_settings.debug_logging, path) != 0;
-    s_settings.downsample_threshold = std::clamp(static_cast<int>(GetPrivateProfileIntA(
-        "Rendering", "DownsampleThreshold", s_settings.downsample_threshold, path)), 1280, 7680);
 
     s_settings.hud_enabled = GetPrivateProfileIntA(
         "HUD", "Enabled", s_settings.hud_enabled, path) != 0;
@@ -251,9 +248,6 @@ void Load(const char* path) {
         ReadFloat("Weapon", "AimPitch", s_settings.aim_pitch_degrees, path), -45.0f, 45.0f);
     s_settings.aim_yaw_degrees = std::clamp(
         ReadFloat("Weapon", "AimYaw", s_settings.aim_yaw_degrees, path), -45.0f, 45.0f);
-    s_settings.aim_convergence_m = std::clamp(
-        ReadFloat("Dot", "ConvergenceDistance", s_settings.aim_convergence_m, path),
-        1.0f, 100.0f);
     s_settings.dot_enabled = GetPrivateProfileIntA(
         "Dot", "Enabled", s_settings.dot_enabled ? 1 : 0, path) != 0;
     s_settings.dot_distance_m = std::clamp(
@@ -371,13 +365,10 @@ void Save(const char* path) {
     WriteFloat("Tracking", "RotationScale", s_settings.rotation_scale, path);
     WriteFloat("Tracking", "HeadYawScale", s_settings.head_yaw_scale, path);
     WriteFloat("Tracking", "HeadPitchScale", s_settings.head_pitch_scale, path);
-    WritePrivateProfileStringA("Tracking", "RollEnabled", s_settings.roll_enabled ? "1" : "0", path);
     WritePrivateProfileStringA("Stereo", "SameFrameStereo",
         s_settings.same_frame_stereo_requested ? "1" : "0", path);
     WritePrivateProfileStringA("Stereo", "ReverseEyes", s_settings.reverse_eyes ? "1" : "0", path);
     WritePrivateProfileStringA("Debug", "Logging", s_settings.debug_logging ? "1" : "0", path);
-    sprintf_s(text, "%d", s_settings.downsample_threshold);
-    WritePrivateProfileStringA("Rendering", "DownsampleThreshold", text, path);
 
     WritePrivateProfileStringA("HUD", "Enabled", s_settings.hud_enabled ? "1" : "0", path);
     WriteFloat("HUD", "Distance", s_settings.hud_distance, path);
@@ -437,7 +428,6 @@ void Save(const char* path) {
     WriteFloat("Weapon", "PositionScale", s_settings.weapon_position_scale, path);
     WriteFloat("Weapon", "AimPitch", s_settings.aim_pitch_degrees, path);
     WriteFloat("Weapon", "AimYaw", s_settings.aim_yaw_degrees, path);
-    WriteFloat("Dot", "ConvergenceDistance", s_settings.aim_convergence_m, path);
     WritePrivateProfileStringA("Dot", "Enabled",
         s_settings.dot_enabled ? "1" : "0", path);
     WriteFloat("Dot", "DistanceMeters", s_settings.dot_distance_m, path);

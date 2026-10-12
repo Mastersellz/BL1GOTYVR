@@ -14,7 +14,6 @@ constexpr int kSaveButton = 200;
 constexpr int kDefaultsButton = 201;
 constexpr int kSameFrameCheck = 202;
 constexpr int kReverseEyesCheck = 203;
-constexpr int kRollCheck = 204;
 constexpr int kLoggingCheck = 205;
 constexpr int kDotCheck = 206;
 constexpr int kHmdDirectionCheck = 207;
@@ -49,7 +48,6 @@ constexpr std::array<Field, 20> kFields = {{
     {108, "Far plane", "Rendering", "FarPlane", "10000", 100.0f, 100000.0f, false},
     {109, "Position scale", "Tracking", "PositionScale", "1.00", 0.0f, 5.0f, false},
     {110, "Rotation scale", "Tracking", "RotationScale", "1.00", 0.0f, 5.0f, false},
-    {111, "Aim target distance (m)", "Dot", "ConvergenceDistance", "20.0", 1.0f, 100.0f, false},
     {112, "OpenXR refresh rate (Hz, 0=default)", "OpenXR", "RefreshRateHz", "72.0", 0.0f, 240.0f, false},
     {113, "Arm reach scale", "Hands", "ArmReachScale", "1.60", 1.0f, 2.0f, false},
     {114, "Hand cut position", "Visibility", "VanillaHandsCutThreshold", "70.0", 20.0f, 90.0f, false},
@@ -91,7 +89,6 @@ void SetDefaults(HWND window) {
     for (const auto& field : kFields) SetDlgItemTextA(window, field.id, field.defaultValue);
     CheckDlgButton(window, kSameFrameCheck, BST_CHECKED);
     CheckDlgButton(window, kReverseEyesCheck, BST_UNCHECKED);
-    CheckDlgButton(window, kRollCheck, BST_UNCHECKED);
     CheckDlgButton(window, kLoggingCheck, BST_CHECKED);
     CheckDlgButton(window, kDotCheck, BST_CHECKED);
     CheckDlgButton(window, kHmdDirectionCheck, BST_UNCHECKED);
@@ -121,8 +118,6 @@ void LoadSettings(HWND window) {
         GetPrivateProfileIntA("Stereo", "SameFrameStereo", 1, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(window, kReverseEyesCheck,
         GetPrivateProfileIntA("Stereo", "ReverseEyes", 0, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
-    CheckDlgButton(window, kRollCheck,
-        GetPrivateProfileIntA("Tracking", "RollEnabled", 1, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(window, kLoggingCheck,
         GetPrivateProfileIntA("Debug", "Logging", 1, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(window, kDotCheck,
@@ -280,8 +275,6 @@ void SaveSettings(HWND window) {
         IsDlgButtonChecked(window, kSameFrameCheck) == BST_CHECKED ? "1" : "0", path.c_str());
     WritePrivateProfileStringA("Stereo", "ReverseEyes",
         IsDlgButtonChecked(window, kReverseEyesCheck) == BST_CHECKED ? "1" : "0", path.c_str());
-    WritePrivateProfileStringA("Tracking", "RollEnabled",
-        IsDlgButtonChecked(window, kRollCheck) == BST_CHECKED ? "1" : "0", path.c_str());
     WritePrivateProfileStringA("Debug", "Logging",
         IsDlgButtonChecked(window, kLoggingCheck) == BST_CHECKED ? "1" : "0", path.c_str());
     WritePrivateProfileStringA("Dot", "Enabled",
@@ -387,7 +380,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 
         CreateCheckbox(window, "Same-frame stereo", kSameFrameCheck, 34, 772);
         CreateCheckbox(window, "Reverse eyes", kReverseEyesCheck, 274, 772);
-        CreateCheckbox(window, "Enable camera roll", kRollCheck, 34, 802);
         CreateCheckbox(window, "Debug logging", kLoggingCheck, 274, 802);
         CreateCheckbox(window, "Show aim dot", kDotCheck, 34, 832);
         CreateCheckbox(window, "HMD-directed movement", kHmdDirectionCheck, 274, 832);

@@ -18,13 +18,10 @@ struct Settings {
     float rotation_scale = 1.0f;
     float head_yaw_scale = 1.0f;     /* 0=free look, 1=full camera rotation */
     float head_pitch_scale = 1.0f;   /* 0=free look, 1=full camera rotation */
-    bool roll_enabled = true;
     bool same_frame_stereo_requested = false;
     bool same_frame_stereo = false;
     bool reverse_eyes = false;
-    bool motion_blur_disabled = true;
     bool camera_recoil_disabled = true;
-    int downsample_threshold = 3840;
     bool debug_logging = true;
 
     /* VR HUD */
@@ -71,7 +68,6 @@ float hud_horizontal_offset = 0.0f;
     float weapon_position_scale = 0.5f;
     float aim_pitch_degrees = 0.0f;
     float aim_yaw_degrees = 0.0f;
-    float aim_convergence_m = 20.0f;
     bool dot_enabled = true;
     float dot_distance_m = 5.0f;
     float weapon_offset_forward = 0.0f;

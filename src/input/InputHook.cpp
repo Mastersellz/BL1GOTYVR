@@ -484,8 +484,20 @@ bool InputHook::UpdateShotgunReloadSequence(const ControllerState controllers[2]
                                             bool actionDown, bool squeezeDown,
                                             uint64_t nowMs) {
     ShotgunReloadSequencer& seq = m_shotgunReload;
+    // Releasing the magazine is a hold gesture: X must stay down long enough
+    // before the magazine leaves the weapon, leaving quick taps free for the
+    // game instead of swallowing them.
+    constexpr uint64_t kMagReleaseHoldMs = 350;
     const bool pressed = xDown && !seq.xWasDown;
     seq.xWasDown = xDown;
+    if (xDown) {
+        if (seq.xHoldSinceMs == 0) seq.xHoldSinceMs = nowMs;
+    } else {
+        seq.xHoldSinceMs = 0;
+        seq.magReleaseArmed = false;
+    }
+    const bool holdSatisfied = xDown && seq.xHoldSinceMs != 0 &&
+        nowMs - seq.xHoldSinceMs >= kMagReleaseHoldMs;
     const bool actionWasDown = seq.gripWasDown;
     const bool gripPressed = actionDown && !seq.gripWasDown;
     const bool actionReleased = !actionDown && actionWasDown;
@@ -495,33 +507,41 @@ bool InputHook::UpdateShotgunReloadSequence(const ControllerState controllers[2]
         if (usableTargeted) {
             // A usable is under the crosshair: let X do its contextual use.
             seq.forwardCurrentPress = true;
-        } else if (seq.phase == ShotgunReloadSequencer::Phase::Idle &&
-                   nowMs >= seq.cooldownUntilMs) {
-            seq.phase = ShotgunReloadSequencer::Phase::MagReleased;
-            seq.enteredPhaseMs = nowMs;
-            seq.wellLatched = false;
-            seq.pouchLatched = false;
-            seq.forwardCurrentPress = false;
-            xrInput.SendHaptic(1, 0.6f, 70.0f);
-            if (WeaponAimSystem::Instance().IsEquippedWeaponRevolver()) {
-                PublishMagHold(3);
-                Log("[ManualReload] Cylinder released to the side — grab it "
-                    "with the left hand");
-            } else {
-                Log("[ManualReload] Mag released — pull it out with the left hand");
-            }
-        } else {
+        } else if (seq.phase != ShotgunReloadSequencer::Phase::Idle) {
             // Second press during an active sequence: cancel back to Idle.
-            // The vanilla reload stays fully suppressed.
+            // Only a fresh edge cancels, so holding X through the release does
+            // not abort it. The vanilla reload stays fully suppressed.
             seq.phase = ShotgunReloadSequencer::Phase::Idle;
             seq.cooldownUntilMs = nowMs + 300;
             seq.wellLatched = false;
             seq.pouchLatched = false;
             seq.wellAnchorValid = false;
             seq.forwardCurrentPress = false;
+            seq.magReleaseArmed = false;
             PublishMagHold(0);
             xrInput.SendHaptic(0, 0.3f, 40.0f);
             Log("[ManualReload] Sequence cancelled");
+        } else {
+            // Start counting the hold; the magazine leaves once it completes.
+            seq.magReleaseArmed = true;
+        }
+    }
+    if (!usableTargeted && seq.magReleaseArmed && holdSatisfied &&
+        seq.phase == ShotgunReloadSequencer::Phase::Idle &&
+        nowMs >= seq.cooldownUntilMs) {
+        seq.phase = ShotgunReloadSequencer::Phase::MagReleased;
+        seq.enteredPhaseMs = nowMs;
+        seq.magReleaseArmed = false;
+        seq.wellLatched = false;
+        seq.pouchLatched = false;
+        seq.forwardCurrentPress = false;
+        xrInput.SendHaptic(1, 0.6f, 70.0f);
+        if (WeaponAimSystem::Instance().IsEquippedWeaponRevolver()) {
+            PublishMagHold(3);
+            Log("[ManualReload] Cylinder released to the side — grab it "
+                "with the left hand");
+        } else {
+            Log("[ManualReload] Mag released — pull it out with the left hand");
         }
     }
     const bool forward = xDown && (seq.forwardCurrentPress || usableTargeted);
@@ -1982,8 +2002,10 @@ void InputHook::ActivateWeaponAimProfile(uintptr_t pawn, uintptr_t weapon,
                 }
             }
         }
-        if (meshName && *meshName) strcpy_s(selected->name, meshName);
-        else strcpy_s(selected->name, "runtime_weapon");
+    if (meshName && *meshName)
+        strncpy_s(selected->name, sizeof(selected->name), meshName, _TRUNCATE);
+    else strncpy_s(selected->name, sizeof(selected->name), "runtime_weapon",
+                   _TRUNCATE);
         selected->valid = true;
     }
     selected->pawn = pawn;
@@ -2758,10 +2780,16 @@ void InputHook::RestoreMagBoneSeated() {
             &poses, sizeof(poses), &read) || read != sizeof(poses) ||
         !poses.data || poses.count <= clipBoneIndex || poses.count > 256)
         return;
-    WriteProcessMemory(GetCurrentProcess(),
-        reinterpret_cast<void*>(poses.data +
-            static_cast<uint64_t>(clipBoneIndex) * 0x40ull),
-        m_magHold.seatedMatrix, sizeof(m_magHold.seatedMatrix), nullptr);
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(GetCurrentProcess(),
+            reinterpret_cast<void*>(poses.data +
+                static_cast<uint64_t>(clipBoneIndex) * 0x40ull),
+            m_magHold.seatedMatrix, sizeof(m_magHold.seatedMatrix), &written) ||
+        written != sizeof(m_magHold.seatedMatrix)) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            Log("[ManualReload] Seated bone restore failed");
+    }
 }
 
 void InputHook::CockRevolverHammer() {

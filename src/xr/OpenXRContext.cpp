@@ -685,12 +685,6 @@ bool AreFormatsCompatible(DXGI_FORMAT a, DXGI_FORMAT b) {
     return false;
 }
 
-static bool IsSrgbFormat(DXGI_FORMAT fmt) {
-    return fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-           fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
-           fmt == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
-}
-
 static uint32_t FindSupportedFormat(ID3D11Device* device, const int64_t* supported,
                                      uint32_t count, DXGI_FORMAT desired) {
     // Pass 1: exact match

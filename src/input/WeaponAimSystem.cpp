@@ -3524,11 +3524,20 @@ bool WeaponAimSystem::RefreshIdentityFromLivePawn(uintptr_t controller, uintptr_
         !ValidateRuntimeObject(globals, names, pawn, "Pawn", pawnClass,
                                pawnName, sizeof(pawnName), pawnClassName,
                                sizeof(pawnClassName))) return false;
-    const bool weaponValid =
+    const bool weaponPtrValid =
         ReadMem(pawn + static_cast<uintptr_t>(weaponOffset), &weapon, sizeof(weapon)) &&
         weapon >= 0x10000 &&
         ReadMem(weapon + static_cast<uintptr_t>(ownerOffset), &owner, sizeof(owner)) &&
-        owner == pawn &&
+        owner == pawn;
+    // Steady-state fast path: same pawn/controller/weapon already published and
+    // valid -> nothing to refresh (skips the name validations below).
+    if (weaponPtrValid &&
+        pawn == m_localPawn.load(std::memory_order_acquire) &&
+        controller == m_localController.load(std::memory_order_acquire) &&
+        weapon == m_localWeapon.load(std::memory_order_acquire) &&
+        m_weaponIdentityValid.load(std::memory_order_acquire))
+        return true;
+    const bool weaponValid = weaponPtrValid &&
         ValidateRuntimeObject(globals, names, weapon, "Weapon", weaponClass,
                               weaponName, sizeof(weaponName), weaponClassName,
                               sizeof(weaponClassName));
@@ -4035,7 +4044,8 @@ void WeaponAimSystem::DumpWeaponPropertiesOnce() {
                     WeaponPropWatchEntry& entry = s_weaponPropWatches[watchCount];
                     entry.offset = offset;
                     entry.size = elementSize;
-                    strcpy_s(entry.name, propertyName);
+                    strncpy_s(entry.name, sizeof(entry.name), propertyName,
+                              _TRUNCATE);
                     entry.lastValid = false;
                     ++watchCount;
                 }
