@@ -522,14 +522,21 @@ void SuppressRecoilTick(bool firing) {
     static uint64_t s_lastFireSeenMs = 0;
     const uint64_t recoilNowMs = GetTickCount64();
     if (firing) s_lastFireSeenMs = recoilNowMs;
-    if (firing || (recoilNowMs - s_lastFireSeenMs < 400 &&
-                   s_recoilAnchorValid.load(std::memory_order_acquire))) {
-        if (s_recoilAnchorValid.load(std::memory_order_acquire)) {
-            memcpy(rotation, s_recoilAnchorRotation,
-                   sizeof(s_recoilAnchorRotation));
-            static std::atomic<uint64_t> recoilLogs{0};
-            if (recoilLogs.fetch_add(1, std::memory_order_relaxed) < 3) {
-                Log("[Camera] Recoil suppression holding pawn rotation");
+    const bool holdPitch = firing ||
+        (recoilNowMs - s_lastFireSeenMs < 400 &&
+         s_recoilAnchorValid.load(std::memory_order_acquire));
+    if (s_recoilAnchorValid.load(std::memory_order_acquire)) {
+        if (holdPitch) {
+            // Only the pitch axis (FRotator index 0) is pinned. Pinning the
+            // whole rotation also froze yaw, and UE3 derives movement direction
+            // from the pawn rotation: holding the trigger broke strafing and
+            // turning with the right stick.
+            if (rotation[0] != s_recoilAnchorRotation[0]) {
+                rotation[0] = s_recoilAnchorRotation[0];
+                static std::atomic<uint64_t> recoilLogs{0};
+                if (recoilLogs.fetch_add(1, std::memory_order_relaxed) < 3) {
+                    Log("[Camera] Recoil suppression holding pawn pitch");
+                }
             }
         } else {
             memcpy(s_recoilAnchorRotation, rotation,
