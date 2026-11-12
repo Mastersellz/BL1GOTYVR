@@ -1,4 +1,5 @@
 #include "FrameLoop.hpp"
+#include "MotionPairTiming.hpp"
 #include "OpenXRContext.hpp"
 #include "FsrEasuShaderSource.h"
 #include "../core/VRMod.hpp"
@@ -13,6 +14,7 @@
 #include "../config/Config.hpp"
 #include "../input/XRInput.hpp"
 #include "../render/HudBlitter.hpp"
+#include "../render/ReloadHighlight.hpp"
 #include <cstring>
 #include <d3dcompiler.h>
 #include <dxgi1_5.h>
@@ -913,7 +915,7 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
     {
         float reloadWorld[3] = {};
         float reloadRadiusMeters = 0.0f;
-        if (!flatSource && m_submissionViewsValid && sampledEye >= 0 &&
+        if (!flatSource && m_submissionViewsValid && eye >= 0 && eye < 2 && sampledEye >= 0 &&
             sampledEye < 2 && input::InputHook::Instance().GetReloadHighlight(
                 reloadWorld, &reloadRadiusMeters)) {
             auto rotateReload = [](const float quaternion[4], const float vector[3],
@@ -937,25 +939,16 @@ bool FrameLoop::BlitTexture(ID3D11DeviceContext* context, ID3D11Texture2D* sourc
                 -eyeView.pose.orientation.z, eyeView.pose.orientation.w};
             float eyeLocal[3] = {};
             rotateReload(inverseEye, eyeDelta, eyeLocal);
-            if (eyeLocal[2] < -0.001f) {
-                const float tangentX = eyeLocal[0] / -eyeLocal[2];
-                const float tangentY = eyeLocal[1] / -eyeLocal[2];
-                const float tanLeft = tanf(eyeView.fov.angleLeft);
-                const float tanRight = tanf(eyeView.fov.angleRight);
-                const float tanDown = tanf(eyeView.fov.angleDown);
-                const float tanUp = tanf(eyeView.fov.angleUp);
-                const float u = (tangentX - tanLeft) / (tanRight - tanLeft);
-                const float verticalHalfSpan = (tanUp - tanDown) * 0.5f;
-                const float v = (verticalHalfSpan - tangentY) /
-                    (verticalHalfSpan * 2.0f);
-                if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
-                    reloadU = u;
-                    reloadV = v;
-                    const float angleRadius = reloadRadiusMeters / -eyeLocal[2];
-                    reloadRadius = angleRadius / (tanUp - tanDown);
-                    reloadRadius = (std::max)(0.01f, (std::min)(0.5f, reloadRadius));
-                    reloadEnabled = 1.0f;
-                }
+            if (render::ProjectReloadHighlight(eyeLocal, reloadRadiusMeters,
+                    tanf(eyeView.fov.angleLeft), tanf(eyeView.fov.angleRight),
+                    tanf(eyeView.fov.angleDown), tanf(eyeView.fov.angleUp),
+                    reloadU, reloadV, reloadRadius)) reloadEnabled = 1.0f;
+            static uint64_t cueSamples[2] = {};
+            const uint64_t cueSample = ++cueSamples[eye];
+            if (cueSample <= 3 || cueSample % 600 == 0) {
+                Log("[ManualReload] Original cue projection: eye=%d visible=%d stage=(%.3f,%.3f,%.3f) local=(%.3f,%.3f,%.3f) uv=(%.3f,%.3f)",
+                    eye, reloadEnabled > 0, reloadWorld[0], reloadWorld[1], reloadWorld[2],
+                    eyeLocal[0], eyeLocal[1], eyeLocal[2], reloadU, reloadV);
             }
         }
     }
@@ -1380,7 +1373,7 @@ bool FrameLoop::AcquireRenderTicket(StereoRenderTicket& ticket) {
         controllers, &controllerGeneration);
 
     AcquireSRWLockExclusive(&m_stereoPairLock);
-    if (m_nextRenderEye == 0) {
+    if (NeedsNewStereoPair(m_nextRenderEye, m_activePair.valid)) {
         if (!currentPoseValid) {
             ReleaseSRWLockExclusive(&m_stereoPairLock);
             return false;
@@ -1424,6 +1417,17 @@ bool FrameLoop::AcquireRenderTicket(StereoRenderTicket& ticket) {
     ticket.eye = m_nextRenderEye;
     ReleaseSRWLockExclusive(&m_stereoPairLock);
     return true;
+}
+
+bool FrameLoop::StageMotionRenderTicket(const StereoRenderTicket& ticket) {
+    AcquireSRWLockExclusive(&m_stereoPairLock);
+    const bool accepted = ticket.motionPosePrepared && ticket.baseCameraValid &&
+        ticket.armTargetGeneration != 0 && !m_activePair.motionPosePrepared &&
+        CanStageMotionPair(m_activePair.valid, m_activePair.pairSerial,
+            m_nextRenderEye, ticket.valid, ticket.pairSerial, ticket.eye);
+    if (accepted) m_activePair = ticket;
+    ReleaseSRWLockExclusive(&m_stereoPairLock);
+    return accepted;
 }
 
 void FrameLoop::CommitRenderedEye(const StereoRenderTicket& ticket) {
@@ -2312,7 +2316,7 @@ void FrameLoop::ResetStereoPair() {
 
 bool FrameLoop::BeginSequentialRender() {
     auto& xr = OpenXRContext::Instance();
-    if (!config::Get().same_frame_stereo || !m_initialized || !m_vrActive ||
+    if (!config::IsSameFrameStereoEnabled() || !m_initialized || !m_vrActive ||
         !xr.IsInitialized() || !xr.IsFrameActive() || !xr.ShouldRender() ||
         !d3d11::GetGameDevice() || !d3d11::GetGameContext() ||
         !d3d11::GetGameSwapChain() || m_sequentialFramePending.load()) {
@@ -2711,7 +2715,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
     StereoRenderTicket renderedTicket = {};
     bool hasRenderedTicket = ConsumeRenderedTicket(renderedTicket);
     camera::CompletedNativeMultiviewFrame nativeFrame = {};
-    const bool hasNativeFrame = config::Get().same_frame_stereo &&
+    const bool hasNativeFrame = config::IsSameFrameStereoEnabled() &&
         camera::ConsumeCompletedNativeMultiviewFrame(nativeFrame);
     bool nativeFrameMatches = hasRenderedTicket && hasNativeFrame &&
         nativeFrame.pairSerial == renderedTicket.pairSerial;
@@ -2765,7 +2769,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         }
     }
 
-    const bool nativeHoldFrame = config::Get().same_frame_stereo &&
+    const bool nativeHoldFrame = config::IsSameFrameStereoEnabled() &&
         camera::IsNativeMultiviewActive() && hasRenderedTicket &&
         renderedTicket.eye == 1 && !hasNativeFrame;
 
@@ -2884,7 +2888,7 @@ void FrameLoop::OnPresent(ID3D11Device* device, ID3D11DeviceContext* context, ID
         return;
     }
 
-    const bool nativeSfrMode = config::Get().same_frame_stereo &&
+    const bool nativeSfrMode = config::IsSameFrameStereoEnabled() &&
         camera::IsNativeMultiviewActive();
     render::FrameProfiler::Scope performance(m_frameProfiler, device, context,
                                               nativeSfrMode);

@@ -78,6 +78,7 @@ public:
     int32_t GetWeaponBoneCount() const {
         return m_weaponBoneCount.load(std::memory_order_acquire);
     }
+    bool GetMagazineBoneBinding(uintptr_t& mesh, int32_t& bone, int32_t& count) const;
     bool IsEquippedWeaponRevolver() const {
         return m_equippedWeaponRevolver.load(std::memory_order_acquire);
     }
@@ -171,6 +172,7 @@ private:
     std::atomic<uintptr_t> m_localWeapon{0};
     std::atomic<uintptr_t> m_shotgunEvidenceWeapon{0};
     std::atomic<uintptr_t> m_lastWeaponMesh{0};
+    mutable SRWLOCK m_reloadMetadataLock = SRWLOCK_INIT;
     std::atomic<int32_t> m_clipBoneIndex{-1};
     std::atomic<int32_t> m_hammerBoneIndex{-1};
     std::atomic<int32_t> m_weaponBoneCount{-1};

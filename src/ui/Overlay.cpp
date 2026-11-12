@@ -188,6 +188,19 @@ void DrawUi() {
             "Hand tuning only rotates the visible model.");
     }
 
+    if (ImGui::CollapsingHeader("Turning")) {
+        ImGui::Text("Native yaw: %s", camera::CanApplyVrTurn() ? "validated" : "unavailable");
+        ImGui::Combo("Foot turn mode", &settings.turn_mode, "Snap\0Smooth\0Off\0");
+        ImGui::SliderFloat("Snap angle", &settings.snap_turn_angle, 5.0f, 90.0f, "%.0f deg");
+        ImGui::SliderFloat("Smooth speed", &settings.smooth_turn_speed,
+                            10.0f, 360.0f, "%.0f deg/s");
+        ImGui::SliderFloat("Stick deadzone", &settings.locomotion_deadzone,
+                            0.0f, 0.5f, "%.2f");
+        ImGui::TextWrapped("Center the right stick after changing modes. "
+            "Vehicles keep native steering. Exact foot turning requires validated "
+            "controller/pauser properties; otherwise smooth XInput uses game sensitivity.");
+    }
+
     if (ImGui::CollapsingHeader("OpenXR")) {
         ImGui::SliderFloat("Refresh rate (Hz)", &settings.openxr_refresh_rate_hz,
                            0.0f, 144.0f, "%.0f Hz");

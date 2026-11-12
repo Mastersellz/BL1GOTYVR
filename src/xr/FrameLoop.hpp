@@ -35,6 +35,9 @@ struct StereoRenderTicket {
     float aimYawDegrees = 0.0f;
     float aimConvergenceMeters = 20.0f;
     uint64_t armTargetGeneration = 0;
+    bool motionPosePrepared = false;
+    uintptr_t motionPawn = 0;
+    uintptr_t motionWeapon = 0;
     XrView views[2] = {};
 };
 
@@ -56,6 +59,7 @@ public:
     uint64_t GetFrameCount() const { return m_frameCount; }
     int GetRenderEye() const;
     bool AcquireRenderTicket(StereoRenderTicket& ticket);
+    bool StageMotionRenderTicket(const StereoRenderTicket& ticket);
     void CommitRenderedEye(const StereoRenderTicket& ticket);
     void AbortStereoPair();
     bool IsProjectionCorrectionEnabled() const { return m_projectionCorrection; }

@@ -16,8 +16,11 @@ struct CompletedNativeMultiviewFrame {
 void StartScanner();
 bool InstallViewportDrawHook(uintptr_t target);
 bool IsCameraFound();
+bool CanApplyVrTurn();
+bool IsVrTurnBlocked();
 bool IsVehicleCameraActive();
 bool IsDownedFirstPersonActive();
+bool PrepareMotionPairPostAnimation(); // Validated arms hook, viewport/game thread only.
 bool IsTransientFirstPersonActionActive();
 bool GetRelativeHeadYaw(float& yawRadians);
 bool IsNativeMultiviewActive();

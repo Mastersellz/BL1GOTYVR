@@ -1,5 +1,6 @@
 #include <Windows.h>
 #include <ShlObj.h>
+#include "Settings.hpp"
 
 #include <array>
 #include <cmath>
@@ -26,38 +27,7 @@ constexpr int kHighPreset = 212;
 constexpr int kUltraPreset = 213;
 constexpr int kMegaUltraPreset = 214;
 
-struct Field {
-    int id;
-    const char* label;
-    const char* section;
-    const char* key;
-    const char* defaultValue;
-    float minimum;
-    float maximum;
-    bool integer;
-};
-
-constexpr std::array<Field, 20> kFields = {{
-    {101, "Render width", "Display", "Width", "2048", 640.0f, 7680.0f, true},
-    {102, "Render height", "Display", "Height", "2048", 480.0f, 4320.0f, true},
-    {103, "Resolution scale", "Display", "ResolutionScale", "1.00", 0.5f, 2.0f, false},
-    {104, "Camera FOV (deg)", "Display", "FOV", "100.0", 60.0f, 150.0f, false},
-    {105, "IPD (mm)", "Stereo", "IPD", "64.0", 50.0f, 80.0f, false},
-    {106, "Convergence shift (% per eye)", "Stereo", "Convergence", "10.0", 0.0f, 20.0f, false},
-    {107, "Near plane", "Rendering", "NearPlane", "0.10", 0.01f, 10.0f, false},
-    {108, "Far plane", "Rendering", "FarPlane", "10000", 100.0f, 100000.0f, false},
-    {109, "Position scale", "Tracking", "PositionScale", "1.00", 0.0f, 5.0f, false},
-    {110, "Rotation scale", "Tracking", "RotationScale", "1.00", 0.0f, 5.0f, false},
-    {112, "OpenXR refresh rate (Hz, 0=default)", "OpenXR", "RefreshRateHz", "72.0", 0.0f, 240.0f, false},
-    {113, "Arm reach scale", "Hands", "ArmReachScale", "1.60", 1.0f, 2.0f, false},
-    {114, "Hand cut position", "Visibility", "VanillaHandsCutThreshold", "70.0", 20.0f, 90.0f, false},
-    {115, "Melee range scale", "Melee", "RangeMultiplier", "1.60", 1.0f, 5.0f, false},
-    {120, "Post FX sharpen", "PostFx", "Sharpen", "0.35", 0.0f, 1.0f, false},
-    {121, "Post FX contrast", "PostFx", "Contrast", "1.00", 0.5f, 2.0f, false},
-    {122, "Post FX saturation", "PostFx", "Saturation", "1.00", 0.0f, 2.0f, false},
-    {123, "Post FX brightness", "PostFx", "Brightness", "0.00", -0.5f, 0.5f, false},
-    {124, "Post FX gamma", "PostFx", "Gamma", "1.00", 0.5f, 2.0f, false},
-}};
+using bl1gotyvr::configurator::kFields;
 
 struct RenderPreset {
     int id;
@@ -87,7 +57,7 @@ std::string ConfigPath() {
 
 void SetDefaults(HWND window) {
     for (const auto& field : kFields) SetDlgItemTextA(window, field.id, field.defaultValue);
-    CheckDlgButton(window, kSameFrameCheck, BST_CHECKED);
+    CheckDlgButton(window, kSameFrameCheck, BST_UNCHECKED);
     CheckDlgButton(window, kReverseEyesCheck, BST_UNCHECKED);
     CheckDlgButton(window, kLoggingCheck, BST_CHECKED);
     CheckDlgButton(window, kDotCheck, BST_CHECKED);
@@ -115,7 +85,7 @@ void LoadSettings(HWND window) {
         SetDlgItemTextA(window, field.id, value);
     }
     CheckDlgButton(window, kSameFrameCheck,
-        GetPrivateProfileIntA("Stereo", "SameFrameStereo", 1, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
+        GetPrivateProfileIntA("Stereo", "SameFrameStereo", 0, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(window, kReverseEyesCheck,
         GetPrivateProfileIntA("Stereo", "ReverseEyes", 0, path.c_str()) ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(window, kLoggingCheck,
@@ -134,19 +104,6 @@ void LoadSettings(HWND window) {
     CheckDlgButton(window, kFsrCheck,
         GetPrivateProfileIntA("PostFx", "FsrUpscale", 1, path.c_str())
             ? BST_CHECKED : BST_UNCHECKED);
-}
-
-bool ReadField(HWND window, const Field& field, std::string& text, int& integerValue) {
-    char value[32] = {};
-    GetDlgItemTextA(window, field.id, value, sizeof(value));
-    char* end = nullptr;
-    const float parsed = strtof(value, &end);
-    if (!end || *end != '\0' || !std::isfinite(parsed) ||
-        parsed < field.minimum || parsed > field.maximum) return false;
-    if (field.integer && parsed != static_cast<float>(static_cast<int>(parsed))) return false;
-    text = value;
-    integerValue = static_cast<int>(parsed);
-    return true;
 }
 
 bool ReplaceIniValue(std::vector<std::string>& lines, const char* key, int value) {
@@ -234,85 +191,31 @@ bool DisableGameWeaponBob() {
 
 void SaveSettings(HWND window) {
     const std::string path = ConfigPath();
-    int width = 0;
-    int height = 0;
-    std::string widthText;
-    std::string heightText;
-    if (!ReadField(window, kFields[0], widthText, width) ||
-        !ReadField(window, kFields[1], heightText, height)) {
-        MessageBoxA(window, "Select a valid square render preset.",
-                    "Invalid resolution", MB_OK | MB_ICONWARNING);
+    bl1gotyvr::configurator::SettingsValues values;
+    for (size_t i = 0; i < kFields.size(); ++i) {
+        char text[128] = {};
+        GetDlgItemTextA(window, kFields[i].id, text, sizeof(text));
+        values.fields[i] = text;
+    }
+    auto checked = [&](int id) {
+        return IsDlgButtonChecked(window, id) == BST_CHECKED;
+    };
+    values.sameFrameStereo = checked(kSameFrameCheck);
+    values.reverseEyes = checked(kReverseEyesCheck);
+    values.logging = checked(kLoggingCheck);
+    values.dot = checked(kDotCheck);
+    values.hmdDirectedMovement = checked(kHmdDirectionCheck);
+    values.physicalCrouch = checked(kPhysicalCrouchCheck);
+    values.postFx = checked(kPostFxCheck);
+    values.fsr = checked(kFsrCheck);
+    std::string error;
+    if (!bl1gotyvr::configurator::SaveModSettings(path.c_str(), values, error)) {
+        MessageBoxA(window, error.c_str(), "Settings not saved", MB_OK | MB_ICONWARNING);
         return;
     }
-    bool supportedPreset = false;
-    for (const auto& preset : kRenderPresets) {
-        if (width == atoi(preset.width) && height == atoi(preset.height)) {
-            supportedPreset = true;
-            break;
-        }
-    }
-    if (!supportedPreset) {
-        MessageBoxA(window,
-            "Unsupported resolution. Choose Low, Medium, High, Ultra, or Mega.",
-            "Invalid resolution", MB_OK | MB_ICONWARNING);
-        return;
-    }
-    for (const auto& field : kFields) {
-        std::string text;
-        int integerValue = 0;
-        if (!ReadField(window, field, text, integerValue)) {
-            std::string message = std::string("Invalid value for ") + field.label +
-                ".\nAllowed range: " + std::to_string(field.minimum) + " - " +
-                std::to_string(field.maximum) + ".";
-            MessageBoxA(window, message.c_str(), "Invalid setting", MB_OK | MB_ICONWARNING);
-            return;
-        }
-        WritePrivateProfileStringA(field.section, field.key, text.c_str(), path.c_str());
-        if (field.id == 101) width = integerValue;
-        if (field.id == 102) height = integerValue;
-    }
-    WritePrivateProfileStringA("Stereo", "SameFrameStereo",
-        IsDlgButtonChecked(window, kSameFrameCheck) == BST_CHECKED ? "1" : "0", path.c_str());
-    WritePrivateProfileStringA("Stereo", "ReverseEyes",
-        IsDlgButtonChecked(window, kReverseEyesCheck) == BST_CHECKED ? "1" : "0", path.c_str());
-    WritePrivateProfileStringA("Debug", "Logging",
-        IsDlgButtonChecked(window, kLoggingCheck) == BST_CHECKED ? "1" : "0", path.c_str());
-    WritePrivateProfileStringA("Dot", "Enabled",
-        IsDlgButtonChecked(window, kDotCheck) == BST_CHECKED ? "1" : "0", path.c_str());
-    WritePrivateProfileStringA("Input", "HmdDirectedLocomotion",
-        IsDlgButtonChecked(window, kHmdDirectionCheck) == BST_CHECKED ? "1" : "0",
-        path.c_str());
-    WritePrivateProfileStringA("Input", "PhysicalCrouch",
-        IsDlgButtonChecked(window, kPhysicalCrouchCheck) == BST_CHECKED ? "1" : "0",
-        path.c_str());
-
-    // Post-processing values imply intent: enabling the effect when any value
-    // is non-neutral avoids saving a tuned preset that silently does nothing
-    // (the checkbox stays a hard off-switch only when everything is neutral).
-    char postFxValues[5][32] = {};
-    GetDlgItemTextA(window, 120, postFxValues[0], sizeof(postFxValues[0]));
-    GetDlgItemTextA(window, 121, postFxValues[1], sizeof(postFxValues[1]));
-    GetDlgItemTextA(window, 122, postFxValues[2], sizeof(postFxValues[2]));
-    GetDlgItemTextA(window, 123, postFxValues[3], sizeof(postFxValues[3]));
-    GetDlgItemTextA(window, 124, postFxValues[4], sizeof(postFxValues[4]));
-    const float postFxSharpen = strtof(postFxValues[0], nullptr);
-    const float postFxContrast = strtof(postFxValues[1], nullptr);
-    const float postFxSaturation = strtof(postFxValues[2], nullptr);
-    const float postFxBrightness = strtof(postFxValues[3], nullptr);
-    const float postFxGamma = strtof(postFxValues[4], nullptr);
-    const bool postFxValuesActive = postFxSharpen > 0.001f ||
-        std::fabs(postFxContrast - 1.0f) > 0.001f ||
-        std::fabs(postFxSaturation - 1.0f) > 0.001f ||
-        std::fabs(postFxBrightness) > 0.001f ||
-        std::fabs(postFxGamma - 1.0f) > 0.001f;
-    const bool postFxEnabled = postFxValuesActive ||
-        IsDlgButtonChecked(window, kPostFxCheck) == BST_CHECKED;
-    WritePrivateProfileStringA("PostFx", "Enabled",
-        postFxEnabled ? "1" : "0", path.c_str());
-    CheckDlgButton(window, kPostFxCheck, postFxEnabled ? BST_CHECKED : BST_UNCHECKED);
-    WritePrivateProfileStringA("PostFx", "FsrUpscale",
-        IsDlgButtonChecked(window, kFsrCheck) == BST_CHECKED ? "1" : "0",
-        path.c_str());
+    int width = 0, height = 0;
+    bl1gotyvr::configurator::ParseField(kFields[0], values.fields[0].c_str(), width);
+    bl1gotyvr::configurator::ParseField(kFields[1], values.fields[1].c_str(), height);
 
     const bool gameIniUpdated = UpdateGameResolution(width, height);
     const bool weaponBobDisabled = DisableGameWeaponBob();
@@ -353,13 +256,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         CreateWindowExA(0, "BUTTON", "Post-processing (native)", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                         16, 616, 500, 136, window, nullptr, nullptr, nullptr);
 
+        int postIndex = 0;
         for (size_t i = 0; i < kFields.size(); ++i) {
             int x = 34;
             int y = 78 + static_cast<int>(i) * 32;
-            if (i >= 15) {
-                const int postIndex = static_cast<int>(i) - 15;
+            if (std::string(kFields[i].section) == "PostFx") {
                 x = (postIndex / 3) ? 274 : 34;
                 y = 646 + (postIndex % 3) * 32;
+                ++postIndex;
             } else if (i >= 9) {
                 x = 274;
                 y = 322 + (static_cast<int>(i) - 9) * 32;

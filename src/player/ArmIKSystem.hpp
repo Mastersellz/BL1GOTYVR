@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "RoomScaleBody.hpp"
+#include "TrackingSpace.hpp"
 #include "../input/XRInput.hpp"
 
 namespace bl1gotyvr::player {
@@ -120,8 +121,10 @@ public:
                            uint64_t controllerGeneration);
     bool GetWorldHandTarget(uint64_t targetGeneration, int hand,
                             float position[3], float forward[3], float up[3]) const;
-    bool GetLeftGripCenterWorld(float out[3]) const;
-    void SetRenderContext(uint64_t renderGeneration, uint64_t targetGeneration);
+    bool GetLeftGripCenterWorld(float out[3], float rotation[9] = nullptr) const;
+    bool GetRenderTrackingFrame(TrackingSpaceFrame& frame) const;
+    void SetRenderContext(uint64_t renderGeneration, uint64_t targetGeneration,
+                          bool forceRebuild = false);
     bool ReapplyRenderPalette();
     bool ApplyPostAnimation(void* component);
     void Restore();
@@ -146,7 +149,7 @@ private:
     void CheckVisibilityWatchdog();
     bool InstallPoseHook();
     void ObserveComponent(void* component);
-    void CaptureNativeRightHand(void* component);
+    void CaptureNativePoseAndRightHand(void* component);
     void ObserveVehicleComponent(uintptr_t vehicle, uintptr_t component);
     bool Apply(uint64_t renderGeneration, uint64_t targetGeneration,
                bool restoreAfterRender);
@@ -173,8 +176,9 @@ private:
     std::atomic<uint64_t> m_scanEpoch{0};
     std::atomic<bool> m_poseHookInstalled{false};
     std::atomic<uint64_t> m_latestTargetGeneration{0};
-    std::atomic<uint64_t> m_renderGeneration{0};
-    std::atomic<uint64_t> m_renderTargetGeneration{0};
+    mutable SRWLOCK m_renderContextLock = SRWLOCK_INIT;
+    uint64_t m_renderGeneration = 0;
+    uint64_t m_renderTargetGeneration = 0;
     std::atomic<uint64_t> m_simulationGeneration{0};
     std::atomic<uint64_t> m_poseHookCalls{0};
     std::atomic<uint64_t> m_poseHookApplies{0};

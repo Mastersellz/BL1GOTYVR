@@ -22,6 +22,13 @@ struct CameraInfo {
     int locationOffset = 0;
     int rotationOffset = 0;
     int fovOffset = 0;
+    int controllerRotationOffset = -1; // reflected Actor::Rotation, never a guessed rotator
+    int worldInfoOffset = -1;          // Actor::WorldInfo
+    int pauserOffset = -1;             // WorldInfo::Pauser
+    int cinematicModeOffset = -1;
+    uint32_t cinematicModeMask = 0;
+    int ignoreLookOffset = -1;
+    uint32_t ignoreLookMask = 0;
     bool found = false;
 };
 

@@ -3600,10 +3600,21 @@ static int FindMagBoneIndex(uintptr_t mesh, char* foundName, size_t foundNameSiz
 static int FindBoneWithKeyword(uintptr_t mesh, const char* keyword, char* foundName,
                                size_t foundNameSize);
 
+bool WeaponAimSystem::GetMagazineBoneBinding(uintptr_t& mesh, int32_t& bone,
+                                             int32_t& count) const {
+    AcquireSRWLockShared(&m_reloadMetadataLock);
+    mesh = m_lastWeaponMesh.load(std::memory_order_relaxed);
+    bone = m_clipBoneIndex.load(std::memory_order_relaxed);
+    count = m_weaponBoneCount.load(std::memory_order_relaxed);
+    ReleaseSRWLockShared(&m_reloadMetadataLock);
+    return mesh >= 0x10000 && bone >= 0 && count > bone && count <= 256;
+}
+
 void WeaponAimSystem::NoteEquippedWeaponMesh(uintptr_t weapon, uintptr_t skeletalMesh,
                                              const char* meshName) {
     if (weapon < 0x10000 || !meshName || !*meshName) return;
     if (skeletalMesh >= 0x10000) {
+        AcquireSRWLockExclusive(&m_reloadMetadataLock);
         const uintptr_t lastMesh = m_lastWeaponMesh.load(std::memory_order_acquire);
         const int32_t currentIndex = m_clipBoneIndex.load(std::memory_order_acquire);
         // Retry while the lookup has never completed (-1); a scanned mesh
@@ -3650,6 +3661,7 @@ void WeaponAimSystem::NoteEquippedWeaponMesh(uintptr_t weapon, uintptr_t skeleta
             }
         }
     }
+    if (skeletalMesh >= 0x10000) ReleaseSRWLockExclusive(&m_reloadMetadataLock);
     if (!WeaponNameContainsNoCase(meshName, "shotgun") &&
         !WeaponNameContainsNoCase(meshName, "riot"))
         return;

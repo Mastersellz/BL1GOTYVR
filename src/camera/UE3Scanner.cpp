@@ -539,6 +539,10 @@ static void FindCameraCache(const UE3Globals* globals, CameraInfo* camera, uintp
     int reflectedLocationOffset = -1;
     int reflectedRotationOffset = -1;
     int reflectedFovOffset = -1;
+    int controllerRotationOffset = -1;
+    int worldInfoOffset = -1, pauserOffset = -1;
+    int cinematicModeOffset = -1, ignoreLookOffset = -1;
+    uint32_t cinematicModeMask = 0, ignoreLookMask = 0;
     for (int32_t i = 0; i < objects.count; ++i) {
         uint64_t object = 0;
         uint64_t classObject = 0;
@@ -553,7 +557,30 @@ static void FindCameraCache(const UE3Globals* globals, CameraInfo* camera, uintp
         }
 
         if (strcmp(className, "StructProperty") == 0) {
-            if (strcmp(objectName, "CalcViewLocation") == 0 &&
+            if (strcmp(objectName, "Rotation") == 0 &&
+                ReadReflectedPropertyOffset(*globals, names, object, "Actor", 12,
+                                            &controllerRotationOffset)) {
+                // Require an aligned actor field beyond the UObject header and
+                // a unique reference to the Rotator ScriptStruct descriptor.
+                int rotatorReferences = 0;
+                for (uintptr_t slot = 0x90; slot < 0xD0; slot += sizeof(uintptr_t)) {
+                    uintptr_t structure = 0, structureClass = 0;
+                    char name[128] = {}, type[128] = {};
+                    if (ReadMem(object + slot, &structure, sizeof(structure)) && structure &&
+                        ReadObjectName(*globals, names, structure, name, sizeof(name)) &&
+                        strcmp(name, "Rotator") == 0 &&
+                        ReadMem(structure + globals->gObjectClassOffset,
+                                &structureClass, sizeof(structureClass)) &&
+                        ReadObjectName(*globals, names, structureClass, type, sizeof(type)) &&
+                        strcmp(type, "ScriptStruct") == 0) ++rotatorReferences;
+                }
+                if (controllerRotationOffset < 0x58 || controllerRotationOffset > 0x2000 ||
+                    (controllerRotationOffset & 3) != 0 || rotatorReferences != 1)
+                    controllerRotationOffset = -1;
+                else
+                    Log("[UE3Scanner] Reflected Actor::Rotation offset=0x%X (Rotator)",
+                        controllerRotationOffset);
+            } else if (strcmp(objectName, "CalcViewLocation") == 0 &&
                 ReadReflectedPropertyOffset(*globals, names, object,
                                             "WillowPlayerController", 12,
                                             &reflectedLocationOffset)) {
@@ -565,6 +592,29 @@ static void FindCameraCache(const UE3Globals* globals, CameraInfo* camera, uintp
                                                    &reflectedRotationOffset)) {
                 Log("[UE3Scanner] Reflected CalcViewRotation offset=0x%X",
                     reflectedRotationOffset);
+            }
+        } else if (strcmp(className, "ObjectProperty") == 0) {
+            if (strcmp(objectName, "WorldInfo") == 0)
+                ReadReflectedPropertyOffset(*globals, names, object, "Actor", 8, &worldInfoOffset);
+            else if (strcmp(objectName, "Pauser") == 0)
+                ReadReflectedPropertyOffset(*globals, names, object, "WorldInfo", 8, &pauserOffset);
+        } else if (strcmp(className, "BoolProperty") == 0 &&
+                   (strcmp(objectName, "bCinematicMode") == 0 ||
+                    strcmp(objectName, "bIgnoreLookInput") == 0)) {
+            int offset = -1;
+            uint32_t mask = 0;
+            if (ReadReflectedPropertyOffset(*globals, names, object, "PlayerController", 4,
+                                            &offset) &&
+                offset >= 0x58 && (offset & 3) == 0 &&
+                ReadMem(object + 0x90, &mask, sizeof(mask)) &&
+                mask != 0 && (mask & (mask - 1)) == 0) {
+                if (strcmp(objectName, "bCinematicMode") == 0) {
+                    cinematicModeOffset = offset;
+                    cinematicModeMask = mask;
+                } else {
+                    ignoreLookOffset = offset;
+                    ignoreLookMask = mask;
+                }
             }
         } else if (strcmp(className, "FloatProperty") == 0 &&
                    strcmp(objectName, "CachedFOVAngle") == 0 &&
@@ -638,6 +688,13 @@ static void FindCameraCache(const UE3Globals* globals, CameraInfo* camera, uintp
             camera->cameraCacheLocation = activeController + reflectedLocationOffset;
             camera->cameraCacheRotation = activeController + reflectedRotationOffset;
             camera->cameraFov = activeController + reflectedFovOffset;
+            camera->controllerRotationOffset = controllerRotationOffset;
+            camera->worldInfoOffset = worldInfoOffset;
+            camera->pauserOffset = pauserOffset;
+            camera->cinematicModeOffset = cinematicModeOffset;
+            camera->cinematicModeMask = cinematicModeMask;
+            camera->ignoreLookOffset = ignoreLookOffset;
+            camera->ignoreLookMask = ignoreLookMask;
             camera->found = true;
             Log("[UE3Scanner] Reflected camera validated: controller=%p loc=+0x%X "
                 "rot=+0x%X fov=+0x%X values=(%.1f,%.1f,%.1f) (%d,%d,%d) %.1f",

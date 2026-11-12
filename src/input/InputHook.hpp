@@ -4,6 +4,10 @@
 #include <openxr/openxr.h>
 #include <atomic>
 #include <cstdint>
+#include "TurnController.hpp"
+#include "MagazinePose.hpp"
+#include "WeaponPosePolicy.hpp"
+#include "../player/TrackingSpace.hpp"
 
 namespace bl1gotyvr { namespace input {
 
@@ -57,6 +61,8 @@ public:
     void Install();
     void UpdateState(XrTime displayTime);
     void Shutdown();
+    double ConsumePendingTurn(uintptr_t controller, uintptr_t pawn);
+    void DiscardPendingTurn();
 
     // Weapon motion
     void CacheWeaponComponent(int index, uintptr_t address, int matrixOffset);
@@ -113,7 +119,8 @@ public:
 private:
     InputHook() = default;
 
-    void ProcessTurn();
+    float ProcessTurn(float stick, bool vehicleMode, bool menuNavigation,
+                      uintptr_t controller, uintptr_t pawn);
     void PollAimTuningKeys();
     bool UpdatePhysicalMelee(const ControllerState& controller, int hand,
                              uint64_t nowMs, bool fistMode);
@@ -187,11 +194,12 @@ private:
     };
     PhysicalMeleeTracker m_melee[2] = {};
 
-    /* Manual shotgun reload: X releases the mag, left hand extracts it,
-       grabs a fresh one from the left-hip pouch and seats it -> R pulse. */
+    /* Manual reload: hold X to release, LT to extract/drop, acquire a fresh
+       mag at the left hip and release LT at the weapon to seat it. */
     struct ShotgunReloadSequencer {
         enum class Phase : uint8_t { Idle = 0, MagReleased, MagOut, NeedMag, NewMag };
         Phase phase = Phase::Idle;
+        uintptr_t weapon = 0;
         bool wellLatched = false;
         bool pouchLatched = false;
         bool xWasDown = false;
@@ -214,10 +222,10 @@ private:
     ShotgunReloadSequencer m_shotgunReload = {};
     /* Visible mag: drives the weapon mesh b_clip bone from the render path. */
     struct MagHoldParams {
-        int32_t mode = 0;   // 0=game control, 1=in left hand, 2=thrown
+        int32_t mode = 0;   // Original path: 0=game, 1=carried, 2=thrown, 3=swing-out
         bool grabRotationValid = false;
         bool seatedValid = false;
-        uintptr_t seatedWeapon = 0;
+        MagazinePoseKey seatedKey;
         uint64_t throwStartMs = 0;
         float throwOrigin[3] = {};
         float throwVelocity[3] = {};
@@ -227,8 +235,16 @@ private:
         float hammerCockedMatrix[16] = {};  // cached cocked hammer matrix
     };
     mutable SRWLOCK m_magHoldLock = SRWLOCK_INIT;
+    SRWLOCK m_magPoseLock = SRWLOCK_INIT; // Serialize the original multi-thread callback path.
     MagHoldParams m_magHold = {};
-    void PublishMagHold(int32_t mode);
+    struct MagazinePoseView {
+        MagazinePoseKey key;
+        int matrixOffset = 0;
+        float componentMatrix[16] = {};
+        float boneMatrix[16] = {};
+    };
+    bool ReadMagazinePose(MagazinePoseView& view, bool readBone = true) const;
+    void PublishMagHold(int32_t mode, bool forceRestore = false);
     void PublishMagThrow(const float originWorld[3], const float velocityWorld[3]);
     bool ApplyMagBoneOverride();
     void RestoreMagBoneSeated();
@@ -236,11 +252,12 @@ private:
     void CockRevolverHammer();
     bool ApplyRevolverIdleExtras();
     void TickHammerStrikeSampler(bool fireOutput, uint64_t nowMs);
-    std::atomic<bool> m_reloadHighlightActive{false};
-    std::atomic<float> m_reloadHighlightX{0.0f};
-    std::atomic<float> m_reloadHighlightY{0.0f};
-    std::atomic<float> m_reloadHighlightZ{0.0f};
-    std::atomic<float> m_reloadHighlightRadius{0.0f};
+    void PublishReloadHighlight(bool active, const float stage[3] = nullptr,
+                                float radius = 0.0f);
+    mutable SRWLOCK m_reloadHighlightLock = SRWLOCK_INIT;
+    bool m_reloadHighlightActive = false;
+    float m_reloadHighlightPosition[3] = {};
+    float m_reloadHighlightRadius = 0.0f;
     std::atomic<bool> m_cylinderSpinning{false};
     std::atomic<bool> m_hammerCocked{false};
     std::atomic<uint64_t> m_spinLastMs{0};
@@ -255,7 +272,10 @@ private:
     std::atomic<uint64_t> m_physicalMeleeAnimationSuppressUntilMs{0};
 
     /* Turn system */
-    float m_snapTurnAccum = 0;
+    TurnController m_turnController;
+    TurnMailbox m_pendingTurn;
+    SRWLOCK m_turnLock = SRWLOCK_INIT;
+    int m_previousTurnMode = -1;
     LARGE_INTEGER m_perfFrequency = {};
     LARGE_INTEGER m_lastFrameTime = {};
     bool m_perfInitialized = false;
@@ -299,6 +319,8 @@ private:
     uint64_t m_nextWeaponComponentScanMs = 0;
     mutable SRWLOCK m_weaponPoseWriteLock = SRWLOCK_INIT;
     uintptr_t m_renderWeaponComponent = 0;
+    uintptr_t m_renderWeaponIdentity = 0;
+    uintptr_t m_renderWeaponMesh = 0;
     int m_renderWeaponMatrixOffset = 0;
     float m_renderWeaponMatrix[16] = {};
     float m_renderWeaponGripPosition[3] = {};

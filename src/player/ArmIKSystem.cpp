@@ -1,4 +1,5 @@
 #include "ArmIKSystem.hpp"
+#include "PoseFrame.hpp"
 
 #include "TwoBoneIK.hpp"
 #include "../camera/CameraHook.hpp"
@@ -479,9 +480,12 @@ bool ValidateMatrix(const float matrix[16]) {
 }
 
 Quat MatrixRotation(const float matrix[16]) {
-    const float m00 = matrix[0], m01 = matrix[4], m02 = matrix[8];
-    const float m10 = matrix[1], m11 = matrix[5], m12 = matrix[9];
-    const float m20 = matrix[2], m21 = matrix[6], m22 = matrix[10];
+    const Vec3 x = Vec3{matrix[0], matrix[1], matrix[2]}.normalized();
+    const Vec3 y = Vec3{matrix[4], matrix[5], matrix[6]}.normalized();
+    const Vec3 z = Vec3{matrix[8], matrix[9], matrix[10]}.normalized();
+    const float m00 = x.x, m01 = y.x, m02 = z.x;
+    const float m10 = x.y, m11 = y.y, m12 = z.y;
+    const float m20 = x.z, m21 = y.z, m22 = z.z;
     const float trace = m00 + m11 + m22;
     Quat result;
     if (trace > 0.0f) {
@@ -638,11 +642,16 @@ struct ArmIKSystem::Rig {
     bool cachedPoseBone[256] = {};
     float cachedLocalToWorld[16] = {};
     bool cachedLocalToWorldValid = false;
+    // Untouched animation input, captured before any VR solve. A new pair can
+    // be prepared during Draw after the tick already applied the previous pair.
+    BoneMatrix nativePose[256] = {};
+    bool nativePoseValid = false;
     BoneMatrix preMeleePose[256] = {};
     bool preMeleePoseValid = false;
 };
 
 struct ArmIKSystem::TargetSnapshot {
+    TrackingSpaceFrame trackingFrame;
     bool valid[2] = {};
     bool componentSpace = false;
     Vec3 position[2];
@@ -727,7 +736,10 @@ void __fastcall ArmIKSystem::HookedUpdateSkelPose(void* component, float deltaTi
         return;
     }
     system.ObserveComponent(component);
-    system.CaptureNativeRightHand(component);
+    system.CaptureNativePoseAndRightHand(component);
+    const ArmRigStatus rigStatus = system.GetStatus();
+    if (rigStatus.rigValid && rigStatus.component == reinterpret_cast<uintptr_t>(component))
+        camera::PrepareMotionPairPostAnimation();
     input::InputHook::Instance().ReapplyWeaponPose(component);
     const uint64_t calls = system.m_poseHookCalls.fetch_add(
         1, std::memory_order_relaxed) + 1;
@@ -746,7 +758,7 @@ void __fastcall ArmIKSystem::HookedUpdateSkelPose(void* component, float deltaTi
     system.m_inFlightPoseHooks.fetch_sub(1, std::memory_order_acq_rel);
 }
 
-void ArmIKSystem::CaptureNativeRightHand(void* component) {
+void ArmIKSystem::CaptureNativePoseAndRightHand(void* component) {
     const uintptr_t componentAddress = reinterpret_cast<uintptr_t>(component);
     Rig rig = {};
     AcquireSRWLockShared(&m_rigLock);
@@ -754,6 +766,7 @@ void ArmIKSystem::CaptureNativeRightHand(void* component) {
         rig = *m_rig;
     ReleaseSRWLockShared(&m_rigLock);
     if (!rig.valid || rig.rightWrist < 0 || rig.rightWrist >= rig.boneCount ||
+        rig.boneCount > 256 ||
         rig.componentPoseStride < static_cast<int>(sizeof(BoneMatrix))) return;
 
     TArray64 livePose = {};
@@ -769,6 +782,32 @@ void ArmIKSystem::CaptureNativeRightHand(void* component) {
         !ReadMemory(rig.component + rig.matrixOffset,
                     localToWorld, sizeof(localToWorld)) ||
         !ValidateMatrix(localToWorld)) return;
+
+    std::array<BoneMatrix, 256> nativePose = {};
+    bool nativePoseValid = true;
+    const bool batched = rig.componentPoseStride == sizeof(BoneMatrix) &&
+        ReadMemory(rig.componentPose, nativePose.data(),
+                   sizeof(BoneMatrix) * static_cast<size_t>(rig.boneCount));
+    for (int bone = 0; bone < rig.boneCount; ++bone) {
+        if ((!batched && !ReadMemory(rig.componentPose +
+                static_cast<uintptr_t>(bone) * rig.componentPoseStride,
+                &nativePose[bone], sizeof(BoneMatrix))) ||
+            !ValidateMatrix(nativePose[bone].values)) {
+            nativePoseValid = false;
+            break;
+        }
+    }
+    AcquireSRWLockExclusive(&m_rigLock);
+    if (m_rig && m_rig->component == rig.component &&
+        m_rig->componentPose == rig.componentPose &&
+        m_rig->skeletalMesh == rig.skeletalMesh &&
+        m_rig->boneCount == rig.boneCount) {
+        m_rig->nativePoseValid = nativePoseValid;
+        if (nativePoseValid)
+            memcpy(m_rig->nativePose, nativePose.data(),
+                   sizeof(BoneMatrix) * static_cast<size_t>(rig.boneCount));
+    }
+    ReleaseSRWLockExclusive(&m_rigLock);
 
     const input::PlayerIdentitySnapshot identity =
         input::WeaponAimSystem::Instance().GetPlayerIdentity();
@@ -1744,6 +1783,8 @@ bool ArmIKSystem::ProbeRig(uint64_t inventoryRequestGeneration) {
         memcpy(best.cachedLocalToWorld, m_rig->cachedLocalToWorld,
                sizeof(best.cachedLocalToWorld));
         best.cachedLocalToWorldValid = m_rig->cachedLocalToWorldValid;
+        memcpy(best.nativePose, m_rig->nativePose, sizeof(best.nativePose));
+        best.nativePoseValid = m_rig->nativePoseValid;
         memcpy(best.preMeleePose, m_rig->preMeleePose,
                sizeof(best.preMeleePose));
         best.preMeleePoseValid = m_rig->preMeleePoseValid;
@@ -2231,6 +2272,11 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
         }
     } else {
         snapshot.controllerGeneration = controllerGeneration;
+        snapshot.trackingFrame = {{cameraLocation[0], cameraLocation[1], cameraLocation[2]},
+            {trackingReferencePosition[0], trackingReferencePosition[1], trackingReferencePosition[2]},
+            {trackingReferenceRotation[0], trackingReferenceRotation[1],
+             trackingReferenceRotation[2], trackingReferenceRotation[3]},
+            gameYawRadians, 100.0f * config::Get().positional_scale, true};
         snapshot.cameraPosition = {cameraLocation[0], cameraLocation[1], cameraLocation[2]};
         snapshot.cameraRotation = QuatLookAt(
             RotatePitchYaw({1.0f, 0.0f, 0.0f}, gamePitchRadians, gameYawRadians),
@@ -2379,19 +2425,18 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
     }
 
     auto& inputHook = input::InputHook::Instance();
-    float weaponPositionValues[3] = {};
-    float weaponForwardValues[3] = {};
-    float weaponUpValues[3] = {};
+    float barrelLocal[3] = {};
     const bool weaponPoseValid = !snapshot.componentSpace &&
-        !camera::IsVehicleCameraActive() &&
-        inputHook.GetDrivenWeaponFrame(weaponPositionValues,
-                                       weaponForwardValues, weaponUpValues);
+        !camera::IsVehicleCameraActive() && snapshot.valid[1] &&
+        inputHook.IsWeaponPoseActive() &&
+        inputHook.GetWeaponBarrelLocalDirection(barrelLocal);
+    // Use the current right-hand frame, not the previous Draw's world position.
+    // Otherwise a held off-hand trails the weapon during walking and turning.
     Vec3 weaponForward = weaponPoseValid
-        ? Vec3{weaponForwardValues[0], weaponForwardValues[1],
-               weaponForwardValues[2]}.normalized() : Vec3{};
+        ? RotateByQuat(snapshot.rotation[1],
+            {barrelLocal[0], barrelLocal[1], barrelLocal[2]}).normalized() : Vec3{};
     Vec3 weaponUp = weaponPoseValid
-        ? Vec3{weaponUpValues[0], weaponUpValues[1],
-               weaponUpValues[2]}.normalized() : Vec3{};
+        ? RotateByQuat(snapshot.rotation[1], {0.0f, 0.0f, 1.0f}).normalized() : Vec3{};
     Vec3 weaponRight{
         weaponUp.y * weaponForward.z - weaponUp.z * weaponForward.y,
         weaponUp.z * weaponForward.x - weaponUp.x * weaponForward.z,
@@ -2404,8 +2449,7 @@ uint64_t ArmIKSystem::UpdateTargets(const float cameraLocation[3], float gamePit
     const bool weaponFrameValid = weaponPoseValid &&
         weaponForward.lengthSq() > 0.9f && weaponRight.lengthSq() > 0.9f &&
         weaponUp.lengthSq() > 0.9f;
-    const Vec3 weaponPosition{weaponPositionValues[0], weaponPositionValues[1],
-                              weaponPositionValues[2]};
+    const Vec3 weaponPosition = snapshot.position[1];
 
     bool weaponContact = false;
     if (weaponFrameValid && snapshot.valid[0] &&
@@ -2506,7 +2550,8 @@ bool ArmIKSystem::GetWorldHandTarget(uint64_t targetGeneration, int hand,
 }
 
 void ArmIKSystem::SetRenderContext(uint64_t renderGeneration,
-                                   uint64_t targetGeneration) {
+                                   uint64_t targetGeneration, bool forceRebuild) {
+    AcquireSRWLockExclusive(&m_renderContextLock);
     if (m_nativeCalibrationResetRequested.exchange(false, std::memory_order_acq_rel)) {
         AcquireSRWLockExclusive(&m_rigLock);
         if (m_rig) {
@@ -2527,7 +2572,9 @@ void ArmIKSystem::SetRenderContext(uint64_t renderGeneration,
         ReleaseSRWLockExclusive(&m_rigLock);
         Log("[ArmIK] Native hand calibration invalidated after settle delay");
     }
-    if (m_calibrationResetRequested.exchange(false, std::memory_order_acq_rel)) {
+    const bool calibrationReset = m_calibrationResetRequested.exchange(false,
+        std::memory_order_acq_rel);
+    if (calibrationReset || forceRebuild) {
         AcquireSRWLockExclusive(&m_rigLock);
         if (m_rig) {
             m_rig->solvedGeneration = 0;
@@ -2536,24 +2583,47 @@ void ArmIKSystem::SetRenderContext(uint64_t renderGeneration,
             m_rig->cachedLocalToWorldValid = false;
         }
         ReleaseSRWLockExclusive(&m_rigLock);
-        Log("[ArmIK] Preserved pre-motion hand calibration restored");
+        if (calibrationReset)
+            Log("[ArmIK] Preserved pre-motion hand calibration restored");
     }
-    m_renderTargetGeneration.store(targetGeneration, std::memory_order_release);
-    m_renderGeneration.store(renderGeneration, std::memory_order_release);
+    m_renderTargetGeneration = targetGeneration;
+    m_renderGeneration = renderGeneration;
+    ReleaseSRWLockExclusive(&m_renderContextLock);
 }
 
-bool ArmIKSystem::ReapplyRenderPalette() {
-    const uint64_t renderGeneration = m_renderGeneration.load(std::memory_order_acquire);
-    const uint64_t targetGeneration = m_renderTargetGeneration.load(std::memory_order_acquire);
-    return renderGeneration != 0 && targetGeneration != 0 &&
-        Apply(renderGeneration, targetGeneration, false);
-}
-
-// Curl the LEFT hand fingers around the carried magazine. Runs after the IK
-// palette write so the closure survives the arm solve.
+// Sensor closure must follow every palette replay, including pre-render ones.
 static void ApplySensorFingerPose(uintptr_t component);
 
-bool ArmIKSystem::GetLeftGripCenterWorld(float out[3]) const {
+bool ArmIKSystem::ReapplyRenderPalette() {
+    AcquireSRWLockShared(&m_renderContextLock);
+    const uint64_t renderGeneration = m_renderGeneration;
+    const uint64_t targetGeneration = m_renderTargetGeneration;
+    const bool applied = renderGeneration != 0 && targetGeneration != 0 &&
+        Apply(renderGeneration, targetGeneration, false);
+    if (applied) {
+        AcquireSRWLockShared(&m_rigLock);
+        const uintptr_t component = m_rig && m_rig->valid ? m_rig->component : 0;
+        ReleaseSRWLockShared(&m_rigLock);
+        ApplySensorFingerPose(component);
+    }
+    ReleaseSRWLockShared(&m_renderContextLock);
+    return applied;
+}
+
+bool ArmIKSystem::GetRenderTrackingFrame(TrackingSpaceFrame& frame) const {
+    AcquireSRWLockShared(&m_renderContextLock);
+    const uint64_t generation = m_renderTargetGeneration;
+    AcquireSRWLockShared(&m_targetLock);
+    const bool valid = m_targets && generation != 0 &&
+        m_targets[generation % kTargetHistorySize].controllerGeneration == generation &&
+        m_targets[generation % kTargetHistorySize].trackingFrame.valid;
+    if (valid) frame = m_targets[generation % kTargetHistorySize].trackingFrame;
+    ReleaseSRWLockShared(&m_targetLock);
+    ReleaseSRWLockShared(&m_renderContextLock);
+    return valid;
+}
+
+bool ArmIKSystem::GetLeftGripCenterWorld(float out[3], float rotation[9]) const {
     // Grip point the magazine should sit in: fingertip centroid of the left
     // hand pulled toward the wrist, in UE3 world space. Uses the same live
     // reads as the finger drive (component matrix + SpaceBases array).
@@ -2610,6 +2680,25 @@ bool ArmIKSystem::GetLeftGripCenterWorld(float out[3]) const {
     for (float& value : centroid) value *= 0.25f;
     float wrist[3] = {};
     if (!readTranslation(19, wrist)) return false;
+    if (rotation) {
+        float wristMatrix[16] = {};
+        if (!ReadMemory(poses.data + 19*kBoneMatrixStride, wristMatrix, sizeof(wristMatrix)))
+            return false;
+        for (int row = 0; row < 3; ++row) {
+            float lengthSquared = 0.0f;
+            for (int column = 0; column < 3; ++column) {
+                float value = 0.0f;
+                for (int k = 0; k < 3; ++k)
+                    value += wristMatrix[row*4+k] * componentMatrix[k*4+column];
+                rotation[row*3+column] = value;
+                lengthSquared += value*value;
+            }
+            if (!std::isfinite(lengthSquared) || lengthSquared < 1.0e-8f) return false;
+            const float inverseLength = 1.0f / sqrtf(lengthSquared);
+            for (int column = 0; column < 3; ++column)
+                rotation[row*3+column] *= inverseLength;
+        }
+    }
     const float gripLocal[3] = {
         centroid[0] * 0.7f + wrist[0] * 0.3f,
         centroid[1] * 0.7f + wrist[1] * 0.3f,
@@ -2634,12 +2723,21 @@ bool ArmIKSystem::ApplyPostAnimation(void* component) {
     if (m_rig && m_rig->valid) targetComponent = m_rig->component;
     ReleaseSRWLockShared(&m_rigLock);
     if (reinterpret_cast<uintptr_t>(component) != targetComponent) return false;
-    const uint64_t renderGeneration = m_renderGeneration.load(std::memory_order_acquire);
-    const uint64_t targetGeneration = m_renderTargetGeneration.load(std::memory_order_acquire);
+    AcquireSRWLockShared(&m_renderContextLock);
+    const uint64_t renderGeneration = m_renderGeneration;
+    const uint64_t targetGeneration = m_renderTargetGeneration;
     const bool applied = renderGeneration != 0 && targetGeneration != 0 &&
         Apply(renderGeneration, targetGeneration, false);
+    ReleaseSRWLockShared(&m_renderContextLock);
     if (applied)
         ApplySensorFingerPose(targetComponent);
+    const int nextEye = xr::FrameLoop::Instance().GetRenderEye();
+    static std::atomic<uint64_t> animationLogs[2]{};
+    const uint64_t sample = ++animationLogs[nextEye == 1 ? 1 : 0];
+    if (sample <= 3 || sample % 600 == 0) {
+        Log("[ArmIK] Post-animation pose: nextEye=%d pair=%llu target=%llu applied=%d",
+            nextEye, renderGeneration, targetGeneration, applied);
+    }
     return applied;
 }
 
@@ -2905,32 +3003,11 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
             if (compensateComponentMotion) {
                 const Vec3 cachedPosition{replay.values[12], replay.values[13],
                     replay.values[14]};
-                const Vec3 cachedWorldPosition{
-                    rig.cachedLocalToWorld[0]*cachedPosition.x +
-                        rig.cachedLocalToWorld[4]*cachedPosition.y +
-                        rig.cachedLocalToWorld[8]*cachedPosition.z +
-                        rig.cachedLocalToWorld[12],
-                    rig.cachedLocalToWorld[1]*cachedPosition.x +
-                        rig.cachedLocalToWorld[5]*cachedPosition.y +
-                        rig.cachedLocalToWorld[9]*cachedPosition.z +
-                        rig.cachedLocalToWorld[13],
-                    rig.cachedLocalToWorld[2]*cachedPosition.x +
-                        rig.cachedLocalToWorld[6]*cachedPosition.y +
-                        rig.cachedLocalToWorld[10]*cachedPosition.z +
-                        rig.cachedLocalToWorld[14]};
-                const Vec3 currentWorldDelta = cachedWorldPosition -
-                    Vec3{localToWorld[12], localToWorld[13], localToWorld[14]};
+                const Vec3 cachedWorldPosition = TransformPosePoint(
+                    rig.cachedLocalToWorld, cachedPosition);
                 BoneTransform compensated;
-                compensated.position = {
-                    localToWorld[0]*currentWorldDelta.x +
-                        localToWorld[1]*currentWorldDelta.y +
-                        localToWorld[2]*currentWorldDelta.z,
-                    localToWorld[4]*currentWorldDelta.x +
-                        localToWorld[5]*currentWorldDelta.y +
-                        localToWorld[6]*currentWorldDelta.z,
-                    localToWorld[8]*currentWorldDelta.x +
-                        localToWorld[9]*currentWorldDelta.y +
-                        localToWorld[10]*currentWorldDelta.z};
+                if (!InversePosePoint(localToWorld, cachedWorldPosition,
+                                      compensated.position)) return false;
                 compensated.rotation = QuatMultiply(componentDelta,
                     MatrixRotation(replay.values)).normalized();
                 SetMatrixTransform(replay, compensated);
@@ -2949,11 +3026,14 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
     // Batch the contiguous pose array (and the strided parent indices) into one
     // read each instead of two ReadProcessMemory calls per bone.
     const size_t boneCount = static_cast<size_t>(rig.boneCount);
-    const bool posesBatched =
+    if (rig.nativePoseValid)
+        memcpy(originalMatrices.data(), rig.nativePose,
+               sizeof(BoneMatrix) * boneCount);
+    const bool posesBatched = rig.nativePoseValid || (
         boneCount > 0 && boneCount <= 256 &&
         rig.componentPoseStride == static_cast<int>(sizeof(BoneMatrix)) &&
         ReadMemory(rig.componentPose, originalMatrices.data(),
-                   sizeof(BoneMatrix) * boneCount);
+                   sizeof(BoneMatrix) * boneCount));
     uint8_t refBatch[8192] = {};
     const bool parentsBatched =
         boneCount > 0 && boneCount <= 256 && rig.refStride > 0 &&
@@ -3014,12 +3094,8 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
         Quat targetRotation = targets.rotation[hand];
         Quat calibrationReferenceRotation = targetRotation;
         if (!targets.componentSpace) {
-            const Vec3 worldDelta = targets.position[hand] -
-                Vec3{localToWorld[12], localToWorld[13], localToWorld[14]};
-            targetComponent = {
-                localToWorld[0]*worldDelta.x + localToWorld[1]*worldDelta.y + localToWorld[2]*worldDelta.z,
-                localToWorld[4]*worldDelta.x + localToWorld[5]*worldDelta.y + localToWorld[6]*worldDelta.z,
-                localToWorld[8]*worldDelta.x + localToWorld[9]*worldDelta.y + localToWorld[10]*worldDelta.z};
+            if (!InversePosePoint(localToWorld, targets.position[hand],
+                                  targetComponent)) return false;
             const Quat componentWorld = MatrixRotation(localToWorld);
             targetRotation = QuatMultiply(componentWorld.conjugate(),
                 targets.rotation[hand]).normalized();
@@ -3036,29 +3112,18 @@ bool ArmIKSystem::Apply(uint64_t renderGeneration, uint64_t targetGeneration,
         if (!targets.componentSpace &&
             (targetComponent - oldShoulder).length() > armReach * 3.0f) {
             const Vec3 worldOffset = targets.position[hand] - targets.cameraPosition;
-            const Vec3 componentOffset{
-                -(localToWorld[0]*worldOffset.x + localToWorld[1]*worldOffset.y +
-                    localToWorld[2]*worldOffset.z),
-                localToWorld[4]*worldOffset.x + localToWorld[5]*worldOffset.y +
-                    localToWorld[6]*worldOffset.z,
-                localToWorld[8]*worldOffset.x + localToWorld[9]*worldOffset.y +
-                    localToWorld[10]*worldOffset.z};
+            Vec3 componentOffset;
+            if (!InversePosePoint(localToWorld, worldOffset +
+                    Vec3{localToWorld[12], localToWorld[13], localToWorld[14]},
+                    componentOffset)) return false;
+            componentOffset.x = -componentOffset.x;
             const int oppositeShoulder = hand == 0 ? rig.rightShoulder : rig.leftShoulder;
             Vec3 shoulderCenter = oldShoulder;
             if (oppositeShoulder >= 0 && oppositeShoulder < rig.boneCount)
                 shoulderCenter = (oldShoulder + original[oppositeShoulder].position) * 0.5f;
-            const Vec3 cameraWorldDelta = targets.cameraPosition -
-                Vec3{localToWorld[12], localToWorld[13], localToWorld[14]};
-            const Vec3 cameraComponent{
-                localToWorld[0]*cameraWorldDelta.x +
-                    localToWorld[1]*cameraWorldDelta.y +
-                    localToWorld[2]*cameraWorldDelta.z,
-                localToWorld[4]*cameraWorldDelta.x +
-                    localToWorld[5]*cameraWorldDelta.y +
-                    localToWorld[6]*cameraWorldDelta.z,
-                localToWorld[8]*cameraWorldDelta.x +
-                    localToWorld[9]*cameraWorldDelta.y +
-                    localToWorld[10]*cameraWorldDelta.z};
+            Vec3 cameraComponent;
+            if (!InversePosePoint(localToWorld, targets.cameraPosition,
+                                  cameraComponent)) return false;
             Vec3 trackingOrigin = shoulderCenter + Vec3{0.0f, 0.0f, 22.0f};
             if (rig.viewmodelTrackingOriginValid) {
                 trackingOrigin = rig.viewmodelTrackingOrigin +

@@ -1,4 +1,6 @@
 #include "CameraHook.hpp"
+#include "ViewAnchor.hpp"
+#include "CameraPosePolicy.hpp"
 #include "UE3Scanner.hpp"
 #include "SignatureScanner.hpp"
 #include "../core/VRMod.hpp"
@@ -9,7 +11,9 @@
 #include "../input/InputHook.hpp"
 #include "../input/XRInput.hpp"
 #include "../input/WeaponAimSystem.hpp"
+#include "../input/TurnController.hpp"
 #include "../player/ArmIKSystem.hpp"
+#include "../ui/Overlay.hpp"
 #include <Windows.h>
 #include <Psapi.h>
 #include <atomic>
@@ -44,6 +48,10 @@ static std::atomic<bool> s_externalViewFirstPersonActive{false};
 static std::atomic<bool> s_transientFirstPersonActionActive{false};
 static SRWLOCK s_firstPersonCameraLock = SRWLOCK_INIT;
 static bool s_firstPersonCameraValid = false;
+static std::atomic<DWORD> s_viewportDrawThreadId{0};
+static thread_local bool s_insideViewportDraw = false;
+static uintptr_t s_lastMotionPawn = 0;
+static uintptr_t s_lastMotionWeapon = 0;
 static uintptr_t s_firstPersonCameraPawn = 0;
 static float s_firstPersonCameraOffset[3] = {};
 static float s_firstPersonCameraWorldLocation[3] = {};
@@ -218,8 +226,6 @@ static std::atomic<float> s_relativeHeadYawRadians{0.0f};
 static std::atomic<bool> s_relativeHeadYawValid{false};
     static std::atomic<int32_t> s_physicalMeleeYawAnchor{0};
     static std::atomic<bool> s_physicalMeleeYawAnchorValid{false};
-    static int32_t s_recoilAnchorRotation[3] = {0, 0, 0};
-    static std::atomic<bool> s_recoilAnchorValid{false};
 static std::atomic<bool> s_recenterRequested{true};
 static std::atomic<bool> s_gamePitchReferenceValid{false};
 static std::atomic<int32_t> s_gamePitchReference{0};
@@ -232,6 +238,7 @@ struct PendingViewPose {
     bool vehicleAnchor = false;
     bool firstPersonOverride = false;
     bool allowFirstPersonRecovery = false;
+    bool firing = false;
     int eye = 0;
     float originalLocation[3] = {};
     float headLocation[3] = {};
@@ -397,33 +404,7 @@ static bool InvertMatrix(const float matrix[16], float inverse[16]) {
 }
 
 static void BuildViewRotation(const int32_t rotation[3], float matrix[16]) {
-    constexpr float kUnisToRadians = 6.2831853071795864769f / 65536.0f;
-    const float pitch = rotation[0] * kUnisToRadians;
-    const float yaw = rotation[1] * kUnisToRadians;
-    const float roll = rotation[2] * kUnisToRadians;
-    const float cp = cosf(pitch), sp = sinf(pitch);
-    const float cy = cosf(yaw), sy = sinf(yaw);
-    const float cr = cosf(roll), sr = sinf(roll);
-    const float right[3] = { -sy, cy, 0.0f };
-    const float up[3] = { -sp * cy, -sp * sy, cp };
-    const float forward[3] = { cp * cy, cp * sy, sp };
-    const float rolledRight[3] = {
-        right[0] * cr + up[0] * sr,
-        right[1] * cr + up[1] * sr,
-        right[2] * cr + up[2] * sr
-    };
-    const float rolledUp[3] = {
-        up[0] * cr - right[0] * sr,
-        up[1] * cr - right[1] * sr,
-        up[2] * cr - right[2] * sr
-    };
-    memset(matrix, 0, sizeof(float) * 16);
-    for (int axis = 0; axis < 3; ++axis) {
-        matrix[axis * 4] = rolledRight[axis];
-        matrix[axis * 4 + 1] = rolledUp[axis];
-        matrix[axis * 4 + 2] = forward[axis];
-    }
-    matrix[15] = 1.0f;
+    BuildStableViewRotation(rotation, matrix);
 }
 
 static void RelativeQuaternion(const float reference[4], const float current[4], float result[4]) {
@@ -445,6 +426,96 @@ static void quat_rotate(float qx, float qy, float qz, float qw, const float v[3]
 }
 
 bool IsCameraFound() { return s_cameraFound && s_viewportDrawTarget != 0; }
+
+bool CanApplyVrTurn() {
+    const CameraInfo camera = GetCameraSnapshot();
+    return s_stereoReady.load(std::memory_order_acquire) && camera.found &&
+        camera.controllerRotationOffset >= 0x58 &&
+        camera.controllerRotationOffset != camera.rotationOffset &&
+        camera.worldInfoOffset >= 0x58 && camera.pauserOffset >= 0x58;
+}
+
+bool IsVrTurnBlocked() {
+    const CameraInfo camera = GetCameraSnapshot();
+    if (!camera.found) return true;
+    uintptr_t world = 0, pauser = 0;
+    // Read failures are not permission to write the native controller. Metadata
+    // missing altogether is handled separately by CanApplyVrTurn's fallback.
+    if (camera.worldInfoOffset >= 0 && camera.pauserOffset >= 0 &&
+        (!CameraRead(camera.controllerAddress + camera.worldInfoOffset, &world, sizeof(world)) ||
+         world < 0x10000 || !CameraRead(world + camera.pauserOffset, &pauser, sizeof(pauser)) ||
+         pauser != 0)) return true;
+    const int offsets[] = {camera.cinematicModeOffset, camera.ignoreLookOffset};
+    const uint32_t masks[] = {camera.cinematicModeMask, camera.ignoreLookMask};
+    for (int i = 0; i < 2; ++i) {
+        uint32_t flags = 0;
+        if (offsets[i] >= 0 && masks[i] &&
+            (!CameraRead(camera.controllerAddress + offsets[i], &flags, sizeof(flags)) ||
+             (flags & masks[i]) != 0)) return true;
+    }
+    return false;
+}
+
+// Called on the game thread only, before eye 0 captures its base rotation.
+// The controller field persists into the next game tick; the cache receives the
+// same delta now so this stereo pair does not have to wait another engine frame.
+static void ApplyQueuedVrTurn(const CameraInfo& camera) {
+    auto& inputHook = input::InputHook::Instance();
+    const auto identity = input::WeaponAimSystem::Instance().GetPlayerIdentity();
+    DWORD foregroundPid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foregroundPid);
+    if (config::Get().turn_mode == 2 || !identity.pawnValid ||
+        identity.controller != camera.controllerAddress ||
+        !CanApplyVrTurn() || IsVrTurnBlocked() || IsVehicleCameraActive() || ui::IsVisible() ||
+        foregroundPid != GetCurrentProcessId() ||
+        input::WeaponAimSystem::Instance().IsVehicleTerminalUiActive() ||
+        xr::FrameLoop::Instance().IsTheaterFallbackActive()) {
+        inputHook.DiscardPendingTurn();
+        return;
+    }
+    const double degrees = inputHook.ConsumePendingTurn(identity.controller, identity.pawn);
+    static uintptr_t remainderController = 0, remainderPawn = 0;
+    static double remainder = 0.0;
+    if (remainderController != identity.controller || remainderPawn != identity.pawn) {
+        remainder = 0;
+        remainderController = identity.controller;
+        remainderPawn = identity.pawn;
+    }
+    if (degrees == 0.0) return;
+    const double previousRemainder = remainder;
+    const int32_t delta = input::QuantizeTurn(degrees, remainder);
+    if (!delta) return;
+    const uintptr_t controllerYaw = identity.controller + camera.controllerRotationOffset + 4;
+    const uintptr_t cacheYaw = camera.cameraCacheRotation + sizeof(int32_t);
+    int32_t previousYaw = 0, previousCacheYaw = 0;
+    if (!CameraRead(controllerYaw, &previousYaw, sizeof(previousYaw)) ||
+        !CameraRead(cacheYaw, &previousCacheYaw, sizeof(previousCacheYaw))) {
+        remainder = previousRemainder;
+        return;
+    }
+    const int32_t newYaw = input::AddYaw(previousYaw, delta);
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(controllerYaw),
+                            &newYaw, sizeof(newYaw), &written) || written != sizeof(newYaw)) {
+        remainder = previousRemainder;
+        return;
+    }
+    const int32_t newCacheYaw = input::AddYaw(previousCacheYaw, delta);
+    if (!WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(cacheYaw),
+                            &newCacheYaw, sizeof(newCacheYaw), &written) ||
+        written != sizeof(newCacheYaw)) {
+        WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(controllerYaw),
+                            &previousYaw, sizeof(previousYaw), &written);
+        remainder = previousRemainder;
+        return;
+    }
+    if (s_physicalMeleeYawAnchorValid.load(std::memory_order_acquire)) {
+        s_physicalMeleeYawAnchor.store(input::AddYaw(s_physicalMeleeYawAnchor.load(), delta));
+    }
+    static uint64_t turns = 0;
+    if (++turns <= 3 || turns % 600 == 0)
+        Log("[Turn] Applied controller yaw at stereo boundary: degrees=%.3f units=%d", degrees, delta);
+}
 
 bool GetRelativeHeadYaw(float& yawRadians) {
     if (!s_relativeHeadYawValid.load(std::memory_order_acquire)) return false;
@@ -512,41 +583,30 @@ bool GetPoseReference(float position[3], float rotation[4]) {
     return true;
 }
 void SuppressRecoilTick(bool firing) {
-    if (!config::Get().camera_recoil_disabled) {
-        s_recoilAnchorValid.store(false, std::memory_order_release);
-        return;
-    }
+    if (!IsViewportPoseThread(GetCurrentThreadId(),
+            s_viewportDrawThreadId.load(std::memory_order_acquire))) return;
     const CameraInfo camera = GetCameraSnapshot();
-    if (!camera.found || !camera.cameraCacheRotation) return;
-    auto* rotation = reinterpret_cast<int32_t*>(camera.cameraCacheRotation);
-    static uint64_t s_lastFireSeenMs = 0;
-    const uint64_t recoilNowMs = GetTickCount64();
-    if (firing) s_lastFireSeenMs = recoilNowMs;
-    const bool holdPitch = firing ||
-        (recoilNowMs - s_lastFireSeenMs < 400 &&
-         s_recoilAnchorValid.load(std::memory_order_acquire));
-    if (s_recoilAnchorValid.load(std::memory_order_acquire)) {
-        if (holdPitch) {
-            // Only the pitch axis (FRotator index 0) is pinned. Pinning the
-            // whole rotation also froze yaw, and UE3 derives movement direction
-            // from the pawn rotation: holding the trigger broke strafing and
-            // turning with the right stick.
-            if (rotation[0] != s_recoilAnchorRotation[0]) {
-                rotation[0] = s_recoilAnchorRotation[0];
-                static std::atomic<uint64_t> recoilLogs{0};
-                if (recoilLogs.fetch_add(1, std::memory_order_relaxed) < 3) {
-                    Log("[Camera] Recoil suppression holding pawn pitch");
-                }
-            }
-        } else {
-            memcpy(s_recoilAnchorRotation, rotation,
-                   sizeof(s_recoilAnchorRotation));
-            s_recoilAnchorValid.store(true, std::memory_order_release);
+    const auto identity = input::WeaponAimSystem::Instance().GetPlayerIdentity();
+    const bool enabled = config::Get().camera_recoil_disabled && camera.found &&
+        camera.cameraCacheRotation && identity.pawnValid &&
+        identity.controller == camera.controllerAddress && !IsVehicleCameraActive() &&
+        s_gamePitchReferenceValid.load(std::memory_order_acquire);
+    static RecoilPitchHold hold;
+    if (!hold.Update(enabled, firing, identity.controller, identity.pawn,
+                     GetTickCount64())) return;
+    const int32_t pitch = s_gamePitchReference.load(std::memory_order_relaxed);
+    int32_t currentPitch = 0;
+    if (CameraRead(camera.cameraCacheRotation, &currentPitch, sizeof(currentPitch)) &&
+        currentPitch != pitch) {
+        SIZE_T written = 0;
+        if (WriteProcessMemory(GetCurrentProcess(),
+                reinterpret_cast<void*>(camera.cameraCacheRotation), &pitch,
+                sizeof(pitch), &written) && written == sizeof(pitch)) {
+            static uint64_t corrections = 0;
+            if (++corrections <= 3 || corrections % 600 == 0)
+                Log("[Camera] Recoil pitch corrected on viewport thread: native=%d base=%d",
+                    currentPitch, pitch);
         }
-    } else {
-        memcpy(s_recoilAnchorRotation, rotation,
-               sizeof(s_recoilAnchorRotation));
-        s_recoilAnchorValid.store(true, std::memory_order_release);
     }
 }
 UE3Globals GetUE3GlobalsSnapshot() {
@@ -744,13 +804,87 @@ static bool GetStableFirstPersonLocation(
     return valid;
 }
 
+bool PrepareMotionPairPostAnimation() {
+    // Do not move camera/input work onto an animation worker. If this engine
+    // uses one, retain the Draw fallback and report preparedAtAnimation=0.
+    if (s_insideViewportDraw ||
+        GetCurrentThreadId() != s_viewportDrawThreadId.load(std::memory_order_acquire) ||
+        !s_poseReferenceValid || s_poseReferenceSimulated ||
+        s_recenterRequested.load(std::memory_order_acquire) ||
+        !s_gamePitchReferenceValid.load(std::memory_order_acquire) ||
+        !s_stereoReady.load(std::memory_order_acquire) ||
+        IsVehicleCameraActive() || IsDownedFirstPersonActive() ||
+        IsTransientFirstPersonActionActive()) return false;
+    auto& frameLoop = xr::FrameLoop::Instance();
+    auto& inputHook = input::InputHook::Instance();
+    auto& weaponAim = input::WeaponAimSystem::Instance();
+    if (frameLoop.IsDesktopTestMode() || frameLoop.IsTheaterFallbackActive() ||
+        frameLoop.GetRenderEye() != 0 || !inputHook.IsMotionControlsEnabled() ||
+        !inputHook.IsWeaponPoseActive() || weaponAim.IsPlayerInjured() ||
+        weaponAim.IsPhaseWalkActive() || ui::IsVisible()) return false;
+    const CameraInfo camera = GetCameraSnapshot();
+    const auto identity = weaponAim.GetPlayerIdentity();
+    if (!camera.found || !identity.pawnValid || !identity.weaponValid ||
+        identity.controller != camera.controllerAddress ||
+        identity.pawn != s_lastMotionPawn || identity.weapon != s_lastMotionWeapon)
+        return false;
+    float anchor[3] = {};
+    if (!GetStableFirstPersonLocation(identity, anchor)) return false;
+    xr::StereoRenderTicket ticket = {};
+    if (!frameLoop.AcquireRenderTicket(ticket) || ticket.eye != 0 ||
+        ticket.motionPosePrepared) return false;
+    ApplyQueuedVrTurn(camera);
+    SuppressRecoilTick(weaponAim.IsFireActive());
+    if (!CameraRead(camera.cameraCacheRotation, ticket.baseRotation,
+                    sizeof(ticket.baseRotation))) return false;
+    ticket.baseRotation[0] = s_gamePitchReference.load(std::memory_order_relaxed);
+    if (inputHook.IsPhysicalMeleeAnimationSuppressed() &&
+        s_physicalMeleeYawAnchorValid.load(std::memory_order_acquire)) {
+        ticket.baseRotation[1] = s_physicalMeleeYawAnchor.load(std::memory_order_acquire);
+    }
+    if (inputHook.ShouldUseNativeCrouchCamera() &&
+        !CameraRead(camera.cameraCacheLocation + sizeof(float)*2, &anchor[2],
+                    sizeof(float))) return false;
+    memcpy(ticket.baseLocation, anchor, sizeof(anchor));
+    ticket.baseFov = config::Get().fov_degrees;
+    ticket.baseCameraValid = true;
+    constexpr float kUnisToRadians = 6.2831853071795864769f / 65536.0f;
+    const float pitch = ticket.baseRotation[0] * kUnisToRadians;
+    const float yaw = ticket.baseRotation[1] * kUnisToRadians;
+    auto& armIK = player::ArmIKSystem::Instance();
+    ticket.armTargetGeneration = armIK.UpdateTargets(ticket.baseLocation, pitch, yaw,
+        ticket.headPosition, ticket.headRotation, s_poseReferencePosition,
+        s_poseReferenceRotation, ticket.controllers, ticket.controllerGeneration);
+    float handPosition[3] = {}, handForward[3] = {}, handUp[3] = {};
+    if (!armIK.GetWorldHandTarget(ticket.armTargetGeneration, 1,
+            handPosition, handForward, handUp)) return false;
+    ticket.motionPosePrepared = true;
+    ticket.motionPawn = identity.pawn;
+    ticket.motionWeapon = identity.weapon;
+    if (!frameLoop.StageMotionRenderTicket(ticket)) return false;
+    armIK.SetRenderContext(ticket.pairSerial, ticket.armTargetGeneration);
+    const float cameraForward[3] = {cosf(yaw)*cosf(pitch), sinf(yaw)*cosf(pitch), sinf(pitch)};
+    const float cameraUp[3] = {-cosf(yaw)*sinf(pitch), -sinf(yaw)*sinf(pitch), cosf(pitch)};
+    inputHook.SetCanonicalWeaponPose(handPosition, handForward, handUp,
+        ticket.baseLocation, cameraForward, cameraUp);
+    inputHook.ApplyRightHand(0);
+    // The caller applies IK immediately after this returns, before native
+    // component/render-data processing resumes. Draw reuses this exact ticket.
+    static uint64_t preparations = 0;
+    if (++preparations <= 3 || preparations % 600 == 0)
+        Log("[ArmIK] Pair prepared post-animation: pair=%llu target=%llu thread=%lu",
+            ticket.pairSerial, ticket.armTargetGeneration, GetCurrentThreadId());
+    return true;
+}
+
 static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, void* canvas) {
-    static thread_local bool dispatching = false;
+    bool& dispatching = s_insideViewportDraw;
     static std::atomic<uint64_t> drawCount{0};
     if (dispatching || !s_originalViewportDraw) {
         if (s_originalViewportDraw) s_originalViewportDraw(viewportClient, viewport, canvas);
         return;
     }
+    s_viewportDrawThreadId.store(GetCurrentThreadId(), std::memory_order_release);
 
     const CameraInfo camera = GetCameraSnapshot();
     const uint64_t count = ++drawCount;
@@ -778,6 +912,20 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
     }
 
     const int eye = simulatedPose ? frameLoop.GetRenderEye() : renderTicket.eye;
+    bool rebuildMotionPose = false;
+    if (renderTicket.motionPosePrepared) {
+        const auto identity = input::WeaponAimSystem::Instance().GetPlayerIdentity();
+        if (!identity.pawnValid || !identity.weaponValid ||
+            identity.pawn != renderTicket.motionPawn ||
+            identity.weapon != renderTicket.motionWeapon || IsVehicleCameraActive() ||
+            IsDownedFirstPersonActive() ||
+            s_recenterRequested.load(std::memory_order_acquire)) {
+            renderTicket.motionPosePrepared = false;
+            rebuildMotionPose = true;
+        }
+    }
+    if (!simulatedPose && eye == 0 && !renderTicket.motionPosePrepared)
+        ApplyQueuedVrTurn(camera);
     float originalLocation[3] = {};
     int32_t originalRotation[3] = {};
     int32_t interactionRotation[3] = {};
@@ -803,16 +951,21 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
             originalFov = *fov;
             cameraStateSaved = true;
 
-            // Recoil suppression also runs from UpdateState (input thread) so
-            // the game tick sees clean values; this keeps the render path and
-            // the interaction rotation consistent with it.
+            // Only the viewport/game thread writes the recoil correction.
+            // Input publishes fire state without racing these camera snapshots.
             SuppressRecoilTick(input::WeaponAimSystem::Instance().IsFireActive());
             memcpy(interactionRotation, rotation, sizeof(interactionRotation));
 
-            if (!s_gamePitchReferenceValid.load(std::memory_order_acquire)) {
-                s_gamePitchReference.store(originalRotation[0], std::memory_order_relaxed);
+            const auto pitchIdentity = input::WeaponAimSystem::Instance().GetPlayerIdentity();
+            const bool onFootPitch = pitchIdentity.pawnValid &&
+                pitchIdentity.controller == camera.controllerAddress && !IsVehicleCameraActive();
+            const int32_t selectedPitch = SelectGamePitchReference(onFootPitch, originalRotation[0]);
+            if (!s_gamePitchReferenceValid.load(std::memory_order_acquire) ||
+                (onFootPitch && s_gamePitchReference.load(std::memory_order_relaxed) != selectedPitch)) {
+                s_gamePitchReference.store(selectedPitch, std::memory_order_relaxed);
                 s_gamePitchReferenceValid.store(true, std::memory_order_release);
-                Log("[Camera] Game pitch locked at %d Unis", originalRotation[0]);
+                Log("[Camera] Game pitch reference: base=%d native=%d onFoot=%d",
+                    selectedPitch, originalRotation[0], onFootPitch);
             }
             rotation[0] = s_gamePitchReference.load(std::memory_order_relaxed);
             const bool suppressPhysicalMeleeCamera =
@@ -902,17 +1055,23 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
                         // game's native crouch transition to lower the VR camera.
                         stableFirstPersonLocation[2] = originalLocation[2];
                     }
-                    renderTicket.baseCameraValid = true;
-                    memcpy(renderTicket.baseLocation,
-                            vehicleAnchorActive ? vehicleSeat :
-                                (downedFirstPerson ? firstPersonLocation :
-                                    (stableFirstPerson ? stableFirstPersonLocation :
-                                        originalLocation)),
-                           sizeof(renderTicket.baseLocation));
-                    memcpy(renderTicket.baseRotation,
-                           downedFirstPerson ? firstPersonRotation : rotation,
-                           sizeof(renderTicket.baseRotation));
-                    renderTicket.baseFov = config::Get().fov_degrees;
+                    if (renderTicket.motionPosePrepared && downedFirstPerson) {
+                        renderTicket.motionPosePrepared = false;
+                        rebuildMotionPose = true;
+                    }
+                    if (!renderTicket.motionPosePrepared) {
+                        renderTicket.baseCameraValid = true;
+                        memcpy(renderTicket.baseLocation,
+                               vehicleAnchorActive ? vehicleSeat :
+                                   (downedFirstPerson ? firstPersonLocation :
+                                       (stableFirstPerson ? stableFirstPersonLocation :
+                                           originalLocation)),
+                               sizeof(renderTicket.baseLocation));
+                        memcpy(renderTicket.baseRotation,
+                               downedFirstPerson ? firstPersonRotation : rotation,
+                               sizeof(renderTicket.baseRotation));
+                        renderTicket.baseFov = config::Get().fov_degrees;
+                    }
                 } else if (!renderTicket.baseCameraValid) {
                     __leave;
                 } else if (vehicleAnchorActive) {
@@ -1050,7 +1209,7 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
 
             const float* armCameraLocation = simulatedPose
                 ? originalLocation : renderTicket.baseLocation;
-            if (simulatedPose || eye == 0) {
+            if (simulatedPose || (eye == 0 && !renderTicket.motionPosePrepared)) {
                 renderTicket.armTargetGeneration =
                     player::ArmIKSystem::Instance().UpdateTargets(
                         armCameraLocation, gamePitch, gameYaw, headPosition,
@@ -1358,6 +1517,7 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
             s_downedFirstPersonActive.load(std::memory_order_acquire);
         pendingPose.allowFirstPersonRecovery = !pendingPose.vehicleAnchor &&
             input::WeaponAimSystem::Instance().GetPlayerIdentity().pawnValid;
+        pendingPose.firing = input::WeaponAimSystem::Instance().IsFireActive();
         pendingPose.eye = eye;
         pendingPose.pairSerial = renderTicket.pairSerial;
         memcpy(pendingPose.originalLocation, originalLocation,
@@ -1398,20 +1558,42 @@ static void __fastcall HookedViewportDraw(void* viewportClient, void* viewport, 
         }
     }
 
-    input::InputHook::Instance().ApplyRightHand(eye);
-    input::InputHook::Instance().ApplyLeftHand(eye);
-    s_originalViewportDraw(viewportClient, viewport, canvas);
-    // Publish only after both AFR eyes consumed the same prepared palette.
-    // The next pair replays this palette identically for left and right.
-    if (simulatedPose || eye == 1) {
+    // Publish this pair BEFORE Draw constructs its render commands. Publishing
+    // after eye one made the arms lag the moving camera/weapon by a whole pair.
+    // Eye one must keep the same targets and cached world-space palette.
+    if (cameraOffsetApplied && (simulatedPose || eye == 0)) {
         player::ArmIKSystem::Instance().SetRenderContext(
             simulatedPose ? count : renderTicket.pairSerial,
-            renderTicket.armTargetGeneration);
+            renderTicket.armTargetGeneration, rebuildMotionPose);
     }
+    input::InputHook::Instance().ApplyRightHand(eye);
+    input::InputHook::Instance().ApplyLeftHand(eye);
+    if (cameraOffsetApplied) {
+        const bool armsPrepared = player::ArmIKSystem::Instance().ReapplyRenderPalette();
+        const bool weaponPrepared = input::InputHook::Instance().ReapplyWeaponPose();
+        {
+            static std::atomic<uint64_t> preparationCount[2]{};
+            const uint64_t prepared = ++preparationCount[eye == 1 ? 1 : 0];
+            if (prepared <= 3 || prepared % 600 == 0) {
+                const auto status = player::ArmIKSystem::Instance().GetStatus();
+                Log("[ArmIK] Current-pair render preparation: pair=%llu eye=%d target=%llu "
+                    "arms=%d weapon=%d preparedAtAnimation=%d solvedPair=%llu",
+                    renderTicket.pairSerial, eye, renderTicket.armTargetGeneration,
+                    armsPrepared, weaponPrepared, renderTicket.motionPosePrepared,
+                    status.solvedGeneration);
+            }
+        }
+    }
+    s_originalViewportDraw(viewportClient, viewport, canvas);
     input::InputHook::Instance().Restore();
     if (realPoseValid) {
         if (cameraOffsetApplied) frameLoop.CommitRenderedEye(renderTicket);
         else frameLoop.AbortStereoPair();
+    }
+    if (cameraOffsetApplied) {
+        const auto identity = input::WeaponAimSystem::Instance().GetPlayerIdentity();
+        s_lastMotionPawn = identity.pawnValid ? identity.pawn : 0;
+        s_lastMotionWeapon = identity.weaponValid ? identity.weapon : 0;
     }
 
     if (cameraStateSaved) {
@@ -1681,13 +1863,31 @@ static bool ApplyPoseToView(uintptr_t viewAddress, const PendingViewPose& pose) 
             }
         }
 
-        // Preserve UE3's exact source basis normally. An external/downed view
-        // needs the last first-person rotator or it keeps looking back at the pawn.
+        // The native source can contain firing shake or the restored interaction
+        // pitch. Never compose that mutable rotation with the HMD a second time.
+        // Keep the same frozen game basis for both on-foot stereo eyes.
+        const bool frozenViewRotation = UseFrozenViewRotation(pose.xrViewsValid,
+            pose.pairSerial, pose.allowFirstPersonRecovery, pose.vehicleAnchor,
+            recoverFirstPerson);
         float firstPersonViewRotation[16] = {};
-        if (recoverFirstPerson)
+        if (frozenViewRotation)
             BuildViewRotation(pose.baseRotation, firstPersonViewRotation);
-        const float* baseTranslatedView = recoverFirstPerson
+        const float* baseTranslatedView = frozenViewRotation
             ? firstPersonViewRotation : backup.translatedView;
+        if (frozenViewRotation && pose.firing) {
+            static std::atomic<uint64_t> firingViews[2]{};
+            const uint64_t sample = ++firingViews[pose.eye == 1 ? 1 : 0];
+            if (sample <= 3 || sample % 600 == 0) {
+                float sourceDifference = 0.0f;
+                for (int row = 0; row < 3; ++row)
+                    for (int column = 0; column < 3; ++column)
+                        sourceDifference += fabsf(baseTranslatedView[row*4 + column] -
+                            backup.translatedView[row*4 + column]);
+                Log("[Camera] Frozen firing view: pair=%llu eye=%d base=(%d,%d,%d) nativeBasisDelta=%.5f",
+                    pose.pairSerial, pose.eye, pose.baseRotation[0], pose.baseRotation[1],
+                    pose.baseRotation[2], sourceDifference);
+            }
+        }
         const float worldOffset[3] = {
             pose.roomOffsetView[0] * baseTranslatedView[0] +
                 pose.roomOffsetView[1] * baseTranslatedView[1] +
@@ -1715,13 +1915,25 @@ static bool ApplyPoseToView(uintptr_t viewAddress, const PendingViewPose& pose) 
 
         float fullView[16] = {};
         memcpy(fullView, baseTranslatedView, sizeof(fullView));
+        const bool frozenStereoAnchor = pose.xrViewsValid && pose.pairSerial != 0;
         const float* anchorOrigin = pose.vehicleAnchor
-            ? pose.headLocation : (recoverFirstPerson ? pose.location : backup.origin);
-        const float newOrigin[3] = {
-            anchorOrigin[0] + worldOffset[0],
-            anchorOrigin[1] + worldOffset[1],
-            anchorOrigin[2] + worldOffset[2]
-        };
+            ? pose.headLocation : ((recoverFirstPerson || frozenStereoAnchor)
+                ? pose.location : backup.origin);
+        const ViewAnchorAdjustment anchorAdjustment = AdjustViewAnchor(
+            anchorOrigin, backup.origin, backup.negativeOrigin, worldOffset);
+        const float* newOrigin = anchorAdjustment.origin;
+        if (frozenStereoAnchor) {
+            static std::atomic<uint64_t> anchorLogs[2]{};
+            const uint64_t sample = ++anchorLogs[pose.eye == 1 ? 1 : 0];
+            if (sample <= 3 || sample % 600 == 0) {
+                Log("[Camera] Stereo anchor: pair=%llu eye=%d nativeDelta=(%.3f,%.3f,%.3f) "
+                    "anchor=(%.2f,%.2f,%.2f)", pose.pairSerial, pose.eye,
+                    anchorOrigin[0] - backup.origin[0],
+                    anchorOrigin[1] - backup.origin[1],
+                    anchorOrigin[2] - backup.origin[2],
+                    anchorOrigin[0], anchorOrigin[1], anchorOrigin[2]);
+            }
+        }
         if (pose.vehicleAnchor) {
             static std::atomic<uint64_t> vehicleViewLogs{0};
             const uint64_t logCount = vehicleViewLogs.fetch_add(
@@ -1768,7 +1980,7 @@ static bool ApplyPoseToView(uintptr_t viewAddress, const PendingViewPose& pose) 
                    sizeof(newInverseTranslatedViewProjection));
         }
         for (int axis = 0; axis < 3; ++axis) {
-            negativeOrigin[axis] = backup.negativeOrigin[axis] - worldOffset[axis];
+            negativeOrigin[axis] = anchorAdjustment.negativeOrigin[axis];
             origin[axis] = newOrigin[axis];
         }
         origin[3] = 1.0f;
@@ -1888,7 +2100,7 @@ static void __fastcall HookedRenderScene(void* renderer) {
         finalPoseCount == 1 && commandViewCount == 1 && appliedPose.xrViewsValid;
     s_originalRenderScene(renderer);
     if (completedAlternateEye) {
-        if (!config::Get().same_frame_stereo) {
+        if (!config::IsSameFrameStereoEnabled()) {
             xr::FrameLoop::Instance().CaptureWorldBeforeHud(
                 appliedPose.pairSerial, appliedPose.eye);
         }
@@ -2023,7 +2235,7 @@ static void* __fastcall HookedRenderCommandConstructor(void* destination, void* 
                     // One native frame already contains both eyes. The second
                     // ticket in the legacy AER pair is a compositor hold frame;
                     // keep it monoscopic to halve its scene traversal/draw setup.
-                    if (config::Get().same_frame_stereo && commandPose.eye == 0) {
+                    if (config::IsSameFrameStereoEnabled() && commandPose.eye == 0) {
                         memcpy(stereoFamily, sourceViewFamily, sizeof(stereoFamily));
                         memcpy(stereoSourceViews[0], reinterpret_cast<const void*>(sourceView),
                                sizeof(stereoSourceViews[0]));
@@ -2070,8 +2282,8 @@ static void* __fastcall HookedRenderCommandConstructor(void* destination, void* 
     }
 
     if (principalSource) {
-        input::InputHook::Instance().ReapplyWeaponPose();
         player::ArmIKSystem::Instance().ReapplyRenderPalette();
+        input::InputHook::Instance().ReapplyWeaponPose();
     }
     void* result = s_originalRenderCommandConstructor(
         destination, constructorSource, argument3, argument4);
@@ -2247,18 +2459,22 @@ static DWORD WINAPI ScannerThread(LPVOID) {
                 player::ArmIKSystem::Instance().RequestInventoryScan();
             const bool commandHookInstalled = InstallRenderCommandProbes(moduleBase);
             const bool renderSceneHookInstalled = InstallRenderSceneProbe(moduleBase);
-            config::Get().same_frame_stereo =
-                config::Get().same_frame_stereo_requested &&
-                commandHookInstalled && renderSceneHookInstalled;
+            config::InitializeStereoMode(commandHookInstalled && renderSceneHookInstalled);
             s_stereoReady.store(
                 commandHookInstalled && renderSceneHookInstalled,
                 std::memory_order_release);
             Log("[Camera] Stereo enabled: final FSceneView 6DoF=%s native multiview=%s "
                 "double-Draw=disabled",
                 commandHookInstalled && renderSceneHookInstalled ? "enabled" : "FAILED",
-                config::Get().same_frame_stereo ? "enabled" : "disabled");
+                config::IsSameFrameStereoEnabled() ? "enabled" : "disabled");
+            Log("[Turn] Native yaw discovery: rotation=0x%X world=0x%X pauser=0x%X "
+                "cinematic=0x%X/0x%X ignoreLook=0x%X/0x%X ready=%d",
+                s_camera.controllerRotationOffset, s_camera.worldInfoOffset,
+                s_camera.pauserOffset, s_camera.cinematicModeOffset,
+                s_camera.cinematicModeMask, s_camera.ignoreLookOffset,
+                s_camera.ignoreLookMask, CanApplyVrTurn() ? 1 : 0);
         } else {
-            config::Get().same_frame_stereo = false;
+            config::InitializeStereoMode(false);
             Log("[Camera] Stereo camera boundary unavailable; rendering remains unmodified");
         }
     } else {

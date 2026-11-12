@@ -1,5 +1,6 @@
 #include "VRMod.hpp"
 #include "globals.hpp"
+#include "BuildInfo.hpp"
 #include "CommandSystem.hpp"
 #include "../config/Config.hpp"
 #include "../camera/CameraHook.hpp"
@@ -414,6 +415,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         OpenLog();
+        LogInternal("[BL1GOTYVR] Build %s git=%s source=%s",
+            BL1GOTYVR_VERSION, BL1GOTYVR_GIT_REVISION, BL1GOTYVR_SOURCE_ID);
         LogInternal("[BL1GOTYVR] DLL attached to process");
         s_displayReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 

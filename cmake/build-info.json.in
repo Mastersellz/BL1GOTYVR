@@ -1,0 +1,9 @@
+{
+  "version": "@PROJECT_VERSION@",
+  "gitRevision": "@BL1GOTYVR_GIT_REVISION@",
+  "sourceId": "@BL1GOTYVR_SOURCE_ID@",
+  "sourceSha256": "@BL1GOTYVR_SOURCE_SHA256@",
+  "compiler": "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@",
+  "cmakeVersion": "@CMAKE_VERSION@",
+  "architecture": "x64"
+}

@@ -13,14 +13,22 @@ other DXGI-based overlay before installing this mod. Removing the proxy
 Run `BL1GOTYVRConfig.exe` from the same directory as `BL1GOTYVR.dll`. The
 utility writes `BL1GOTYVR.ini`. Optical and tracking settings reload live after
 Save; resolution and OpenXR refresh-rate changes require restarting the game.
+`SameFrameStereo` also requires a restart: live INI reloads preserve the current
+validated renderer mode, including when unrelated settings are saved. The
+configurator defaults to alternate-eye stereo; native multiview is opt-in.
+
+The configurator validates all fields before saving and replaces the mod INI in
+one operation. Unknown keys and weapon profiles are preserved. Write failures
+are reported instead of displaying a successful save. The Post FX enabled
+checkbox is authoritative: tuning sharpening/color values does not enable it.
 
 | Setting | Range | Effect |
 |---|---:|---|
-| Render width/height | 640x480 to 7680x4320 | Square game backbuffer resolution |
+| Render width/height | Five square presets, 1536 to 4096 | Square game backbuffer resolution |
 | Resolution scale | 0.50 to 2.00 | OpenXR eye swapchain scale |
 | OpenXR refresh rate | 0 or 1 to 240 Hz | Requests the nearest runtime-supported rate; `0` keeps the runtime default |
 | Camera FOV | 60 to 150 degrees | UE3 camera FOV during each eye render |
-| IPD | 50 to 80 mm | Physical separation between eye cameras |
+| IPD | 50 to 80 mm | Desktop simulation fallback; headset mode uses runtime eye poses |
 | Convergence shift | 0 to 20% per eye | Horizontal eye-image shift; `10` is the recommended GDI/AFR baseline and `0` keeps images parallel |
 | Near/far plane | 0.01 to 100000 | OpenXR projection clipping range |
 | Position scale | 0 to 5 | Head translation multiplier |
@@ -81,13 +89,52 @@ The left trigger does not activate ADS. Press it while the left hand is already
 touching the active weapon to hold that contact point as a two-hand grip. Press
 it with the hand away from the weapon to arm the left-hand physical melee.
 
+## Turning (stabilization pass 2)
+
+Use the **Turning** section of the F10 overlay, or edit these INI keys:
+
+```ini
+[Input]
+TurnMode=1
+SnapTurnAngle=30
+SmoothTurnSpeed=90
+LocomotionDeadzone=0.2
+```
+
+- `TurnMode=0`: one snap per right-stick gesture. Deflect at least 65%, then
+  center inside the deadzone to rearm. Holding the stick does not repeat snaps.
+- `TurnMode=1`: smooth yaw, with `SmoothTurnSpeed` in degrees/second at full
+  deflection. Deflection above the deadzone scales that speed linearly.
+- `TurnMode=2`: disable VR right-stick turning **on foot**, not HMD tracking,
+  vehicle steering or a separate physical gamepad.
+
+Center the stick after enabling/changing modes, closing the overlay, regaining
+focus/tracking, or returning from native vehicle/menu controls. Render stalls do
+not accumulate a large delayed turn. Snap/smooth deltas are queued to the game
+thread and applied only at the beginning of a stereo pair, never between eyes.
+Angular precision is limited to UE3's rotator units (360/65536 degrees);
+fractional units are retained rather than discarded on every update.
+
+This path requires runtime validation of `Actor::Rotation`, `Actor::WorldInfo`
+and `WorldInfo::Pauser`. Paused worlds do not receive direct yaw writes; reflected
+cinematic/look-ignore flags are also respected when available. Vehicles and
+recognized menus retain native XInput axes. If metadata is unavailable, smooth
+XInput falls back to the previous game-controlled sensitivity; exact snap is
+disabled rather than approximated with mouse pixels. The overlay shows whether
+native yaw is validated, and `[Turn]` logs report discovery/application.
+
+This is not yet headset-validated. Check pause/inventory UI, cutscenes, vehicles,
+locomotion, ballistics, HMD recenter and multiplayer before treating the native
+controller write path as a stable release. The keyboard/mouse vehicle fallback
+still uses legacy mouse steering, not calibrated angular velocity.
+
 ## Runtime Diagnostics
 
 | Key | Effect |
 |---|---|
 | `F8` | Cycles GDI, raw backbuffer, and tracked SDR capture sources |
-| `F9` | Toggles experimental OpenXR FOV/crop correction |
-| `F10` | Selects the next tracked SDR target |
+| `F9` | Diagnostic notice; coherent projection correction remains enabled |
+| `F10` | Toggles the tuning overlay; also advances the diagnostic tracked SDR target |
 | `F11` | Toggles GDI/AFR eye and rendered-pose latency compensation |
 
 ## Desktop Pose Simulation

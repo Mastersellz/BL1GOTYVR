@@ -100,7 +100,7 @@ button.
 | Left thumbstick | Move |
 | Right thumbstick | Smooth or snap turn |
 | Right trigger | Fire |
-| Left trigger | Aim down sights |
+| Left trigger | Two-hand grip on weapon contact, or arm left-hand melee |
 | A | Jump |
 | B | Close/back (`Escape`) |
 | X | Use/reload game action |
@@ -123,7 +123,7 @@ override so the VR marker and shot trace remain aligned.
 From a Visual Studio developer command prompt:
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
@@ -132,6 +132,10 @@ Or run:
 ```bat
 build.bat
 ```
+
+`build.bat` discovers Visual Studio/Build Tools through CMake, stops on errors,
+and accepts an optional output directory (`build.bat build-check`). Run a CMake
+version that supports your installed Visual Studio generator.
 
 Release outputs are generated under `build\Release\`:
 
@@ -143,6 +147,28 @@ Release outputs are generated under `build\Release\`:
 The target must remain **x64** because `BorderlandsGOTY.exe` is a 64-bit
 process.
 
+The DLL logs its version, Git revision and source fingerprint at startup.
+`build/build-info.json` records the full project-source fingerprint and toolchain;
+local source edits are included even when the Git revision is unchanged. This
+identifies the source snapshot, not a guarantee of bit-identical DLLs or unchanged
+external dependency checkouts.
+
+### Regression tests
+
+Use a separate build directory so the previous Release binaries remain available:
+
+```powershell
+cmake -S . -B build-check -A x64 -DBL1GOTYVR_BUILD_CORE_TESTS=ON -DBL1GOTYVR_BUILD_RENDER_TESTS=ON
+cmake --build build-check --config Release
+ctest --test-dir build-check -C Release --output-on-failure
+```
+
+Core tests cover stereo-mode reloads, configuration validation and atomic saves,
+file-write failures, snap/smooth turning and queued yaw safety, and the
+IK/room-scale self-tests. HUD tests run on D3D11 WARP.
+These tests do not launch/inject the game or modify its INI files and do not
+replace headset validation. See [docs/STABILIZATION.md](docs/STABILIZATION.md).
+
 ## Diagnostics
 
 Runtime diagnostics are written to `BL1GOTYVR.log` beside the game executable.
@@ -152,8 +178,8 @@ Useful development keys include:
 |---|---|
 | F6 | Toggle desktop pose simulation |
 | F8 | Cycle capture source |
-| F9 | Toggle projection crop correction |
-| F10 | Select the next tracked SDR target |
+| F9 | Diagnostic notice; projection correction stays enabled |
+| F10 | Toggle tuning overlay; also advances tracked target in diagnostic capture mode |
 | F11 | Toggle capture/pose latency compensation |
 
 These keys are intended for troubleshooting. The default capture and projection

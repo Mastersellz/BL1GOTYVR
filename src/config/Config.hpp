@@ -19,7 +19,6 @@ struct Settings {
     float head_yaw_scale = 1.0f;     /* 0=free look, 1=full camera rotation */
     float head_pitch_scale = 1.0f;   /* 0=free look, 1=full camera rotation */
     bool same_frame_stereo_requested = false;
-    bool same_frame_stereo = false;
     bool reverse_eyes = false;
     bool camera_recoil_disabled = true;
     bool debug_logging = true;
@@ -112,6 +111,10 @@ float hud_horizontal_offset = 0.0f;
 };
 
 Settings& Get();
+// Startup-latched renderer state, deliberately separate from reloadable settings.
+// Only camera discovery may initialize it after validating the native hooks.
+void InitializeStereoMode(bool nativeHooksValidated);
+bool IsSameFrameStereoEnabled();
 float GetMeleeRangeMultiplier();
 bool IsSupportedRenderResolution(int width, int height);
 bool EnforceGameResolution();

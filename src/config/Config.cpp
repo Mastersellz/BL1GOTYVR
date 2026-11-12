@@ -15,9 +15,20 @@ static char s_configPath[MAX_PATH] = {};
 static FILETIME s_lastWriteTime = {};
 static ULONGLONG s_lastReloadCheck = 0;
 static std::atomic<float> s_meleeRangeMultiplier{1.60f};
+static std::atomic<bool> s_sameFrameStereoEnabled{false};
 static constexpr int kRenderPresets[] = {1536, 2048, 2560, 3072, 4096};
 
 Settings& Get() { return s_settings; }
+void InitializeStereoMode(bool nativeHooksValidated) {
+    s_sameFrameStereoEnabled.store(
+        nativeHooksValidated && s_settings.same_frame_stereo_requested,
+        std::memory_order_release);
+}
+
+bool IsSameFrameStereoEnabled() {
+    return s_sameFrameStereoEnabled.load(std::memory_order_acquire);
+}
+
 float GetMeleeRangeMultiplier() {
     return s_meleeRangeMultiplier.load(std::memory_order_acquire);
 }
@@ -151,9 +162,8 @@ void Load(const char* path) {
         ReadFloat("Tracking", "HeadPitchScale", s_settings.head_pitch_scale, path), 0.0f, 1.0f);
     s_settings.same_frame_stereo_requested = GetPrivateProfileIntA(
         "Stereo", "SameFrameStereo", s_settings.same_frame_stereo_requested, path) != 0;
-    // Runtime enables this only after both the viewport boundary and camera
-    // cache are validated. Until then AFR is the only safe capture path.
-    s_settings.same_frame_stereo = false;
+    // The scanner latches the validated renderer mode at startup. Loading an
+    // INI only changes the request for the next startup, never an in-flight pair.
     s_settings.reverse_eyes = GetPrivateProfileIntA(
         "Stereo", "ReverseEyes", s_settings.reverse_eyes, path) != 0;
     s_settings.debug_logging = GetPrivateProfileIntA(
@@ -336,7 +346,14 @@ bool ReloadIfChanged() {
     WIN32_FILE_ATTRIBUTE_DATA attributes = {};
     if (!GetFileAttributesExA(s_configPath, GetFileExInfoStandard, &attributes) ||
         CompareFileTime(&attributes.ftLastWriteTime, &s_lastWriteTime) == 0) return false;
+    const bool previousStereoRequest = s_settings.same_frame_stereo_requested;
     Load(s_configPath);
+    if (previousStereoRequest != s_settings.same_frame_stereo_requested) {
+        Log("[Config] SameFrameStereo request changed; restart required "
+            "(active=%s requested=%s)",
+            IsSameFrameStereoEnabled() ? "native" : "alternate-eye",
+            s_settings.same_frame_stereo_requested ? "native" : "alternate-eye");
+    }
     Log("[Config] Runtime settings reloaded");
     return true;
 }
